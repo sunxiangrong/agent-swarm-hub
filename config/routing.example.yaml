@@ -1,0 +1,21 @@
+providers:
+  spokesperson: claude
+  coordinator: claude
+  execution:
+    - codex
+    - gemini
+    - opencode
+
+channels:
+  telegram:
+    enabled: true
+  lark:
+    enabled: true
+
+policy:
+  default_visibility: spokesperson_only
+  escalate:
+    - BLOCKER
+    - RISK
+    - DISSENT
+    - REQUEST_INPUT

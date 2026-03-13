@@ -1,0 +1,11 @@
+levels:
+  BLOCKER:
+    remote_visible: true
+  RISK:
+    remote_visible: true
+  DISSENT:
+    remote_visible: true
+  REQUEST_INPUT:
+    remote_visible: true
+  IMPORTANT_FINDING:
+    remote_visible: true
