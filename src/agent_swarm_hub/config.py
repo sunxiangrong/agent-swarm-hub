@@ -15,14 +15,18 @@ def _env_flag(name: str, default: bool = False) -> bool:
 class TelegramConfig:
     enabled: bool = False
     bot_token: str = ""
-    default_parse_mode: str = "Markdown"
+    default_parse_mode: str = ""
+    webhook_url: str = ""
+    polling_timeout_s: int = 30
 
     @classmethod
     def from_env(cls) -> "TelegramConfig":
         return cls(
             enabled=_env_flag("ASH_TELEGRAM_ENABLED"),
             bot_token=os.getenv("ASH_TELEGRAM_BOT_TOKEN", "").strip(),
-            default_parse_mode=os.getenv("ASH_TELEGRAM_PARSE_MODE", "Markdown").strip() or "Markdown",
+            default_parse_mode=os.getenv("ASH_TELEGRAM_PARSE_MODE", "").strip(),
+            webhook_url=os.getenv("ASH_TELEGRAM_WEBHOOK_URL", "").strip(),
+            polling_timeout_s=int(os.getenv("ASH_TELEGRAM_POLL_TIMEOUT_S", "30").strip() or "30"),
         )
 
 

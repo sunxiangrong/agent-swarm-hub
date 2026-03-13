@@ -10,23 +10,23 @@ Implemented:
 
 - Lark inbound event normalization for text messages
 - outbound text payload builder
+- official SDK-backed message request builder
 - command contract for `/write`, `/status`, `/escalations`, `/help`
 
 Deferred:
 
 - signature verification
-- challenge response handling
 - app credentials and tenant install wiring
-- message send/retry logic
+- actual SDK send with your real app permissions
 
 ## Expected Flow
 
 ```text
 Lark event callback
-  -> lark_event_to_remote_message(...)
-  -> CCConnectAdapter.handle_message(...)
+  -> LarkService.challenge_response(...) if challenge
+  -> LarkRunner / LarkService
   -> build_lark_text_outbound(...)
-  -> Lark send message API
+  -> client.im.v1.message.create(...)
 ```
 
 ## What You Will Need To Provide Later

@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.scripts]
+agent-swarm-hub = "agent_swarm_hub.cli:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

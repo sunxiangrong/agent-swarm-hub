@@ -9,7 +9,7 @@ from .remote import RemoteMessage, RemotePlatform
 class TelegramOutboundMessage:
     chat_id: str
     text: str
-    parse_mode: str = "Markdown"
+    parse_mode: str | None = None
     reply_to_message_id: int | None = None
 
 
