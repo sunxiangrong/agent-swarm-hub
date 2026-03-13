@@ -1,6 +1,6 @@
 import json
 
-from agent_swarm_hub import LarkConfig, LarkService
+from agent_swarm_hub import EchoExecutor, LarkConfig, LarkService
 
 
 def test_lark_service_builds_create_message_request() -> None:
@@ -35,6 +35,7 @@ def test_lark_service_handles_challenge() -> None:
 
 def test_lark_service_dispatches_event_to_outbound_text() -> None:
     service = LarkService(LarkConfig(enabled=True, app_id="app", app_secret="secret"))
+    service.runner.adapter.executor = EchoExecutor()
 
     dispatch = service.handle_event(
         {
@@ -51,4 +52,4 @@ def test_lark_service_dispatches_event_to_outbound_text() -> None:
 
     assert dispatch.inbound_task_id is not None
     assert dispatch.outbound.receive_id == "oc_456"
-    assert json.loads(dispatch.outbound.content)["text"].startswith("Accepted task.")
+    assert json.loads(dispatch.outbound.content)["text"].startswith("Task ID:")

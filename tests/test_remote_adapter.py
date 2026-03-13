@@ -1,5 +1,6 @@
 from agent_swarm_hub import (
     CCConnectAdapter,
+    EchoExecutor,
     Event,
     EventType,
     RemoteMessage,
@@ -16,7 +17,7 @@ def test_parse_remote_command_defaults_plain_text_to_write() -> None:
 
 
 def test_write_creates_session_and_status_reads_it() -> None:
-    adapter = CCConnectAdapter()
+    adapter = CCConnectAdapter(executor=EchoExecutor())
     message = RemoteMessage(
         platform=RemotePlatform.TELEGRAM,
         chat_id="chat-1",
@@ -35,12 +36,12 @@ def test_write_creates_session_and_status_reads_it() -> None:
     )
 
     assert write_response.task_id is not None
-    assert "Accepted task." in write_response.text
+    assert "Backend: echo" in write_response.text
     assert write_response.task_id in status_response.text
 
 
 def test_blocker_event_becomes_visible_escalation() -> None:
-    adapter = CCConnectAdapter()
+    adapter = CCConnectAdapter(executor=EchoExecutor())
     base_message = RemoteMessage(
         platform=RemotePlatform.LARK,
         chat_id="chat-2",

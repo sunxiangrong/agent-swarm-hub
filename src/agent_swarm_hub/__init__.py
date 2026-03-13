@@ -3,6 +3,15 @@
 from .adapter import AdapterResponse, CCConnectAdapter
 from .config import LarkConfig, RuntimeConfig, TelegramConfig, load_env_file
 from .escalation import EscalationDecision, EscalationPolicy
+from .executor import (
+    ClaudePrintExecutor,
+    CodexExecExecutor,
+    EchoExecutor,
+    ExecutionResult,
+    Executor,
+    ExecutorError,
+    build_executor,
+)
 from .lark import LarkOutboundMessage, build_lark_text_outbound, lark_event_to_remote_message
 from .lark_service import LarkDispatch, LarkService
 from .lark_ws_runner import LarkWebSocketRunner
@@ -19,10 +28,16 @@ __all__ = [
     "AdapterResponse",
     "CCConnectAdapter",
     "ChannelDispatchResult",
+    "ClaudePrintExecutor",
+    "CodexExecExecutor",
+    "EchoExecutor",
     "EscalationDecision",
     "EscalationPolicy",
     "Event",
     "EventType",
+    "ExecutionResult",
+    "Executor",
+    "ExecutorError",
     "LarkConfig",
     "LarkDispatch",
     "LarkOutboundMessage",
@@ -46,6 +61,7 @@ __all__ = [
     "TelegramService",
     "TelegramTransport",
     "build_lark_text_outbound",
+    "build_executor",
     "build_telegram_outbound",
     "lark_event_to_remote_message",
     "parse_remote_command",

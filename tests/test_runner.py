@@ -1,10 +1,11 @@
 import json
 
-from agent_swarm_hub import LarkConfig, LarkRunner, TelegramConfig, TelegramRunner
+from agent_swarm_hub import EchoExecutor, LarkConfig, LarkRunner, TelegramConfig, TelegramRunner
 
 
 def test_telegram_runner_dispatches_write_flow() -> None:
-    runner = TelegramRunner(TelegramConfig(enabled=True, bot_token="token"))
+    runner = TelegramRunner(TelegramConfig(enabled=True, bot_token="token"), adapter=None)
+    runner.adapter.executor = EchoExecutor()
 
     result = runner.handle_update(
         {
@@ -20,11 +21,12 @@ def test_telegram_runner_dispatches_write_flow() -> None:
     assert result.platform == "telegram"
     assert result.task_id is not None
     assert result.outbound.chat_id == "123"
-    assert "Accepted task." in result.outbound.text
+    assert "Backend: echo" in result.outbound.text
 
 
 def test_lark_runner_dispatches_status_flow() -> None:
-    runner = LarkRunner(LarkConfig(enabled=True, app_id="app", app_secret="secret"))
+    runner = LarkRunner(LarkConfig(enabled=True, app_id="app", app_secret="secret"), adapter=None)
+    runner.adapter.executor = EchoExecutor()
 
     runner.handle_event(
         {

@@ -55,7 +55,12 @@ class TelegramPollingRunner:
             with urlopen(http_request, timeout=30) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
-            raise RuntimeError(f"Telegram API HTTP error: {exc.code}") from exc
+            try:
+                body = exc.read().decode("utf-8")
+            except Exception:
+                body = ""
+            detail = f" body={body}" if body else ""
+            raise RuntimeError(f"Telegram API HTTP error: {exc.code}{detail}") from exc
         except URLError as exc:
             raise RuntimeError(f"Telegram API connection error: {exc.reason}") from exc
 

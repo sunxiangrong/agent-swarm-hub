@@ -1,4 +1,4 @@
-from agent_swarm_hub import TelegramConfig, TelegramService, TelegramTransport
+from agent_swarm_hub import EchoExecutor, TelegramConfig, TelegramService, TelegramTransport
 
 
 def test_telegram_transport_builds_send_message_request() -> None:
@@ -30,6 +30,7 @@ def test_telegram_service_turns_update_into_send_request() -> None:
     service = TelegramService(
         TelegramConfig(enabled=True, bot_token="999:xyz", default_parse_mode="")
     )
+    service.runner.adapter.executor = EchoExecutor()
 
     dispatch = service.handle_update(
         {
@@ -44,7 +45,7 @@ def test_telegram_service_turns_update_into_send_request() -> None:
 
     assert dispatch.inbound_task_id is not None
     assert dispatch.send_request.url.endswith("/bot999:xyz/sendMessage")
-    assert "Accepted task." in dispatch.send_request.payload["text"]
+    assert "Backend: echo" in dispatch.send_request.payload["text"]
 
 
 def test_telegram_transport_builds_webhook_request() -> None:

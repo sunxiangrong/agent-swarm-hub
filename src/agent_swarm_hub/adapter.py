@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from hashlib import sha1
 
 from .escalation import EscalationDecision
+from .executor import Executor, ExecutorError, build_executor
 from .models import Event
 from .remote import RemoteMessage, parse_remote_command
 from .swarm import SwarmCoordinator, SwarmState
@@ -20,8 +21,9 @@ class AdapterResponse:
 class CCConnectAdapter:
     """Translate remote chat messages into runtime coordinator actions."""
 
-    def __init__(self, coordinator: SwarmCoordinator | None = None):
+    def __init__(self, coordinator: SwarmCoordinator | None = None, executor: Executor | None = None):
         self.coordinator = coordinator or SwarmCoordinator()
+        self.executor = executor or build_executor()
         self.sessions: dict[str, SwarmState] = {}
         self.escalations: dict[str, list[Event]] = {}
 
@@ -64,12 +66,21 @@ class CCConnectAdapter:
         state = self.coordinator.create_root_task(task_id=task_id, title=argument, role="runtime_coordinator")
         self.sessions[message.session_key] = state
         self.escalations.setdefault(message.session_key, [])
-        return AdapterResponse(
-            text=(
-                f"Accepted task.\n"
+        try:
+            result = self.executor.run(argument)
+            text = (
                 f"Task ID: {task_id}\n"
+                f"Backend: {result.backend}\n"
+                f"{result.output}"
+            )
+        except ExecutorError as exc:
+            text = (
+                f"Task ID: {task_id}\n"
+                f"Execution error: {exc}\n"
                 f"{self.coordinator.render_remote_summary(state)}"
-            ),
+            )
+        return AdapterResponse(
+            text=text,
             task_id=task_id,
         )
 
