@@ -1,7 +1,7 @@
 """Swarm coordination primitives for remote agent orchestration."""
 
 from .adapter import AdapterResponse, CCConnectAdapter
-from .config import LarkConfig, RuntimeConfig, TelegramConfig
+from .config import LarkConfig, RuntimeConfig, TelegramConfig, load_env_file
 from .escalation import EscalationDecision, EscalationPolicy
 from .lark import LarkOutboundMessage, build_lark_text_outbound, lark_event_to_remote_message
 from .lark_service import LarkDispatch, LarkService
@@ -29,6 +29,7 @@ __all__ = [
     "LarkRunner",
     "LarkService",
     "LarkWebSocketRunner",
+    "load_env_file",
     "RemoteCommand",
     "RemoteMessage",
     "RemotePlatform",
