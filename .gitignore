@@ -6,3 +6,4 @@ __pycache__/
 *.egg-info/
 .DS_Store
 .env.local
+.agent-swarm-hub.sqlite3

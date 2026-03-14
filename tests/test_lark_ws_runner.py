@@ -73,3 +73,27 @@ def test_lark_ws_runner_builds_handler() -> None:
     handler = runner.build_event_handler()
 
     assert handler is not None
+
+
+def test_lark_ws_runner_reconnects_after_error(monkeypatch) -> None:
+    runner = LarkWebSocketRunner.create(
+        LarkConfig(enabled=True, app_id="app", app_secret="secret", verify_token="verify")
+    )
+    attempts = {"count": 0}
+
+    class FakeClient:
+        def start(self):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("keepalive ping timeout")
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(LarkWebSocketRunner, "build_ws_client", lambda self: FakeClient())
+    monkeypatch.setattr("time.sleep", lambda *_args, **_kwargs: None)
+
+    try:
+        runner.run_forever()
+    except KeyboardInterrupt:
+        pass
+
+    assert attempts["count"] == 2

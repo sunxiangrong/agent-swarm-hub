@@ -1,75 +1,118 @@
 # agent-swarm-hub
 
-Independent orchestration repository for a runtime-coordinated swarm workflow built around `ccb`, `tmux`, and remote chat entrypoints such as `cc-connect`, Lark, and Telegram.
+项目级远程 agent 中枢。它把 Telegram、飞书、项目上下文、Claude/Codex 分工、以及 `ccb/askd` 执行底座接在一起。
 
-## Scope
+## 当前能力
 
-This repository owns:
+- Telegram 长轮询，支持断线重试
+- 飞书 WebSocket，支持断线重连
+- chat -> workspace 绑定
+- workspace 项目配置：
+  - `path`
+  - `backend`
+  - `transport`
+- 项目级 task 持久化
+- 项目级 phase 状态机：
+  - `discussion`
+  - `ready_for_execution`
+  - `executing`
+  - `reviewing`
+  - `reported`
+- Claude/Codex 双 agent 分工：
+  - Claude：讨论、拆解、校验、汇报
+  - Codex：实现、执行、验证
+- 双 agent 独立 session id：
+  - `claude_session_id`
+  - `codex_session_id`
+- 双 agent 独立最近记忆流
+- 结构化交接对象：
+  - `discussion_brief`
+  - `execution_packet`
+  - `review_verdict`
+- 共享项目会话库接入
+- `ccb` 环境注入：
+  - `CCB_SESSION_ID`
+  - `CCB_WORK_DIR`
+  - `CCB_RUN_DIR`
 
-- swarm coordination primitives
-- runtime coordination policy
-- escalation policy
-- spokesperson summaries for remote chat tools
-- integration glue for `ccb`, `cc-connect`, and optional `Superpowers`
-
-This repository does not own:
-
-- machine bootstrap and cross-device environment sync
-- secrets or host-specific overrides
-- vendored third-party source trees
-
-Those remain in [`agent-env`](../agent-env).
-
-## Model
-
-Internal execution is a `swarm`: agents specialize, split work further inside their own domain, and raise events when blocked or when they disagree.
-
-External presentation is a `single spokesperson`: remote tools should see only consolidated progress, escalations, and final summaries unless a child agent opinion is explicitly promoted.
-
-The coordinator is a runtime layer, not a permanent "boss" agent. Claude Code is the default spokesperson and synthesizer, and can also participate as a high-capability node when needed.
-
-See [docs/swarm-architecture.md](/Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub/docs/swarm-architecture.md).
-
-## Layout
+## 核心流程
 
 ```text
-docs/                 architecture and integration notes
-src/agent_swarm_hub/  runtime coordinator implementation
-tests/                focused behavior tests
-scripts/              bootstrap helpers
-config/               example routing and escalation config
+Telegram / Lark
+      |
+      v
+project worker
+      |
+      +--> Claude
+      |     讨论 / 拆解 / 校验 / 汇报
+      |
+      +--> Codex
+            实现 / 执行 / 验证
 ```
 
-## Superpowers Strategy
+典型流转：
 
-`Superpowers` is treated as an optional planning/review layer, not the runtime coordinator.
+1. `/write <task>` 进入 `discussion`
+2. 普通文本继续和 Claude 讨论
+3. `/execute [notes]` 生成结构化执行包
+4. Codex 执行
+5. Claude review 并向用户汇报
 
-Recommended first-pass integrations:
+## 常用命令
 
-- brainstorming
-- writing-plans
-- requesting-code-review
-- systematic-debugging
-- verification-before-completion
+- `/projects`
+- `/use <workspace>`
+- `/where`
+- `/project set-path <path>`
+- `/project set-backend <backend>`
+- `/project set-transport <transport>`
+- `/write <task>`
+- `/execute [notes]`
+- `/status`
+- `/new`
+- `/escalations`
 
-Deferred until needed:
+## 启动
 
-- subagent-driven-development
-- test-driven-development
-- using-git-worktrees
-
-See [docs/superpowers-integration.md](/Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub/docs/superpowers-integration.md).
-
-## Development
-
-Use the `cli` conda environment.
+Telegram:
 
 ```bash
-conda run -n cli pytest
+cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+./scripts/start-telegram.sh
 ```
 
-## Next Steps
+飞书:
 
-1. Add `cc-connect` adapters for Telegram and Lark.
-2. Bind runtime coordinator actions to `ccb` execution backends.
-3. Export install/bootstrap commands into `agent-env` once the interfaces settle.
+```bash
+cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+./scripts/start-lark.sh
+```
+
+一起启动:
+
+```bash
+cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+./scripts/start-local.sh
+```
+
+## 推荐配置
+
+`.env.local` 最少建议包含：
+
+```bash
+ASH_EXECUTOR=claude
+ASH_EXECUTOR_TRANSPORT=ccb
+ASH_PROXY_URL=http://127.0.0.1:6789
+```
+
+说明：
+
+- `ASH_EXECUTOR` 是默认 workspace 后端
+- workspace 级配置会覆盖全局默认值
+- `transport=ccb` 时会优先走 `ask/askd + ccb` 会话路由
+
+## 文档
+
+- [操作手册](/Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub/docs/操作手册.md)
+- [实现手册](/Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub/docs/实现手册.md)
+- [架构说明](/Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub/docs/swarm-architecture.md)

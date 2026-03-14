@@ -14,6 +14,14 @@ fi
 if [[ -n "${ASH_PROXY_URL:-}" ]]; then
   export http_proxy="$ASH_PROXY_URL"
   export https_proxy="$ASH_PROXY_URL"
+  export HTTP_PROXY="$ASH_PROXY_URL"
+  export HTTPS_PROXY="$ASH_PROXY_URL"
+  export all_proxy="$ASH_PROXY_URL"
+  export ALL_PROXY="$ASH_PROXY_URL"
 fi
 
-PYTHONPATH=src conda run -n cli python -m agent_swarm_hub.cli telegram-poll --once "$@"
+if [[ "${CONDA_DEFAULT_ENV:-}" == "cli" ]]; then
+  PYTHONPATH=src python -m agent_swarm_hub.cli telegram-poll "$@"
+else
+  PYTHONPATH=src conda run --live-stream -n cli python -m agent_swarm_hub.cli telegram-poll "$@"
+fi

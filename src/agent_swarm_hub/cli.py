@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from .config import RuntimeConfig, load_env_file
+from .config import RuntimeConfig, apply_runtime_env, load_env_file
 from .lark_ws_runner import LarkWebSocketRunner
 from .telegram_polling import TelegramPollingRunner
 from .telegram_service import TelegramService
@@ -34,6 +34,7 @@ def main() -> int:
 
     args = parser.parse_args()
     load_env_file(args.env_file)
+    apply_runtime_env()
 
     if args.command == "lark-ws":
         config = RuntimeConfig.from_env().lark
@@ -49,7 +50,7 @@ def main() -> int:
             return 0
 
         runner = LarkWebSocketRunner.create(config)
-        runner.start()
+        runner.run_forever()
         return 0
     if args.command == "telegram-poll":
         config = RuntimeConfig.from_env().telegram
@@ -65,14 +66,18 @@ def main() -> int:
             return 0
 
         polling = TelegramPollingRunner(TelegramService(config))
-        result = polling.run_once(offset=args.offset)
-        print(
-            {
-                "updates_seen": result.updates_seen,
-                "updates_processed": result.updates_processed,
-                "next_offset": result.next_offset,
-            }
-        )
+        if args.once:
+            result = polling.run_once(offset=args.offset)
+            print(
+                {
+                    "updates_seen": result.updates_seen,
+                    "updates_processed": result.updates_processed,
+                    "next_offset": result.next_offset,
+                }
+            )
+            return 0
+
+        polling.run_forever(offset=args.offset)
         return 0
 
     return 1

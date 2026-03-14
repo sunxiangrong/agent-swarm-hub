@@ -14,10 +14,18 @@ fi
 if [[ -n "${ASH_PROXY_URL:-}" ]]; then
   export http_proxy="$ASH_PROXY_URL"
   export https_proxy="$ASH_PROXY_URL"
+  export HTTP_PROXY="$ASH_PROXY_URL"
+  export HTTPS_PROXY="$ASH_PROXY_URL"
+  export all_proxy="$ASH_PROXY_URL"
+  export ALL_PROXY="$ASH_PROXY_URL"
 fi
 
 echo "[agent-swarm-hub] starting Lark websocket listener in background"
-PYTHONPATH=src conda run -n cli python -m agent_swarm_hub.cli lark-ws &
+if [[ "${CONDA_DEFAULT_ENV:-}" == "cli" ]]; then
+  PYTHONPATH=src python -m agent_swarm_hub.cli lark-ws &
+else
+  PYTHONPATH=src conda run --live-stream -n cli python -m agent_swarm_hub.cli lark-ws &
+fi
 LARK_PID=$!
 
 cleanup() {
@@ -28,8 +36,12 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-echo "[agent-swarm-hub] running one Telegram polling cycle"
-PYTHONPATH=src conda run -n cli python -m agent_swarm_hub.cli telegram-poll --once
+echo "[agent-swarm-hub] running Telegram polling loop"
+if [[ "${CONDA_DEFAULT_ENV:-}" == "cli" ]]; then
+  PYTHONPATH=src python -m agent_swarm_hub.cli telegram-poll
+else
+  PYTHONPATH=src conda run --live-stream -n cli python -m agent_swarm_hub.cli telegram-poll
+fi
 
 echo "[agent-swarm-hub] Lark listener is still running under PID $LARK_PID"
 echo "[agent-swarm-hub] press Ctrl+C to stop"

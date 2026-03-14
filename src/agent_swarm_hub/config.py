@@ -33,6 +33,14 @@ def load_env_file(path: str | os.PathLike[str] = ".env.local", *, override: bool
     return loaded
 
 
+def apply_runtime_env() -> None:
+    proxy_url = os.getenv("ASH_PROXY_URL", "").strip()
+    if not proxy_url:
+        return
+    for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        os.environ.setdefault(key, proxy_url)
+
+
 @dataclass(frozen=True, slots=True)
 class TelegramConfig:
     enabled: bool = False
