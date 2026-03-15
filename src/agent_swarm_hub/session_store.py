@@ -154,6 +154,17 @@ class SessionStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS ephemeral_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_key TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS workspaces (
                     workspace_id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
@@ -606,6 +617,67 @@ class SessionStore:
                 LIMIT ?
                 """,
                 (session_key, workspace_id, task_id, limit),
+            ).fetchall()
+        return list(reversed(rows))
+
+    def append_ephemeral_message(
+        self,
+        *,
+        session_key: str,
+        workspace_id: str,
+        agent: str,
+        role: str,
+        text: str,
+        expires_at: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ephemeral_messages (session_key, workspace_id, agent, role, text, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (session_key, workspace_id, agent, role, text, expires_at, _utc_now()),
+            )
+
+    def purge_expired_ephemeral_messages(self) -> None:
+        now = _utc_now()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM ephemeral_messages WHERE expires_at <= ?", (now,))
+
+    def trim_ephemeral_messages(self, session_key: str, workspace_id: str, agent: str, *, keep: int = 5) -> None:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id
+                FROM ephemeral_messages
+                WHERE session_key = ? AND workspace_id = ? AND agent = ?
+                ORDER BY id DESC
+                """,
+                (session_key, workspace_id, agent),
+            ).fetchall()
+            stale_ids = [row["id"] for row in rows[keep:]]
+            if stale_ids:
+                conn.executemany("DELETE FROM ephemeral_messages WHERE id = ?", [(item,) for item in stale_ids])
+
+    def list_ephemeral_messages(
+        self,
+        session_key: str,
+        workspace_id: str,
+        agent: str,
+        *,
+        limit: int = 5,
+    ) -> list[sqlite3.Row]:
+        self.purge_expired_ephemeral_messages()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_key, workspace_id, agent, role, text, expires_at, created_at
+                FROM ephemeral_messages
+                WHERE session_key = ? AND workspace_id = ? AND agent = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_key, workspace_id, agent, limit),
             ).fetchall()
         return list(reversed(rows))
 

@@ -21,6 +21,7 @@ def _init_project_session_db(db_path: Path, workspace_path: str) -> None:
                 project_id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 workspace_path TEXT NOT NULL,
+                profile TEXT NOT NULL DEFAULT '',
                 summary TEXT NOT NULL
             );
             CREATE TABLE provider_sessions (
@@ -32,17 +33,23 @@ def _init_project_session_db(db_path: Path, workspace_path: str) -> None:
         )
         conn.execute(
             """
-            INSERT INTO projects (project_id, title, workspace_path, summary)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            ("sheep-gwas-123abc", "sheep-gwas", workspace_path, "Project: sheep-gwas\nRecent user focus: GWAS plotting"),
+            (
+                "sheep-gwas",
+                "sheep-gwas",
+                workspace_path,
+                "Sheep GWAS analysis workspace for plotting, QC, and result interpretation.",
+                "Project: sheep-gwas\nCurrent focus: GWAS plotting",
+            ),
         )
         conn.executemany(
             """
             INSERT INTO provider_sessions (provider, raw_session_id, project_id)
             VALUES (?, ?, ?)
             """,
-            [("claude", "c1", "sheep-gwas-123abc"), ("codex", "x1", "sheep-gwas-123abc")],
+            [("claude", "c1", "sheep-gwas"), ("codex", "x1", "sheep-gwas")],
         )
 
 
@@ -72,6 +79,13 @@ def test_parse_remote_command_supports_execute() -> None:
 
     assert command.name == "execute"
     assert command.argument == "run the tests"
+
+
+def test_parse_remote_command_supports_sessions() -> None:
+    command = parse_remote_command("/sessions")
+
+    assert command.name == "sessions"
+    assert command.argument == ""
 
 
 def test_write_creates_session_and_status_reads_it(tmp_path) -> None:
@@ -127,6 +141,62 @@ def test_plain_text_continues_existing_task(tmp_path) -> None:
     assert "Backend: echo" in continue_response.text
 
 
+def test_short_plain_text_without_active_task_becomes_ephemeral(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="好的",
+        )
+    )
+
+    ephemerals = store.list_ephemeral_messages("telegram:chat-1:root", Path.cwd().name.lower().replace(" ", "-"), "claude")
+    messages = store.list_recent_messages("telegram:chat-1:root")
+
+    assert "ephemeral context only" in response.text
+    assert len(ephemerals) == 1
+    assert ephemerals[0]["text"] == "好的"
+    assert messages == []
+
+
+def test_sessions_reports_formal_and_ephemeral_counts(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
+
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="hello",
+        )
+    )
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Draft a Telegram rollout",
+        )
+    )
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/sessions",
+        )
+    )
+
+    assert "Claude Formal Messages:" in response.text
+    assert "Claude Ephemeral Messages: 1" in response.text
+    assert "Codex Formal Messages: 0" in response.text
+
+
 def test_projects_lists_current_workspace(tmp_path) -> None:
     adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
     default_workspace = Path.cwd().name.lower().replace(" ", "-")
@@ -142,6 +212,44 @@ def test_projects_lists_current_workspace(tmp_path) -> None:
 
     assert "Available workspaces:" in response.text
     assert f"* {default_workspace}" in response.text
+
+
+def test_projects_includes_shared_project_profile(tmp_path, monkeypatch) -> None:
+    workspace_dir = tmp_path / "sheep-gwas"
+    workspace_dir.mkdir()
+    project_db = tmp_path / "project-sessions.sqlite3"
+    _init_project_session_db(project_db, str(workspace_dir.resolve()))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(project_db))
+
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/use sheep-gwas",
+        )
+    )
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text=f"/project set-path {workspace_dir}",
+        )
+    )
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/projects",
+        )
+    )
+
+    assert "* sheep-gwas" in response.text
+    assert "Profile: Sheep GWAS analysis workspace for plotting, QC, and result interpretation." in response.text
 
 
 def test_use_switches_workspace_for_chat(tmp_path) -> None:
@@ -280,10 +388,11 @@ def test_where_and_status_include_shared_project_context(tmp_path, monkeypatch) 
         )
     )
 
-    assert "Project Session: sheep-gwas-123abc" in where.text
+    assert "Project Session: sheep-gwas" in where.text
+    assert "Project Profile: Sheep GWAS analysis workspace for plotting, QC, and result interpretation." in where.text
     assert "Project Provider Sessions: 2" in where.text
     assert "Project Summary: Project: sheep-gwas" in where.text
-    assert "Project Session: sheep-gwas-123abc" in status.text
+    assert "Project Session: sheep-gwas" in status.text
 
 
 def test_execute_routes_codex_then_claude_review(tmp_path) -> None:
@@ -377,6 +486,39 @@ def test_agent_specific_history_is_injected_for_claude_followup(tmp_path) -> Non
     assert codex_rows == []
 
 
+def test_ephemeral_history_is_injected_into_agent_prompt(tmp_path) -> None:
+    class RecordingExecutor(EchoExecutor):
+        def __init__(self):
+            self.prompts = []
+
+        def run(self, prompt: str):
+            self.prompts.append(prompt)
+            return super().run(prompt)
+
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+    executor = RecordingExecutor()
+    adapter = CCConnectAdapter(executor=executor, store=store)
+
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="hello",
+        )
+    )
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Draft the rollout plan",
+        )
+    )
+
+    assert "ephemeral user: hello" in executor.prompts[0]
+
+
 def test_workspace_prompt_includes_shared_project_context(tmp_path, monkeypatch) -> None:
     workspace_dir = tmp_path / "sheep-gwas"
     workspace_dir.mkdir()
@@ -399,8 +541,8 @@ def test_workspace_prompt_includes_shared_project_context(tmp_path, monkeypatch)
             VALUES (?, ?, ?)
             """,
             [
-                ("sheep-gwas-123abc", "user", "Need GWAS plotting help"),
-                ("sheep-gwas-123abc", "assistant", "Prior GWAS plotting suggestions"),
+                ("sheep-gwas", "user", "Need GWAS plotting help"),
+                ("sheep-gwas", "assistant", "Prior GWAS plotting suggestions"),
             ],
         )
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(project_db))
@@ -442,7 +584,8 @@ def test_workspace_prompt_includes_shared_project_context(tmp_path, monkeypatch)
     )
 
     assert executor.prompts
-    assert "Project: sheep-gwas-123abc" in executor.prompts[0]
+    assert "Project: sheep-gwas" in executor.prompts[0]
+    assert "Profile: Sheep GWAS analysis workspace for plotting, QC, and result interpretation." in executor.prompts[0]
     assert "Summary: Project: sheep-gwas" in executor.prompts[0]
     assert "Assigned Agent: claude" in executor.prompts[0]
     assert "Worker Phase: discussion" in executor.prompts[0]

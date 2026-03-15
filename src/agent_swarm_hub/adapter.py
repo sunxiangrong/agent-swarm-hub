@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ PHASE_READY = "ready_for_execution"
 PHASE_EXECUTING = "executing"
 PHASE_REVIEWING = "reviewing"
 PHASE_REPORTED = "reported"
+LOW_SIGNAL_TEXT = {"hi", "hello", "ok", "okay", "好的", "收到", "继续", "开始"}
 
 
 @dataclass(slots=True)
@@ -52,6 +54,8 @@ class CCConnectAdapter:
         workspace_id = self._get_or_create_bound_workspace(message)
         self._ensure_executor_session_id(message.session_key, workspace_id)
         self._load_session(message.session_key, workspace_id)
+        if self._should_treat_as_ephemeral(message, workspace_id):
+            return self._handle_ephemeral(message, workspace_id)
         if message.text.strip() and not message.text.strip().startswith("/") and self._has_active_task(message.session_key, workspace_id):
             return self._handle_continue(message, message.text.strip())
         command = parse_remote_command(message.text)
@@ -66,6 +70,7 @@ class CCConnectAdapter:
                     "/execute [notes]\n"
                     "/new\n"
                     "/status\n"
+                    "/sessions\n"
                     "/escalations\n"
                     "/help"
                 )
@@ -86,6 +91,8 @@ class CCConnectAdapter:
             return self._handle_new(message)
         if command.name == "status":
             return self._handle_status(message)
+        if command.name == "sessions":
+            return self._handle_sessions(message)
         return self._handle_escalations(message)
 
     def publish_event(self, message: RemoteMessage, event: Event) -> AdapterResponse:
@@ -159,6 +166,26 @@ class CCConnectAdapter:
             phase=PHASE_DISCUSSION,
         )
         return AdapterResponse(text=text, task_id=task_id)
+
+    def _handle_ephemeral(self, message: RemoteMessage, workspace_id: str) -> AdapterResponse:
+        text = message.text.strip()
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        self.store.append_ephemeral_message(
+            session_key=message.session_key,
+            workspace_id=workspace_id,
+            agent="claude",
+            role="user",
+            text=text,
+            expires_at=expires_at,
+        )
+        self.store.trim_ephemeral_messages(message.session_key, workspace_id, "claude", keep=5)
+        return AdapterResponse(
+            text=(
+                f"Workspace: {workspace_id}\n"
+                "This short message was kept as ephemeral context only.\n"
+                "It will not enter project summary or long-term session memory."
+            )
+        )
 
     def _handle_continue(self, message: RemoteMessage, argument: str) -> AdapterResponse:
         workspace_id = self._get_or_create_bound_workspace(message)
@@ -409,6 +436,29 @@ class CCConnectAdapter:
             task_id=state.root_task_id,
         )
 
+    def _handle_sessions(self, message: RemoteMessage) -> AdapterResponse:
+        workspace_id = self._get_or_create_bound_workspace(message)
+        session_record = self.store.get_workspace_session(message.session_key, workspace_id)
+        phase = self._current_phase(message.session_key, workspace_id)
+        claude_session_id = self._ensure_agent_session_id(message.session_key, workspace_id, "claude")
+        codex_session_id = self._ensure_agent_session_id(message.session_key, workspace_id, "codex")
+        claude_rows = self.store.list_recent_agent_messages(message.session_key, workspace_id, "claude", limit=50)
+        codex_rows = self.store.list_recent_agent_messages(message.session_key, workspace_id, "codex", limit=50)
+        claude_ephemeral = self.store.list_ephemeral_messages(message.session_key, workspace_id, "claude", limit=50)
+        codex_ephemeral = self.store.list_ephemeral_messages(message.session_key, workspace_id, "codex", limit=50)
+        lines = [
+            f"Workspace: {workspace_id}",
+            f"Phase: {phase}",
+            f"Active Task: {session_record.active_task_id if session_record and session_record.active_task_id else 'none'}",
+            f"Claude Session: {claude_session_id}",
+            f"Codex Session: {codex_session_id}",
+            f"Claude Formal Messages: {len(claude_rows)}",
+            f"Claude Ephemeral Messages: {len(claude_ephemeral)}",
+            f"Codex Formal Messages: {len(codex_rows)}",
+            f"Codex Ephemeral Messages: {len(codex_ephemeral)}",
+        ]
+        return AdapterResponse(text="\n".join(lines), task_id=session_record.active_task_id if session_record else None)
+
     def _handle_escalations(self, message: RemoteMessage) -> AdapterResponse:
         workspace_id = self._get_or_create_bound_workspace(message)
         state = self._load_session(message.session_key, workspace_id)
@@ -430,6 +480,9 @@ class CCConnectAdapter:
         for workspace in workspaces:
             marker = "*" if workspace.workspace_id == workspace_id else "-"
             lines.append(f"{marker} {workspace.workspace_id} ({workspace.backend}/{workspace.transport})")
+            project = self.project_context_store.get_for_workspace_path(workspace.path)
+            if project and project.profile:
+                lines.append(f"  Profile: {project.profile}")
         return AdapterResponse(text="\n".join(lines))
 
     def _handle_use(self, message: RemoteMessage, argument: str) -> AdapterResponse:
@@ -683,6 +736,7 @@ class CCConnectAdapter:
             return ""
         return (
             f"Project Session: {project.project_id}\n"
+            f"Project Profile: {project.profile}\n"
             f"Project Summary: {project.summary}\n"
             f"Project Provider Sessions: {project.provider_session_count}\n"
             f"Project Active Sessions: {project.active_session_count}\n"
@@ -718,9 +772,10 @@ class CCConnectAdapter:
 
     def _agent_history_text(self, *, session_key: str, workspace_id: str, agent: str) -> str:
         rows = self.store.list_recent_agent_messages(session_key, workspace_id, agent, limit=6)
-        if not rows:
-            return ""
-        return "\n".join(f"- {row['role']}: {row['text']}" for row in rows)
+        ephemeral_rows = self.store.list_ephemeral_messages(session_key, workspace_id, agent, limit=5)
+        lines = [f"- {row['role']}: {row['text']}" for row in rows]
+        lines.extend(f"- ephemeral {row['role']}: {row['text']}" for row in ephemeral_rows)
+        return "\n".join(lines)
 
     @staticmethod
     def _ccb_env(*, agent_session_id: str, work_dir: str | None) -> dict[str, str]:
@@ -729,6 +784,19 @@ class CCConnectAdapter:
             env["CCB_WORK_DIR"] = work_dir
             env["CCB_RUN_DIR"] = work_dir
         return env
+
+    def _should_treat_as_ephemeral(self, message: RemoteMessage, workspace_id: str) -> bool:
+        text = (message.text or "").strip()
+        if not text or text.startswith("/"):
+            return False
+        if self._has_active_task(message.session_key, workspace_id):
+            return False
+        lowered = text.lower()
+        if lowered in LOW_SIGNAL_TEXT:
+            return True
+        if len(text) <= 12:
+            return True
+        return False
 
     def _build_execution_packet(
         self,
