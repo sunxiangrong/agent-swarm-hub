@@ -701,14 +701,34 @@ class CCConnectAdapter:
         return AdapterResponse(text="\n".join(lines), task_id=state.root_task_id)
 
     def _handle_projects(self, message: RemoteMessage, workspace_id: str | None) -> AdapterResponse:
-        workspaces = self.store.list_workspaces()
-        lines = ["Available workspaces:"]
-        for workspace in workspaces:
+        local_workspaces = {workspace.workspace_id: workspace for workspace in self.store.list_workspaces()}
+        shared_projects = self.project_context_store.list_projects()
+        for project in shared_projects:
+            local_workspaces.setdefault(
+                project.project_id,
+                self.store.get_workspace(project.project_id)
+                or self._workspace_record_from_project(project.project_id),
+            )
+        lines = ["Projects:"]
+        for workspace_id_key in sorted(local_workspaces):
+            workspace = local_workspaces[workspace_id_key]
             marker = "*" if workspace.workspace_id == workspace_id else "-"
-            lines.append(f"{marker} {workspace.workspace_id} ({workspace.backend}/{workspace.transport})")
-            project = self.project_context_store.get_for_workspace_path(workspace.path)
+            lines.append(f"{marker} {workspace.workspace_id}")
+            lines.append(f"  Mode: formal ({workspace.backend}/{workspace.transport})")
+            project = self.project_context_store.get_project(workspace.workspace_id)
+            if project is None:
+                project = self.project_context_store.get_for_workspace_path(workspace.path)
+            path_text = self._short_path(project.workspace_path if project and project.workspace_path else workspace.path)
+            lines.append(f"  Path: {path_text or 'not set'}")
             if project and project.profile:
                 lines.append(f"  Profile: {project.profile}")
+                focus = self._project_focus(project.summary)
+                if focus:
+                    lines.append(f"  Focus: {focus}")
+        temp_marker = "*" if workspace_id is None else "-"
+        lines.append(f"{temp_marker} temporary")
+        lines.append("  Mode: temporary")
+        lines.append("  Profile: 临时对话模式，不进入项目长期记忆；切换离开时清理临时上下文。")
         if workspace_id is None:
             lines.append("No project is currently bound to this chat. Use /use <workspace> to enter formal project mode.")
         return AdapterResponse(text="\n".join(lines))
@@ -717,6 +737,16 @@ class CCConnectAdapter:
         workspace_id = self._normalize_workspace_id(argument)
         if not workspace_id:
             return AdapterResponse(text="Usage: /use <workspace>")
+        if workspace_id in {"temporary", "temp"}:
+            self.store.clear_chat_binding(message.session_key)
+            self.store.clear_ephemeral_messages(message.session_key, EPHEMERAL_WORKSPACE_ID)
+            return AdapterResponse(
+                text=(
+                    "Current mode switched to `temporary`.\n"
+                    "Temporary messages will not enter project memory and will be cleared when you switch away."
+                )
+            )
+        self.store.clear_ephemeral_messages(message.session_key, EPHEMERAL_WORKSPACE_ID)
         self._ensure_workspace(workspace_id)
         self.store.bind_chat(
             session_key=message.session_key,
@@ -862,6 +892,19 @@ class CCConnectAdapter:
     def _ensure_workspace(self, workspace_id: str) -> None:
         if self.store.get_workspace(workspace_id) is not None:
             return
+        shared_project = self.project_context_store.get_project(workspace_id)
+        if shared_project is not None:
+            default_backend = "claude"
+            if "codex" in shared_project.project_id.casefold():
+                default_backend = "codex"
+            self.store.upsert_workspace(
+                workspace_id=workspace_id,
+                title=shared_project.title,
+                path=shared_project.workspace_path or "",
+                backend=default_backend,
+                transport=self._current_transport(),
+            )
+            return
         self.store.upsert_workspace(
             workspace_id=workspace_id,
             title=workspace_id,
@@ -869,6 +912,45 @@ class CCConnectAdapter:
             backend=self._current_backend(),
             transport=self._current_transport(),
         )
+
+    @staticmethod
+    def _workspace_record_from_project(project_id: str):
+        from .session_store import WorkspaceRecord
+
+        default_backend = "codex" if "codex" in project_id.casefold() else "claude"
+        return WorkspaceRecord(
+            workspace_id=project_id,
+            title=project_id,
+            path="",
+            backend=default_backend,
+            transport="direct",
+            created_at="",
+            updated_at="",
+        )
+
+    @staticmethod
+    def _short_path(path: str | None) -> str:
+        raw = (path or "").strip()
+        if not raw:
+            return ""
+        if len(raw) <= 72:
+            return raw
+        return f"...{raw[-69:]}"
+
+    @staticmethod
+    def _project_focus(summary: str | None) -> str:
+        text = (summary or "").strip()
+        if not text:
+            return ""
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Current focus:"):
+                return stripped.removeprefix("Current focus:").strip()
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Recent context:"):
+                return stripped.removeprefix("Recent context:").strip()
+        return ""
 
     def _ensure_executor_session_id(self, session_key: str, workspace_id: str) -> str:
         record = self.store.get_workspace_session(session_key, workspace_id)
@@ -1094,7 +1176,7 @@ class CCConnectAdapter:
             "discussion_brief": discussion_brief,
             "execution_note": note,
             "recent_discussion": [f"{row['role']}: {row['text']}" for row in recent[-6:]],
-            "instructions": "Implement the agreed change, run the most relevant verification you can, and report concrete results.",
+            "instructions": "Implement the agreed change, self-validate while executing, run the most relevant verification you can, and report concrete results.",
         }
         if execution_plan is not None:
             packet["execution_plan"] = execution_plan
@@ -1130,10 +1212,10 @@ class CCConnectAdapter:
             return []
         suggestions: list[str] = []
         if any(item in text for item in {"test", "验证", "测试"}):
-            suggestions.append("tester")
+            suggestions.append("isolated-test")
         if any(item in text for item in {"docs", "文档", "总结"}):
-            suggestions.append("reporter")
-        suggestions.append("subcodex")
+            suggestions.append("isolated-docs")
+        suggestions.append("isolated-implementation")
         return suggestions
 
     def _build_execution_plan(
@@ -1154,6 +1236,7 @@ class CCConnectAdapter:
             "operator_note": operator_note.strip() or "No extra operator note.",
             "discussion_brief": discussion_brief,
             "planner_output": planner_output,
+            "subagent_policy": "Only spawn sub-agents when a large task needs context isolation. Sub-agents are not organizational roles.",
         }
 
     def _run_subagents(
@@ -1244,7 +1327,7 @@ class CCConnectAdapter:
 
     @staticmethod
     def _subagent_backend_mode(role: str) -> str:
-        return "claude" if role in {"reporter", "planner"} else "codex"
+        return "codex"
 
     @staticmethod
     def _build_subagent_packet(
@@ -1259,7 +1342,7 @@ class CCConnectAdapter:
             "subagent_role": role,
             "execution_plan": execution_plan,
             "execution_packet": execution_packet,
-            "instructions": "Complete your specialized slice of the task and return concrete findings for the main worker.",
+            "instructions": "Use this isolated execution context to complete only your specialized slice of the task, then return concrete findings to the main worker.",
         }
 
     @staticmethod
@@ -1275,7 +1358,7 @@ class CCConnectAdapter:
             f"Estimated complexity: {complexity}\n"
             f"Operator note: {operator_note.strip() or 'No extra operator note.'}\n"
             f"Discussion brief:\n{json.dumps(discussion_brief, ensure_ascii=False, indent=2)}\n\n"
-            "Produce a concise execution plan. State whether sub-agents are needed, suggest their roles, and outline the main execution steps."
+            "Produce a concise execution plan. Only suggest sub-agents when context isolation is needed. Treat sub-agents as isolated execution contexts, not organizational roles. Outline the main execution steps."
         )
 
     def _build_discussion_brief(

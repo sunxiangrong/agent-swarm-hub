@@ -23,7 +23,7 @@ fi
 PROVIDER="${1:-${ASH_EXECUTOR:-codex}}"
 PROJECT="${2:-}"
 
-echo "[agent-swarm-hub] starting local chat"
+echo "[agent-swarm-hub] starting swarm shell"
 echo "[agent-swarm-hub] provider=$PROVIDER"
 if [[ -n "$PROJECT" ]]; then
   echo "[agent-swarm-hub] project=$PROJECT"
@@ -31,14 +31,14 @@ fi
 
 if [[ "${CONDA_DEFAULT_ENV:-}" == "cli" ]]; then
   if [[ -n "$PROJECT" ]]; then
-    PYTHONPATH=src python -m agent_swarm_hub.cli local-native --provider "$PROVIDER" --project "$PROJECT"
+    PYTHONPATH=src python -m agent_swarm_hub.cli local-chat --provider "$PROVIDER" --project "$PROJECT"
   else
-    PYTHONPATH=src python -m agent_swarm_hub.cli local-native --provider "$PROVIDER"
+    PYTHONPATH=src python -m agent_swarm_hub.cli local-chat --provider "$PROVIDER"
   fi
 else
   if [[ -n "$PROJECT" ]]; then
-    PYTHONPATH=src conda run --live-stream -n cli python -m agent_swarm_hub.cli local-native --provider "$PROVIDER" --project "$PROJECT"
+    PYTHONPATH=src conda run --live-stream -n cli python -m agent_swarm_hub.cli local-chat --provider "$PROVIDER" --project "$PROJECT"
   else
-    PYTHONPATH=src conda run --live-stream -n cli python -m agent_swarm_hub.cli local-native --provider "$PROVIDER"
+    PYTHONPATH=src conda run --live-stream -n cli python -m agent_swarm_hub.cli local-chat --provider "$PROVIDER"
   fi
 fi

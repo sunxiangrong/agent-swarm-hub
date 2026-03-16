@@ -53,6 +53,14 @@ class ProjectContextStore:
             projects.append(ProjectContext(**payload))
         return projects
 
+    def get_project(self, project_id: str) -> ProjectContext | None:
+        if not project_id or not self.db_path.exists():
+            return None
+        for project in self.list_projects():
+            if project.project_id == project_id:
+                return project
+        return None
+
     def get_for_workspace_path(self, workspace_path: str | None) -> ProjectContext | None:
         if not workspace_path or not self.db_path.exists():
             return None

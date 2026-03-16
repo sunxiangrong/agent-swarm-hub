@@ -159,3 +159,27 @@ def test_cli_local_native_launches_provider_in_workspace(monkeypatch, tmp_path) 
     assert captured["env"]["ASH_ACTIVE_WORKSPACE"] == "project-alpha"
     assert captured["env"]["CCB_WORK_DIR"] == str(workspace_path)
     assert captured["env"]["CCB_RUN_DIR"] == str(workspace_path)
+
+
+def test_cli_local_native_rejects_workspace_without_path(monkeypatch, tmp_path, capsys) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+
+    from agent_swarm_hub.session_store import SessionStore
+
+    store = SessionStore(db_path)
+    store.upsert_workspace(
+        workspace_id="project-alpha",
+        title="project-alpha",
+        path="",
+        backend="codex",
+        transport="direct",
+    )
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+
+    exit_code = main()
+    err = capsys.readouterr().err
+
+    assert exit_code == 2
+    assert "has no configured path" in err

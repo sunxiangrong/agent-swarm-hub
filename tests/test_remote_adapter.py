@@ -387,7 +387,8 @@ def test_projects_lists_current_workspace(tmp_path) -> None:
         )
     )
 
-    assert "Available workspaces:" in response.text
+    assert "Projects:" in response.text
+    assert "temporary" in response.text
     assert "No project is currently bound to this chat." in response.text
 
 
@@ -426,7 +427,50 @@ def test_projects_includes_shared_project_profile(tmp_path, monkeypatch) -> None
     )
 
     assert "* sheep-gwas" in response.text
+    assert "Mode: formal" in response.text
+    assert "Path:" in response.text
     assert "Profile: Sheep GWAS analysis workspace for plotting, QC, and result interpretation." in response.text
+
+
+def test_use_creates_unknown_workspace(tmp_path) -> None:
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/use does-not-exist",
+        )
+    )
+
+    assert "switched to `does-not-exist`" in response.text
+
+
+def test_use_temporary_clears_binding_and_ephemeral_context(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
+
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="Brainstorm a rollout approach for this idea",
+        )
+    )
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/use temporary",
+        )
+    )
+
+    assert "switched to `temporary`" in response.text
+    assert store.get_chat_binding("telegram:chat-1:root") is None
+    assert store.list_ephemeral_messages("telegram:chat-1:root", "__ephemeral__", "claude") == []
 
 
 def test_use_switches_workspace_for_chat(tmp_path) -> None:
@@ -757,7 +801,7 @@ def test_unbound_ephemeral_history_is_not_injected_into_formal_project_prompt(tm
 
     assert "ephemeral user: hello" not in executor.prompts[0]
     ephemerals = store.list_ephemeral_messages("telegram:chat-1:root", "__ephemeral__", "claude")
-    assert len(ephemerals) == 1
+    assert ephemerals == []
 
 
 def test_workspace_prompt_includes_shared_project_context(tmp_path, monkeypatch) -> None:

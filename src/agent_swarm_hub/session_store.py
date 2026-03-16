@@ -231,6 +231,10 @@ class SessionStore:
             return None
         return WorkspaceRecord(**dict(row))
 
+    def clear_chat_binding(self, session_key: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM chat_bindings WHERE session_key = ?", (session_key,))
+
     def list_workspaces(self) -> list[WorkspaceRecord]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -696,6 +700,16 @@ class SessionStore:
                 (session_key, workspace_id, agent, limit),
             ).fetchall()
         return list(reversed(rows))
+
+    def clear_ephemeral_messages(self, session_key: str, workspace_id: str | None = None) -> None:
+        with self._connect() as conn:
+            if workspace_id is None:
+                conn.execute("DELETE FROM ephemeral_messages WHERE session_key = ?", (session_key,))
+            else:
+                conn.execute(
+                    "DELETE FROM ephemeral_messages WHERE session_key = ? AND workspace_id = ?",
+                    (session_key, workspace_id),
+                )
 
     @staticmethod
     def dumps_json(data: object) -> str:

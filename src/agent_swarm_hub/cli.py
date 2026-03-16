@@ -146,6 +146,13 @@ def _run_local_native(*, provider: str, project: str | None) -> int:
     if selected_workspace and workspace is None:
         print(f"Unknown workspace: {selected_workspace}", file=sys.stderr)
         return 2
+    if workspace is not None and not (workspace.path or "").strip():
+        print(
+            f"Workspace `{workspace.workspace_id}` has no configured path.\n"
+            "Set a project path before entering native CLI.",
+            file=sys.stderr,
+        )
+        return 2
 
     work_dir = workspace.path if workspace and workspace.path else os.getcwd()
     env = os.environ.copy()
