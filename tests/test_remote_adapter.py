@@ -3,6 +3,7 @@ import sqlite3
 
 from agent_swarm_hub import (
     CCConnectAdapter,
+    ConfirmationRequiredError,
     EchoExecutor,
     Event,
     EventType,
@@ -101,6 +102,13 @@ def test_parse_remote_command_supports_sessions() -> None:
     assert command.argument == ""
 
 
+def test_parse_remote_command_supports_confirm() -> None:
+    command = parse_remote_command("/confirm")
+
+    assert command.name == "confirm"
+    assert command.argument == ""
+
+
 def test_parse_remote_command_supports_worker_and_tasks() -> None:
     worker = parse_remote_command("/worker")
     tasks = parse_remote_command("/tasks")
@@ -124,7 +132,50 @@ def test_help_includes_command_explanations(tmp_path) -> None:
     assert "项目命令:" in response.text
     assert "/projects  查看可用项目列表" in response.text
     assert "/worker  查看当前 worker phase" in response.text
+    assert "/confirm  当 bridge 上浮确认请求时继续执行" in response.text
     assert "未绑定项目时" in response.text
+
+
+def test_confirm_replays_pending_write_and_returns_result(tmp_path) -> None:
+    class ConfirmingExecutor(EchoExecutor):
+        def __init__(self):
+            self.calls = 0
+
+        def run(self, prompt: str):
+            self.calls += 1
+            if self.calls == 1:
+                raise ConfirmationRequiredError(
+                    prompt="Claude requires workspace trust confirmation. Use /confirm to continue.",
+                    agent="claude",
+                    kind="claude_trust",
+                )
+            return super().run(prompt)
+
+    adapter = CCConnectAdapter(executor=ConfirmingExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
+    _bind_workspace(adapter)
+
+    blocked = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Draft a Telegram rollout",
+        )
+    )
+    confirmed = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/confirm",
+        )
+    )
+
+    assert "Confirmation Required" in blocked.text
+    assert "Use /confirm to continue." in blocked.text
+    assert "Confirmation accepted for claude." in confirmed.text
+    assert "Phase: discussion" in confirmed.text
+    assert "Backend: echo" in confirmed.text
 
 
 def test_write_creates_session_and_status_reads_it(tmp_path) -> None:
@@ -656,15 +707,20 @@ def test_execute_routes_codex_then_claude_review(tmp_path) -> None:
     )
     handoffs = store.list_task_handoffs("telegram:chat-1:root", workspace_id, write_task_id := response.task_id or "")
 
-    assert len(executor.prompts) == 3
+    assert len(executor.prompts) == 4
     assert "Assigned Agent: claude" in executor.prompts[0]
-    assert "Assigned Agent: codex" in executor.prompts[1]
-    assert "Assigned Agent: claude" in executor.prompts[2]
+    assert any("Assigned Agent: codex" in prompt for prompt in executor.prompts)
+    assert "Assigned Agent: claude" in executor.prompts[-1]
     assert "Phase: reported" in response.text
     assert "Execution Backend: echo" in response.text
     assert "Report Backend: echo" in response.text
     assert "Phase: reported" in status.text
-    assert [row["handoff_type"] for row in handoffs] == ["discussion_brief", "execution_packet", "review_verdict"]
+    handoff_types = [row["handoff_type"] for row in handoffs]
+    assert handoff_types[0] == "discussion_brief"
+    assert "execution_packet" in handoff_types
+    assert "verification_packet" in handoff_types
+    assert "verification_result" in handoff_types
+    assert handoff_types[-1] == "review_verdict"
 
 
 def test_large_task_execute_runs_planning_before_codex(tmp_path) -> None:
@@ -701,29 +757,49 @@ def test_large_task_execute_runs_planning_before_codex(tmp_path) -> None:
 
     handoffs = store.list_task_handoffs("telegram:chat-1:root", workspace_id, response.task_id or "")
 
-    assert len(executor.prompts) == 7
-    assert "Worker Phase: planning" in executor.prompts[1]
-    assert "Assigned Agent: claude" in executor.prompts[1]
-    assert "Assigned Agent: codex" in executor.prompts[2]
-    assert "subagent_role" in executor.prompts[2]
-    assert "Assigned Agent: codex" in executor.prompts[5]
-    assert "subagent_results" in executor.prompts[5]
+    assert len(executor.prompts) == 8
+    assert any("Worker Phase: planning" in prompt and "Assigned Agent: claude" in prompt for prompt in executor.prompts)
+    assert any("Assigned Agent: codex" in prompt and "subagent_role" in prompt for prompt in executor.prompts)
+    assert any("Assigned Agent: codex" in prompt and "subagent_results" in prompt for prompt in executor.prompts)
+    assert "Assigned Agent: claude" in executor.prompts[-1]
     assert "Complexity: large" in response.text
     assert "Planning Backend: echo" in response.text
     assert "Sub-agent Runs: 3" in response.text
-    assert [row["handoff_type"] for row in handoffs] == [
-        "discussion_brief",
-        "execution_plan",
-        "execution_packet",
-        "subagent_packet",
-        "subagent_result",
-        "subagent_packet",
-        "subagent_result",
-        "subagent_packet",
-        "subagent_result",
-        "review_verdict",
-    ]
+    handoff_types = [row["handoff_type"] for row in handoffs]
+    assert "execution_packet" in handoff_types
+    assert handoff_types.count("subagent_packet") == 3
+    assert handoff_types.count("subagent_result") == 3
+    assert "verification_packet" in handoff_types
+    assert "verification_result" in handoff_types
+    assert handoff_types[-1] == "review_verdict"
     assert "suggested_subagents" in handoffs[1]["content_json"]
+    tasks = store.list_tasks("telegram:chat-1:root", workspace_id)
+    assert tasks[0].status == "completed"
+
+
+def test_codex_prompt_loads_execution_guidance_docs(tmp_path) -> None:
+    class RecordingExecutor(EchoExecutor):
+        def __init__(self):
+            self.prompts = []
+
+        def run(self, prompt: str):
+            self.prompts.append(prompt)
+            return super().run(prompt)
+
+    adapter = CCConnectAdapter(executor=RecordingExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
+    _bind_workspace(adapter)
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Implement the rollout plan",
+        )
+    )
+
+    assert response.task_id is not None
+    prompt = adapter.executor.prompts[0]
+    assert "The remote chat shell and local swarm shell should share the same command logic." in prompt
 
 
 def test_agent_specific_history_is_injected_for_claude_followup(tmp_path) -> None:
@@ -1100,8 +1176,8 @@ def test_new_clears_active_task_context(tmp_path) -> None:
     assert "No active task" in status_response.text
 
 
-def test_blocker_event_becomes_visible_escalation() -> None:
-    adapter = CCConnectAdapter(executor=EchoExecutor())
+def test_blocker_event_becomes_visible_escalation(tmp_path) -> None:
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
     adapter.handle_message(
         RemoteMessage(
             platform=RemotePlatform.LARK,

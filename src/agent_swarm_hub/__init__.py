@@ -6,6 +6,7 @@ from .escalation import EscalationDecision, EscalationPolicy
 from .executor import (
     AskExecutor,
     ClaudePrintExecutor,
+    ConfirmationRequiredError,
     CodexExecExecutor,
     EchoExecutor,
     ExecutionResult,
@@ -42,6 +43,7 @@ __all__ = [
     "CCConnectAdapter",
     "ChannelDispatchResult",
     "ClaudePrintExecutor",
+    "ConfirmationRequiredError",
     "CodexExecExecutor",
     "EchoExecutor",
     "EscalationDecision",

@@ -520,13 +520,25 @@ class SessionStore:
         task_id: str | None = None,
         platform_message_id: str | None = None,
     ) -> None:
+        normalized_session_key = str(session_key)
+        normalized_task_id = None if task_id is None else str(task_id)
+        normalized_role = str(role)
+        normalized_platform_message_id = "" if platform_message_id is None else str(platform_message_id)
+        normalized_text = str(text)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO messages (session_key, task_id, role, platform_message_id, text, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (session_key, task_id, role, platform_message_id, text, _utc_now()),
+                (
+                    normalized_session_key,
+                    normalized_task_id,
+                    normalized_role,
+                    normalized_platform_message_id,
+                    normalized_text,
+                    _utc_now(),
+                ),
             )
 
     def append_agent_message(

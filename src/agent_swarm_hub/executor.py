@@ -7,10 +7,26 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+import json
 
 
 class ExecutorError(RuntimeError):
     pass
+
+
+class ConfirmationRequiredError(ExecutorError):
+    def __init__(self, *, prompt: str, agent: str, kind: str):
+        super().__init__(prompt)
+        self.prompt = prompt
+        self.agent = agent
+        self.kind = kind
+
+
+class AuthenticationRequiredError(ExecutorError):
+    def __init__(self, *, prompt: str, agent: str):
+        super().__init__(prompt)
+        self.prompt = prompt
+        self.agent = agent
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,9 +76,35 @@ class AskExecutor(Executor):
             timeout=self.timeout_s + 15,
             env=env,
         )
+        marker = "[CCB_CONFIRMATION_REQUIRED]"
+        auth_marker = "[CCB_AUTHENTICATION_REQUIRED]"
+        stdout_text = (proc.stdout or "").strip()
+        stderr_text = (proc.stderr or "").strip()
+        for stream_text in (stdout_text, stderr_text):
+            if marker in stream_text:
+                payload_text = stream_text.split(marker, 1)[1].strip()
+                try:
+                    payload = json.loads(payload_text)
+                except Exception:
+                    payload = {}
+                raise ConfirmationRequiredError(
+                    prompt=str(payload.get("prompt") or "Confirmation required."),
+                    agent=str(payload.get("agent") or self.provider),
+                    kind=str(payload.get("kind") or ""),
+                )
+            if auth_marker in stream_text:
+                payload_text = stream_text.split(auth_marker, 1)[1].strip()
+                try:
+                    payload = json.loads(payload_text)
+                except Exception:
+                    payload = {}
+                raise AuthenticationRequiredError(
+                    prompt=str(payload.get("prompt") or "Authentication required."),
+                    agent=str(payload.get("agent") or self.provider),
+                )
         if proc.returncode != 0:
-            raise ExecutorError(proc.stderr.strip() or proc.stdout.strip() or f"ask {self.provider} failed")
-        output = proc.stdout.strip()
+            raise ExecutorError(stderr_text or stdout_text or f"ask {self.provider} failed")
+        output = stdout_text
         if not output:
             raise ExecutorError(f"ask {self.provider} returned no final message")
         print(f"[agent-swarm-hub] executor=ask provider={self.provider} completed", file=sys.stderr, flush=True)
@@ -77,9 +119,54 @@ class FallbackExecutor(Executor):
     def run(self, prompt: str) -> ExecutionResult:
         try:
             return self.primary.run(prompt)
+        except ConfirmationRequiredError:
+            raise
+        except AuthenticationRequiredError:
+            raise
         except ExecutorError as exc:
             print(f"[agent-swarm-hub] primary executor failed, falling back: {exc}", file=sys.stderr, flush=True)
             return self.fallback.run(prompt)
+
+
+def send_bridge_confirmation(*, mode: str, work_dir: str | None) -> bool:
+    if not work_dir:
+        return False
+    lib_dir = Path(os.getenv("ASH_CCB_LIB_DIR", "/Users/sunxiangrong/Desktop/CLI/Codex/claude_code_bridge/lib"))
+    if not lib_dir.exists():
+        return False
+
+    cwd_before = Path.cwd()
+    try:
+        os.chdir(work_dir)
+        sys.path.insert(0, str(lib_dir))
+        if mode == "claude":
+            from claude_comm import ClaudeCommunicator  # type: ignore
+
+            comm = ClaudeCommunicator(lazy_init=True)
+            backend = comm.backend
+            pane_id = comm.pane_id
+        else:
+            from caskd_session import load_project_session  # type: ignore
+
+            session = load_project_session(Path(work_dir))
+            if not session:
+                return False
+            ok, pane_id = session.ensure_pane()
+            if not ok:
+                return False
+            backend = session.backend()
+        if not backend or not pane_id:
+            return False
+        send_key = getattr(backend, "send_key", None)
+        if not callable(send_key):
+            return False
+        return bool(send_key(str(pane_id), "Enter"))
+    finally:
+        try:
+            sys.path = [p for p in sys.path if p != str(lib_dir)]
+        except Exception:
+            pass
+        os.chdir(cwd_before)
 
 
 class ClaudePrintExecutor(Executor):

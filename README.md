@@ -1,13 +1,13 @@
 # agent-swarm-hub
 
-项目级 agent 中枢。它把 Telegram、飞书、本地 CLI、共享项目会话库、Claude/Codex 分工，以及 `ccb/askd` 执行底座接在一起。
+项目级 agent 中枢。它把 Telegram、飞书、本地 swarm shell、共享项目会话库、Claude/Codex 分工，以及 `ccb/askd` 执行底座接在一起。
 
 它现在有两种使用形态：
 
 - 远程聊天模式  
   Telegram / 飞书进入统一项目命令层，适合项目管理、监控和汇报。
-- 本地原生模式  
-  先选项目，再直接进入原生 `claude` / `codex` CLI，适合本地编码和深度对话。
+- 本地 swarm 模式  
+  先选项目，再直接进入本地 swarm shell，适合项目级协同、任务监控与跨 agent 调度。
 
 ## 核心目标
 
@@ -15,7 +15,7 @@
 - Claude 与 Codex 在项目内协作
 - `ccb` 负责底层会话载体
 - 远程聊天负责项目管理和汇报
-- 本地 CLI 负责进入原生 agent 工作流
+- 本地 `ash-chat` 负责进入项目并直接进入 swarm
 
 ## 当前能力
 
@@ -42,10 +42,11 @@
   - `reported`
 - Claude/Codex 双 agent 分工：
   - Claude：讨论、拆解、规划、校验、汇报
-  - Codex：实现、执行、验证
+  - Codex：实现、执行、自校验
 - sub-agent 派发：
   - 大任务先规划
   - 根据 `execution_plan` 自动建议并派发 sub-agent
+- sub-agent 用于上下文隔离，而不是模拟组织层级
 - 双 agent 独立 session id：
   - `claude_session_id`
   - `codex_session_id`
@@ -60,7 +61,13 @@
   - `execution_packet`
   - `subagent_packet`
   - `subagent_result`
+  - `verification_packet`
+  - `verification_result`
   - `review_verdict`
+- 交互确认上浮：
+  - Claude `go ahead` / proceed 页会回到聊天壳
+  - 用户通过 `/confirm` 继续
+  - 启动级认证问题会返回 `Authentication Required`
 - `ccb` 环境注入：
   - `CCB_SESSION_ID`
   - `CCB_WORK_DIR`
@@ -91,12 +98,20 @@ project worker
 6. Codex 执行
 7. Claude review 并向用户汇报
 
-本地模式典型流转：
+本地 swarm 模式典型流转：
 
 1. `ash-chat codex` 或 `ash-chat claude`
 2. 启动前先选项目
-3. 绑定项目目录与 `ccb` 环境
-4. 直接进入原生 `codex` / `claude` CLI
+3. 进入项目后直接进入 swarm shell
+4. 使用与远程聊天一致的命令：
+   - `/projects`
+   - `/use`
+   - `/where`
+   - `/write`
+   - `/execute`
+   - `/worker`
+   - `/tasks`
+   - `/sessions`
 
 ## 使用模式
 
@@ -115,13 +130,14 @@ project worker
 - 飞书
 - `python -m agent_swarm_hub.cli local-chat`
 
-### 2. 本地原生模式
+### 2. 本地 swarm 模式
 
 适合：
 
-- 直接进入 `claude` / `codex` 原生 CLI
-- 在开始对话前绑定项目
-- 保持本地使用习惯
+- 本地跨 agent 协作
+- 项目级 worker 调度
+- 监控 planning / sub-agent / handoff / phase
+- 与远程聊天保持同一套命令逻辑
 
 入口：
 
@@ -196,17 +212,11 @@ ash-chat claude
 
 说明：
 
-- `start-chat.sh` / `ash-chat` 现在默认进入本地原生模式
+- `start-chat.sh` / `ash-chat` 现在默认进入本地 swarm shell
 - 启动前会从共享项目库里选择项目
-- 选定项目后，直接进入原生 `claude` / `codex` CLI
-- 不再先进入 `/write` 风格的本地聊天壳
-
-如果你要保留统一命令层的本地测试入口，仍可手动运行：
-
-```bash
-cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
-PYTHONPATH=src conda run -n cli python -m agent_swarm_hub.cli local-chat --provider codex
-```
+- 选定项目后，直接进入统一命令层
+- 远程聊天与本地 swarm shell 的命令和行为应保持一致
+- 原生 `claude` / `codex` CLI 仍然保留，但不再是 `ash-chat` 的默认目标
 
 ## 推荐配置
 
@@ -223,6 +233,18 @@ ASH_PROXY_URL=http://127.0.0.1:6789
 - `ASH_EXECUTOR` 是默认 workspace 后端
 - workspace 级配置会覆盖全局默认值
 - `transport=ccb` 时会优先走 `ask/askd + ccb` 会话路由
+
+## 当前真实联调状态
+
+- Claude bridge 已经基本修通：
+  - trust prompt 自动通过
+  - `go ahead` / proceed 这类执行确认会上浮
+  - planning 即使未显式输出 `CCB_DONE`，也能靠 idle 收口继续
+- Codex bridge 也已能稳定 mounted / ping
+- 当前真实 end-to-end 多 agent 闭环剩下的主要阻塞点是：
+  - fresh Codex pane 在某些环境下仍会落到登录页
+  - 这类问题现在会明确上浮为 `Authentication Required`
+  - 不会再静默卡死
 
 ## 数据层
 
