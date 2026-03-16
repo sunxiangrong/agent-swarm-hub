@@ -25,6 +25,34 @@ class ProjectContextStore:
     def __init__(self, db_path: str | None = None):
         self.db_path = Path(db_path or os.getenv("ASH_PROJECT_SESSION_DB", "").strip() or DEFAULT_PROJECT_SESSION_DB)
 
+    def list_projects(self) -> list[ProjectContext]:
+        if not self.db_path.exists():
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            provider_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_sessions)").fetchall()}
+            project_columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
+            active_expr = "SUM(CASE WHEN ps.status = 'active' THEN 1 ELSE 0 END)" if "status" in provider_columns else "COUNT(ps.raw_session_id)"
+            profile_expr = "p.profile" if "profile" in project_columns else "'' AS profile"
+            rows = conn.execute(
+                f"""
+                SELECT p.project_id, p.title, p.workspace_path, {profile_expr}, p.summary,
+                       COUNT(ps.raw_session_id) AS provider_session_count,
+                       {active_expr} AS active_session_count
+                FROM projects p
+                LEFT JOIN provider_sessions ps ON ps.project_id = p.project_id
+                GROUP BY p.project_id, p.title, p.workspace_path, profile, p.summary
+                ORDER BY p.project_id ASC
+                """
+            ).fetchall()
+        projects: list[ProjectContext] = []
+        for row in rows:
+            payload = dict(row)
+            payload["active_session_count"] = payload.get("active_session_count") or 0
+            payload["recent_messages"] = ()
+            projects.append(ProjectContext(**payload))
+        return projects
+
     def get_for_workspace_path(self, workspace_path: str | None) -> ProjectContext | None:
         if not workspace_path or not self.db_path.exists():
             return None

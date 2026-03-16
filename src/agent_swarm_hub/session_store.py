@@ -69,6 +69,7 @@ class WorkspaceSessionRecord:
 class TaskRecord:
     task_id: str
     session_key: str
+    workspace_id: str
     title: str
     status: str
     executor_session_id: str | None
@@ -577,6 +578,21 @@ class SessionStore:
                 (session_key, workspace_id, agent, limit),
             ).fetchall()
         return list(reversed(rows))
+
+    def list_tasks(self, session_key: str, workspace_id: str, *, limit: int = 20) -> list[TaskRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT task_id, session_key, workspace_id, title, status, executor_session_id, last_checkpoint,
+                       created_at, updated_at, closed_at
+                FROM tasks
+                WHERE session_key = ? AND workspace_id = ?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (session_key, workspace_id, limit),
+            ).fetchall()
+        return [TaskRecord(**dict(row)) for row in rows]
 
     def append_task_handoff(
         self,

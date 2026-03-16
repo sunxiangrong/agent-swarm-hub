@@ -7,6 +7,7 @@ from enum import Enum
 class RemotePlatform(str, Enum):
     TELEGRAM = "telegram"
     LARK = "lark"
+    LOCAL = "local"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +41,6 @@ def parse_remote_command(text: str) -> RemoteCommand:
     parts = stripped.split(maxsplit=1)
     command = parts[0][1:].lower()
     argument = parts[1].strip() if len(parts) > 1 else ""
-    if command not in {"write", "execute", "new", "status", "sessions", "escalations", "projects", "use", "where", "project", "help"}:
+    if command not in {"write", "execute", "new", "status", "sessions", "escalations", "projects", "use", "where", "project", "worker", "tasks", "help"}:
         return RemoteCommand(name="help", argument=stripped)
     return RemoteCommand(name=command, argument=argument)

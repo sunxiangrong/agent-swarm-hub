@@ -13,6 +13,19 @@ from agent_swarm_hub import (
 )
 
 
+def _bind_workspace(adapter: CCConnectAdapter, *, workspace_id: str = "project-alpha") -> str:
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text=f"/use {workspace_id}",
+        )
+    )
+    assert workspace_id in response.text
+    return workspace_id
+
+
 def _init_project_session_db(db_path: Path, workspace_path: str) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.executescript(
@@ -88,9 +101,36 @@ def test_parse_remote_command_supports_sessions() -> None:
     assert command.argument == ""
 
 
+def test_parse_remote_command_supports_worker_and_tasks() -> None:
+    worker = parse_remote_command("/worker")
+    tasks = parse_remote_command("/tasks")
+
+    assert worker.name == "worker"
+    assert tasks.name == "tasks"
+
+
+def test_help_includes_command_explanations(tmp_path) -> None:
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/help",
+        )
+    )
+
+    assert "项目命令:" in response.text
+    assert "/projects  查看可用项目列表" in response.text
+    assert "/worker  查看当前 worker phase" in response.text
+    assert "未绑定项目时" in response.text
+
+
 def test_write_creates_session_and_status_reads_it(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions.sqlite3")
     adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
+    workspace_id = _bind_workspace(adapter)
     message = RemoteMessage(
         platform=RemotePlatform.TELEGRAM,
         chat_id="chat-1",
@@ -116,10 +156,12 @@ def test_write_creates_session_and_status_reads_it(tmp_path) -> None:
     assert "Claude Session: claude-" in status_response.text
     assert "Codex Session: codex-" in status_response.text
     assert "Phase: discussion" in status_response.text
+    assert f"Workspace: {workspace_id}" in status_response.text
 
 
 def test_plain_text_continues_existing_task(tmp_path) -> None:
     adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
+    _bind_workspace(adapter)
     message = RemoteMessage(
         platform=RemotePlatform.TELEGRAM,
         chat_id="chat-1",
@@ -141,6 +183,24 @@ def test_plain_text_continues_existing_task(tmp_path) -> None:
     assert "Backend: echo" in continue_response.text
 
 
+def test_bound_plain_text_without_active_task_starts_task(tmp_path) -> None:
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
+    _bind_workspace(adapter)
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="Draft a Telegram rollout",
+        )
+    )
+
+    assert response.task_id is not None
+    assert "Phase: discussion" in response.text
+    assert "Backend: echo" in response.text
+
+
 def test_short_plain_text_without_active_task_becomes_ephemeral(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions.sqlite3")
     adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
@@ -154,13 +214,70 @@ def test_short_plain_text_without_active_task_becomes_ephemeral(tmp_path) -> Non
         )
     )
 
-    ephemerals = store.list_ephemeral_messages("telegram:chat-1:root", Path.cwd().name.lower().replace(" ", "-"), "claude")
+    ephemerals = store.list_ephemeral_messages("telegram:chat-1:root", "__ephemeral__", "claude")
     messages = store.list_recent_messages("telegram:chat-1:root")
 
     assert "ephemeral context only" in response.text
     assert len(ephemerals) == 1
     assert ephemerals[0]["text"] == "好的"
     assert messages == []
+
+
+def test_unbound_long_plain_text_runs_temporary_swarm_with_claude_default(tmp_path) -> None:
+    class RecordingExecutor(EchoExecutor):
+        def __init__(self):
+            self.prompts = []
+
+        def run(self, prompt: str):
+            self.prompts.append(prompt)
+            return super().run(prompt)
+
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+    executor = RecordingExecutor()
+    adapter = CCConnectAdapter(executor=executor, store=store)
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="Brainstorm a rollout approach for this idea",
+        )
+    )
+
+    ephemerals = store.list_ephemeral_messages("telegram:chat-1:root", "__ephemeral__", "claude")
+
+    assert "Temporary Swarm Mode" in response.text
+    assert "Starting Agent: claude" in response.text
+    assert executor.prompts
+    assert "Assigned Agent: claude" in executor.prompts[0]
+    assert len(ephemerals) == 2
+    assert store.list_recent_messages("telegram:chat-1:root") == []
+
+
+def test_unbound_long_plain_text_can_start_with_codex(tmp_path) -> None:
+    class RecordingExecutor(EchoExecutor):
+        def __init__(self):
+            self.prompts = []
+
+        def run(self, prompt: str):
+            self.prompts.append(prompt)
+            return super().run(prompt)
+
+    executor = RecordingExecutor()
+    adapter = CCConnectAdapter(executor=executor, store=SessionStore(tmp_path / "sessions.sqlite3"))
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="Fix this script and run a test pass",
+        )
+    )
+
+    assert "Starting Agent: codex" in response.text
+    assert "Assigned Agent: codex" in executor.prompts[0]
 
 
 def test_sessions_reports_formal_and_ephemeral_counts(tmp_path) -> None:
@@ -175,6 +292,7 @@ def test_sessions_reports_formal_and_ephemeral_counts(tmp_path) -> None:
             text="hello",
         )
     )
+    _bind_workspace(adapter)
     adapter.handle_message(
         RemoteMessage(
             platform=RemotePlatform.TELEGRAM,
@@ -193,13 +311,72 @@ def test_sessions_reports_formal_and_ephemeral_counts(tmp_path) -> None:
     )
 
     assert "Claude Formal Messages:" in response.text
-    assert "Claude Ephemeral Messages: 1" in response.text
+    assert "Claude Ephemeral Messages: 0" in response.text
     assert "Codex Formal Messages: 0" in response.text
+
+
+def test_unbound_formal_task_prompts_for_project_selection(tmp_path) -> None:
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Draft a Telegram rollout",
+        )
+    )
+
+    assert "No project is currently bound" in response.text
+    assert "/use <workspace>" in response.text
+
+
+def test_worker_and_tasks_report_project_runtime(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
+    _bind_workspace(adapter)
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Build a multi-agent rollout workflow",
+        )
+    )
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/execute Plan the architecture, decide whether sub-agents are needed, then implement safely",
+        )
+    )
+
+    worker = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/worker",
+        )
+    )
+    tasks = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/tasks",
+        )
+    )
+
+    assert "Sub-agent Runs:" in worker.text
+    assert "Latest Handoffs:" in worker.text
+    assert "Recent Tasks:" in tasks.text
+    assert "Build a multi-agent rollout workflow" in tasks.text
 
 
 def test_projects_lists_current_workspace(tmp_path) -> None:
     adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
-    default_workspace = Path.cwd().name.lower().replace(" ", "-")
 
     response = adapter.handle_message(
         RemoteMessage(
@@ -211,7 +388,7 @@ def test_projects_lists_current_workspace(tmp_path) -> None:
     )
 
     assert "Available workspaces:" in response.text
-    assert f"* {default_workspace}" in response.text
+    assert "No project is currently bound to this chat." in response.text
 
 
 def test_projects_includes_shared_project_profile(tmp_path, monkeypatch) -> None:
@@ -407,6 +584,7 @@ def test_execute_routes_codex_then_claude_review(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions.sqlite3")
     executor = RecordingExecutor()
     adapter = CCConnectAdapter(executor=executor, store=store)
+    workspace_id = _bind_workspace(adapter)
     adapter.handle_message(
         RemoteMessage(
             platform=RemotePlatform.TELEGRAM,
@@ -432,7 +610,7 @@ def test_execute_routes_codex_then_claude_review(tmp_path) -> None:
             text="/status",
         )
     )
-    handoffs = store.list_task_handoffs("telegram:chat-1:root", Path.cwd().name.lower().replace(" ", "-"), write_task_id := response.task_id or "")
+    handoffs = store.list_task_handoffs("telegram:chat-1:root", workspace_id, write_task_id := response.task_id or "")
 
     assert len(executor.prompts) == 3
     assert "Assigned Agent: claude" in executor.prompts[0]
@@ -443,6 +621,65 @@ def test_execute_routes_codex_then_claude_review(tmp_path) -> None:
     assert "Report Backend: echo" in response.text
     assert "Phase: reported" in status.text
     assert [row["handoff_type"] for row in handoffs] == ["discussion_brief", "execution_packet", "review_verdict"]
+
+
+def test_large_task_execute_runs_planning_before_codex(tmp_path) -> None:
+    class RecordingExecutor(EchoExecutor):
+        def __init__(self):
+            self.prompts = []
+
+        def run(self, prompt: str):
+            self.prompts.append(prompt)
+            return super().run(prompt)
+
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+    executor = RecordingExecutor()
+    adapter = CCConnectAdapter(executor=executor, store=store)
+    workspace_id = _bind_workspace(adapter)
+
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Design a multi-agent swarm architecture for a large refactor with tests and docs",
+        )
+    )
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/execute Plan the architecture, decide whether sub-agents are needed, then implement safely",
+        )
+    )
+
+    handoffs = store.list_task_handoffs("telegram:chat-1:root", workspace_id, response.task_id or "")
+
+    assert len(executor.prompts) == 7
+    assert "Worker Phase: planning" in executor.prompts[1]
+    assert "Assigned Agent: claude" in executor.prompts[1]
+    assert "Assigned Agent: codex" in executor.prompts[2]
+    assert "subagent_role" in executor.prompts[2]
+    assert "Assigned Agent: codex" in executor.prompts[5]
+    assert "subagent_results" in executor.prompts[5]
+    assert "Complexity: large" in response.text
+    assert "Planning Backend: echo" in response.text
+    assert "Sub-agent Runs: 3" in response.text
+    assert [row["handoff_type"] for row in handoffs] == [
+        "discussion_brief",
+        "execution_plan",
+        "execution_packet",
+        "subagent_packet",
+        "subagent_result",
+        "subagent_packet",
+        "subagent_result",
+        "subagent_packet",
+        "subagent_result",
+        "review_verdict",
+    ]
+    assert "suggested_subagents" in handoffs[1]["content_json"]
 
 
 def test_agent_specific_history_is_injected_for_claude_followup(tmp_path) -> None:
@@ -457,6 +694,7 @@ def test_agent_specific_history_is_injected_for_claude_followup(tmp_path) -> Non
     store = SessionStore(tmp_path / "sessions.sqlite3")
     executor = RecordingExecutor()
     adapter = CCConnectAdapter(executor=executor, store=store)
+    workspace_id = _bind_workspace(adapter)
 
     adapter.handle_message(
         RemoteMessage(
@@ -479,14 +717,14 @@ def test_agent_specific_history_is_injected_for_claude_followup(tmp_path) -> Non
     assert "Recent Agent Context:" in executor.prompts[1]
     assert "- user: Draft the rollout plan" in executor.prompts[1]
 
-    claude_rows = store.list_recent_agent_messages("telegram:chat-1:root", Path.cwd().name.lower().replace(" ", "-"), "claude")
-    codex_rows = store.list_recent_agent_messages("telegram:chat-1:root", Path.cwd().name.lower().replace(" ", "-"), "codex")
+    claude_rows = store.list_recent_agent_messages("telegram:chat-1:root", workspace_id, "claude")
+    codex_rows = store.list_recent_agent_messages("telegram:chat-1:root", workspace_id, "codex")
 
     assert len(claude_rows) >= 4
     assert codex_rows == []
 
 
-def test_ephemeral_history_is_injected_into_agent_prompt(tmp_path) -> None:
+def test_unbound_ephemeral_history_is_not_injected_into_formal_project_prompt(tmp_path) -> None:
     class RecordingExecutor(EchoExecutor):
         def __init__(self):
             self.prompts = []
@@ -507,6 +745,7 @@ def test_ephemeral_history_is_injected_into_agent_prompt(tmp_path) -> None:
             text="hello",
         )
     )
+    _bind_workspace(adapter)
     adapter.handle_message(
         RemoteMessage(
             platform=RemotePlatform.TELEGRAM,
@@ -516,7 +755,9 @@ def test_ephemeral_history_is_injected_into_agent_prompt(tmp_path) -> None:
         )
     )
 
-    assert "ephemeral user: hello" in executor.prompts[0]
+    assert "ephemeral user: hello" not in executor.prompts[0]
+    ephemerals = store.list_ephemeral_messages("telegram:chat-1:root", "__ephemeral__", "claude")
+    assert len(ephemerals) == 1
 
 
 def test_workspace_prompt_includes_shared_project_context(tmp_path, monkeypatch) -> None:
@@ -625,7 +866,8 @@ def test_workspace_config_controls_executor_behavior(tmp_path) -> None:
 
 def test_workspace_switch_isolates_active_tasks(tmp_path) -> None:
     adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
-    default_workspace = Path.cwd().name.lower().replace(" ", "-")
+    default_workspace = "project-alpha"
+    _bind_workspace(adapter, workspace_id=default_workspace)
     first = adapter.handle_message(
         RemoteMessage(
             platform=RemotePlatform.TELEGRAM,
@@ -675,6 +917,7 @@ def test_workspace_switch_isolates_active_tasks(tmp_path) -> None:
 def test_executor_session_id_is_stable_per_workspace_session(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions.sqlite3")
     adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
+    workspace_id = _bind_workspace(adapter)
     where_response = adapter.handle_message(
         RemoteMessage(
             platform=RemotePlatform.TELEGRAM,
@@ -692,7 +935,7 @@ def test_executor_session_id_is_stable_per_workspace_session(tmp_path) -> None:
         )
     )
 
-    record = store.get_workspace_session("telegram:chat-1:root", Path.cwd().name.lower().replace(" ", "-"))
+    record = store.get_workspace_session("telegram:chat-1:root", workspace_id)
 
     assert record is not None
     assert record.executor_session_id is not None
@@ -723,6 +966,7 @@ def test_executor_session_id_is_stable_per_workspace_session(tmp_path) -> None:
 def test_workspace_session_tracks_distinct_agent_session_ids(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions.sqlite3")
     adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
+    workspace_id = _bind_workspace(adapter)
 
     adapter.handle_message(
         RemoteMessage(
@@ -741,7 +985,7 @@ def test_workspace_session_tracks_distinct_agent_session_ids(tmp_path) -> None:
         )
     )
 
-    record = store.get_workspace_session("telegram:chat-1:root", Path.cwd().name.lower().replace(" ", "-"))
+    record = store.get_workspace_session("telegram:chat-1:root", workspace_id)
 
     assert record is not None
     assert record.executor_session_id is not None
@@ -755,6 +999,7 @@ def test_workspace_session_tracks_distinct_agent_session_ids(tmp_path) -> None:
 def test_session_persists_across_adapter_instances(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions.sqlite3")
     adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
+    _bind_workspace(adapter)
     message = RemoteMessage(
         platform=RemotePlatform.TELEGRAM,
         chat_id="chat-1",
@@ -780,6 +1025,7 @@ def test_session_persists_across_adapter_instances(tmp_path) -> None:
 
 def test_new_clears_active_task_context(tmp_path) -> None:
     adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
+    _bind_workspace(adapter)
     adapter.handle_message(
         RemoteMessage(
             platform=RemotePlatform.TELEGRAM,
@@ -812,6 +1058,14 @@ def test_new_clears_active_task_context(tmp_path) -> None:
 
 def test_blocker_event_becomes_visible_escalation() -> None:
     adapter = CCConnectAdapter(executor=EchoExecutor())
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.LARK,
+            chat_id="chat-2",
+            user_id="user-9",
+            text="/use lark-project",
+        )
+    )
     base_message = RemoteMessage(
         platform=RemotePlatform.LARK,
         chat_id="chat-2",

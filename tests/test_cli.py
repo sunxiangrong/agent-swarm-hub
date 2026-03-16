@@ -71,3 +71,91 @@ def test_cli_runs_lark_ws_forever(monkeypatch) -> None:
 
     assert exit_code == 0
     assert called["started"] is True
+
+
+def test_cli_local_chat_binds_explicit_project(monkeypatch, capsys) -> None:
+    inputs = iter(["/quit"])
+
+    monkeypatch.setenv("ASH_EXECUTOR", "echo")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-swarm-hub", "local-chat", "--provider", "echo", "--project", "agent-swarm-hub"],
+    )
+
+    exit_code = main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Current workspace switched to `agent-swarm-hub`." in output
+
+
+def test_cli_local_chat_prompts_for_project_or_temporary(monkeypatch, capsys) -> None:
+    inputs = iter(["temporary", "/quit"])
+
+    monkeypatch.setenv("ASH_EXECUTOR", "echo")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-chat", "--provider", "echo"])
+
+    exit_code = main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Available workspaces:" in output
+    assert "Temporary mode selected." in output
+
+
+def test_cli_local_chat_reprompts_for_invalid_project_selection(monkeypatch, capsys) -> None:
+    inputs = iter(["project", "1", "/quit"])
+
+    monkeypatch.setenv("ASH_EXECUTOR", "echo")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-chat", "--provider", "echo"])
+
+    exit_code = main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Unknown project selection." in output
+    assert "Current workspace switched to `agent-swarm-hub`." in output
+
+
+def test_cli_local_native_launches_provider_in_workspace(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    workspace_path = tmp_path / "project"
+    workspace_path.mkdir()
+
+    from agent_swarm_hub.session_store import SessionStore
+
+    store = SessionStore(db_path)
+    store.upsert_workspace(
+        workspace_id="project-alpha",
+        title="project-alpha",
+        path=str(workspace_path),
+        backend="codex",
+        transport="direct",
+    )
+
+    captured = {}
+
+    def fake_execvpe(command, argv, env):
+        captured["command"] = command
+        captured["argv"] = argv
+        captured["env"] = env
+        raise SystemExit(0)
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setattr("os.execvpe", fake_execvpe)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+
+    try:
+        main()
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    assert captured["command"].endswith("codex")
+    assert captured["env"]["ASH_ACTIVE_WORKSPACE"] == "project-alpha"
+    assert captured["env"]["CCB_WORK_DIR"] == str(workspace_path)
+    assert captured["env"]["CCB_RUN_DIR"] == str(workspace_path)
