@@ -707,6 +707,7 @@ class CCConnectAdapter:
         workspace_id = self._require_bound_workspace(message)
         if workspace_id is None:
             return self._formal_project_required_response()
+        self._sync_project_memory(session_key=message.session_key, workspace_id=workspace_id)
         memory_key = self._memory_key(message.session_key, workspace_id)
         self.sessions.pop(memory_key, None)
         self.escalations.pop(memory_key, None)
@@ -876,6 +877,9 @@ class CCConnectAdapter:
         workspace_id = self._normalize_workspace_id(argument)
         if not workspace_id:
             return AdapterResponse(text="Usage: /use <workspace>")
+        current_workspace_id = self._get_bound_workspace(message)
+        if current_workspace_id and current_workspace_id != workspace_id:
+            self._sync_project_memory(session_key=message.session_key, workspace_id=current_workspace_id)
         if workspace_id in {"temporary", "temp"}:
             self._clear_pending_confirmations(message.session_key)
             self.store.clear_chat_binding(message.session_key)
@@ -1037,6 +1041,12 @@ class CCConnectAdapter:
             swarm_state_json=self._serialize_state(state),
             escalations_json=self._serialize_events(self.escalations.get(memory_key, [])),
         )
+        self._sync_project_memory(
+            session_key=message.session_key,
+            workspace_id=workspace_id,
+            state=state,
+            summary=summary,
+        )
 
     def _get_bound_workspace(self, message: RemoteMessage) -> str | None:
         binding = self.store.get_chat_binding(message.session_key)
@@ -1097,6 +1107,59 @@ class CCConnectAdapter:
         if len(raw) <= 72:
             return raw
         return f"...{raw[-69:]}"
+
+    def _resolve_shared_project_id(self, workspace_id: str) -> str | None:
+        shared_project = self.project_context_store.get_project(workspace_id)
+        if shared_project is not None:
+            return shared_project.project_id
+        workspace = self.store.get_workspace(workspace_id)
+        project = self.project_context_store.get_for_workspace_path(workspace.path if workspace else None)
+        return project.project_id if project is not None else None
+
+    @staticmethod
+    def _summary_recent_context(summary: str | None) -> str:
+        text = (summary or '').strip()
+        if not text:
+            return ''
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in lines:
+            if line.startswith('Recent context:'):
+                return line.removeprefix('Recent context:').strip()
+        if len(lines) >= 2:
+            return lines[1]
+        return lines[0] if lines else ''
+
+    def _sync_project_memory(
+        self,
+        *,
+        session_key: str,
+        workspace_id: str,
+        state: SwarmState | None = None,
+        summary: str | None = None,
+    ) -> None:
+        project_id = self._resolve_shared_project_id(workspace_id)
+        if not project_id:
+            return
+        workspace_session = self.store.get_workspace_session(session_key, workspace_id)
+        resolved_state = state or self._load_session(session_key, workspace_id)
+        resolved_summary = summary or (workspace_session.conversation_summary if workspace_session else '')
+        focus = ''
+        if resolved_state is not None and resolved_state.root_task_id in resolved_state.tasks:
+            focus = resolved_state.tasks[resolved_state.root_task_id].title.strip()
+        if not focus:
+            focus = self._project_focus(resolved_summary)
+        recent_context = self._summary_recent_context(resolved_summary)
+        memory = self.project_context_store._compact(resolved_summary, 180) if resolved_summary else ''
+        memory_key = self._memory_key(session_key, workspace_id)
+        recent_rows = self.store.list_recent_messages(memory_key, limit=2)
+        hints = [f"{row['role']}: {row['text']}" for row in recent_rows if (row['text'] or '').strip()]
+        self.project_context_store.upsert_project_memory(
+            project_id,
+            focus=focus,
+            recent_context=recent_context,
+            memory=memory,
+            recent_hints=hints,
+        )
 
     @staticmethod
     def _project_focus(summary: str | None) -> str:
@@ -1215,6 +1278,10 @@ class CCConnectAdapter:
             f"Project Provider Sessions: {project.provider_session_count}\n"
             f"Project Active Sessions: {project.active_session_count}\n"
         )
+
+    def _project_memory_snapshot(self, workspace_id: str) -> dict[str, Any]:
+        workspace = self.store.get_workspace(workspace_id)
+        return self.project_context_store.build_memory_snapshot(workspace.path if workspace else None)
 
     def _prompt_with_project_context(self, workspace_id: str, prompt: str) -> str:
         workspace = self.store.get_workspace(workspace_id)
@@ -1501,6 +1568,7 @@ class CCConnectAdapter:
                 role=role,
                 execution_plan=execution_plan,
                 execution_packet=execution_packet,
+                project_memory=self._project_memory_snapshot(workspace_id),
             )
             backend_mode = self._subagent_backend_mode(role)
             self.store.append_task_handoff(
@@ -1637,11 +1705,13 @@ class CCConnectAdapter:
         role: str,
         execution_plan: dict[str, Any],
         execution_packet: dict[str, Any],
+        project_memory: dict[str, Any],
     ) -> dict[str, Any]:
         read_only = bool(execution_packet.get("read_only"))
         return {
             "task": state.tasks[state.root_task_id].title,
             "subagent_role": role,
+            "project_memory": project_memory,
             "execution_plan": execution_plan,
             "execution_packet": execution_packet,
             "instructions": (

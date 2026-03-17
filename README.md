@@ -1,9 +1,11 @@
 # agent-swarm-hub
 
-项目级 agent 中枢。它把 Telegram、飞书、本地 swarm shell、共享项目会话库、Claude/Codex 分工，以及 `ccb/askd` 执行底座接在一起。
+项目级 agent 中枢。它把 Telegram、飞书、本地原生 CLI、本地 swarm shell、共享项目会话库、Claude/Codex 分工，以及 `ccb/askd` 执行底座接在一起。
 
-它现在有两种使用形态：
+它现在有三种使用形态：
 
+- 本地原生 CLI 模式  
+  先选项目，优先恢复该项目最近的 Claude/Codex 原生会话，再进入原生 CLI。
 - 远程聊天模式  
   Telegram / 飞书进入统一项目命令层，适合项目管理、监控和汇报。
 - 本地 swarm 模式  
@@ -15,13 +17,16 @@
 - Claude 与 Codex 在项目内协作
 - `ccb` 负责底层会话载体
 - 远程聊天负责项目管理和汇报
-- 本地 `ash-chat` 负责进入项目并直接进入 swarm
+- 本地 `ash-chat` 负责进入项目并直接进入原生 Claude/Codex CLI
+- 本地 `ash-swarm` 负责进入统一 swarm shell
 
 ## 当前能力
 
 - Telegram 长轮询，支持断线重试
 - 飞书 WebSocket，支持断线重连
-- 本地全局启动入口：`ash-chat`
+- 本地全局启动入口：
+  - `ash-chat`
+  - `ash-swarm`
 - 远程 chat -> workspace 绑定
 - workspace 项目配置：
   - `path`
@@ -30,6 +35,8 @@
 - 共享项目会话库：
   - 项目 `profile`
   - 项目 `summary`
+  - 项目级 `project_memory`
+  - 项目级 `provider_bindings`
   - Claude/Codex 原始会话归类
   - `active / archived` 生命周期
 - 项目级 task 持久化
@@ -98,9 +105,18 @@ project worker
 6. Codex 执行
 7. Claude review 并向用户汇报
 
-本地 swarm 模式典型流转：
+本地原生 CLI 模式典型流转：
 
 1. `ash-chat codex` 或 `ash-chat claude`
+2. 启动前先选项目
+3. 进入对应项目路径，并注入 compact `project_memory` 与该项目当前的 `claude_session_id` / `codex_session_id`
+4. 根据共享项目会话库优先恢复当前 provider 绑定的原生 session
+5. 如果绑定不可用，再回退到该项目最近可用的原生 session
+6. 进入原生 `codex` / `claude` CLI
+
+本地 swarm 模式典型流转：
+
+1. `ash-swarm codex` 或 `ash-swarm claude`
 2. 启动前先选项目
 3. 进入项目后直接进入 swarm shell
 4. 使用与远程聊天一致的命令：
@@ -130,7 +146,22 @@ project worker
 - 飞书
 - `python -m agent_swarm_hub.cli local-chat`
 
-### 2. 本地 swarm 模式
+### 2. 本地原生 CLI 模式
+
+适合：
+
+- 直接进入 `codex resume` / `claude --resume` 语义
+- 在项目目录下继续历史原生会话
+- 把“项目选择”放在原生 CLI 之前
+- 让“选项目”本身就等价于恢复该项目的本地 CLI 上下文
+- 把长期上下文沉淀到项目记忆，而不是依赖堆积大量 provider session
+
+入口：
+
+- `ash-chat`
+- `./scripts/start-chat.sh`
+
+### 3. 本地 swarm 模式
 
 适合：
 
@@ -141,8 +172,8 @@ project worker
 
 入口：
 
-- `ash-chat`
-- `./scripts/start-chat.sh`
+- `ash-swarm`
+- `./scripts/start-swarm.sh`
 
 ## 常用命令
 
@@ -183,18 +214,32 @@ cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
 ./scripts/start-local.sh
 ```
 
-本地统一聊天入口:
+本地原生 CLI 入口:
 
 ```bash
 cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
 ./scripts/start-chat.sh
 ```
 
-本地全局入口:
+本地 swarm shell 入口:
+
+```bash
+cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+./scripts/start-swarm.sh
+```
+
+本地全局原生入口:
 
 ```bash
 ash-chat codex
 ash-chat claude
+```
+
+本地全局 swarm 入口:
+
+```bash
+ash-swarm codex
+ash-swarm claude
 ```
 
 指定 provider:
@@ -210,13 +255,20 @@ ash-chat claude
 ./scripts/start-chat.sh claude agent-swarm-hub
 ```
 
+直接绑定项目启动 swarm shell:
+
+```bash
+./scripts/start-swarm.sh claude agent-swarm-hub
+```
+
 说明：
 
-- `start-chat.sh` / `ash-chat` 现在默认进入本地 swarm shell
+- `start-chat.sh` / `ash-chat` 现在默认进入原生 `claude` / `codex` CLI
 - 启动前会从共享项目库里选择项目
-- 选定项目后，直接进入统一命令层
-- 远程聊天与本地 swarm shell 的命令和行为应保持一致
-- 原生 `claude` / `codex` CLI 仍然保留，但不再是 `ash-chat` 的默认目标
+- 选定项目后，会优先恢复这个项目最近一次对应 provider 的原生会话
+- 找不到可恢复会话时，才进入新的原生会话
+- `start-swarm.sh` / `ash-swarm` 进入统一 swarm shell
+- `local-chat` 仍然保留，用于统一命令层
 
 ## 推荐配置
 

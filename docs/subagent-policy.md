@@ -19,3 +19,4 @@ Rules:
 - sub-agents are ephemeral
 - sub-agents return results to the main worker
 - main Codex remains the primary implementation agent
+- sub-agents receive the same compact project memory snapshot as the main agent, not full long-form session history

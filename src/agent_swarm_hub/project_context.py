@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 DEFAULT_PROJECT_SESSION_DB = "/Users/sunxiangrong/Desktop/CLI/local-skills/project-session-manager/data/sessions.sqlite3"
+_PROMPT_PROFILE_LIMIT = 160
+_PROMPT_FIELD_LIMIT = 180
+_PROMPT_MESSAGE_LIMIT = 120
+_PROMPT_RECENT_MESSAGE_COUNT = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,18 +24,71 @@ class ProjectContext:
     summary: str
     provider_session_count: int
     active_session_count: int = 0
+    binding_claude_session_id: str = ""
+    binding_codex_session_id: str = ""
     recent_messages: tuple[str, ...] = ()
 
 
 class ProjectContextStore:
     def __init__(self, db_path: str | None = None):
         self.db_path = Path(db_path or os.getenv("ASH_PROJECT_SESSION_DB", "").strip() or DEFAULT_PROJECT_SESSION_DB)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS projects (
+                    project_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    workspace_path TEXT NOT NULL DEFAULT '',
+                    profile TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_sessions (
+                    provider TEXT NOT NULL,
+                    raw_session_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    notes TEXT NOT NULL DEFAULT '',
+                    source_path TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL DEFAULT '',
+                    last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (provider, raw_session_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS project_memory (
+                    project_id TEXT PRIMARY KEY,
+                    focus TEXT NOT NULL DEFAULT '',
+                    recent_context TEXT NOT NULL DEFAULT '',
+                    memory TEXT NOT NULL DEFAULT '',
+                    recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_bindings (
+                    project_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    raw_session_id TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (project_id, provider)
+                );
+                """
+            )
 
     def list_projects(self) -> list[ProjectContext]:
         if not self.db_path.exists():
             return []
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
+        with self._connect() as conn:
             provider_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_sessions)").fetchall()}
             project_columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
             active_expr = "SUM(CASE WHEN ps.status = 'active' THEN 1 ELSE 0 END)" if "status" in provider_columns else "COUNT(ps.raw_session_id)"
@@ -37,10 +96,13 @@ class ProjectContextStore:
             rows = conn.execute(
                 f"""
                 SELECT p.project_id, p.title, p.workspace_path, {profile_expr}, p.summary,
-                       COUNT(ps.raw_session_id) AS provider_session_count,
-                       {active_expr} AS active_session_count
+                       COUNT(DISTINCT ps.provider || ':' || ps.raw_session_id) AS provider_session_count,
+                       {active_expr} AS active_session_count,
+                       COALESCE(MAX(CASE WHEN pb.provider = 'claude' THEN pb.raw_session_id END), '') AS binding_claude_session_id,
+                       COALESCE(MAX(CASE WHEN pb.provider = 'codex' THEN pb.raw_session_id END), '') AS binding_codex_session_id
                 FROM projects p
                 LEFT JOIN provider_sessions ps ON ps.project_id = p.project_id
+                LEFT JOIN provider_bindings pb ON pb.project_id = p.project_id
                 GROUP BY p.project_id, p.title, p.workspace_path, profile, p.summary
                 ORDER BY p.project_id ASC
                 """
@@ -65,8 +127,7 @@ class ProjectContextStore:
         if not workspace_path or not self.db_path.exists():
             return None
         resolved = str(Path(workspace_path).expanduser().resolve())
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
+        with self._connect() as conn:
             provider_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_sessions)").fetchall()}
             project_columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
             tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
@@ -75,10 +136,13 @@ class ProjectContextStore:
             row = conn.execute(
                 f"""
                 SELECT p.project_id, p.title, p.workspace_path, {profile_expr}, p.summary,
-                       COUNT(ps.raw_session_id) AS provider_session_count,
-                       {active_expr} AS active_session_count
+                       COUNT(DISTINCT ps.provider || ':' || ps.raw_session_id) AS provider_session_count,
+                       {active_expr} AS active_session_count,
+                       COALESCE(MAX(CASE WHEN pb.provider = 'claude' THEN pb.raw_session_id END), '') AS binding_claude_session_id,
+                       COALESCE(MAX(CASE WHEN pb.provider = 'codex' THEN pb.raw_session_id END), '') AS binding_codex_session_id
                 FROM projects p
                 LEFT JOIN provider_sessions ps ON ps.project_id = p.project_id
+                LEFT JOIN provider_bindings pb ON pb.project_id = p.project_id
                 WHERE p.workspace_path = ?
                 GROUP BY p.project_id, p.title, p.workspace_path, profile, p.summary
                 """,
@@ -112,14 +176,178 @@ class ProjectContextStore:
         project = self.get_for_workspace_path(workspace_path)
         if project is None:
             return ""
+        snapshot = self.build_memory_snapshot(workspace_path)
         lines = [
             f"Project: {project.project_id}",
-            f"Workspace: {project.workspace_path}",
-            f"Profile: {project.profile}",
-            f"Summary: {project.summary}",
+            f"Workspace: {snapshot['workspace']}",
+            f"Profile: {snapshot['profile']}",
             f"Active Provider Sessions: {project.active_session_count}",
         ]
-        if project.recent_messages:
-            lines.append("Recent Project Messages:")
-            lines.extend(f"- {message}" for message in project.recent_messages[-6:])
+        if snapshot["focus"]:
+            lines.append(f"Focus: {snapshot['focus']}")
+        if snapshot["recent_context"]:
+            lines.append(f"Recent Context: {snapshot['recent_context']}")
+        elif snapshot["memory"]:
+            lines.append(f"Project Memory: {snapshot['memory']}")
+        if snapshot["recent_hints"]:
+            lines.append("Recent Memory Hints:")
+            lines.extend(f"- {message}" for message in snapshot["recent_hints"])
         return "\n".join(lines)
+
+    def build_memory_snapshot(self, workspace_path: str | None) -> dict[str, Any]:
+        project = self.get_for_workspace_path(workspace_path)
+        if project is None:
+            return {
+                "project_id": "",
+                "workspace": "",
+                "profile": "",
+                "focus": "",
+                "recent_context": "",
+                "memory": "",
+                "recent_hints": [],
+            }
+        stored_memory = self.get_project_memory(project.project_id)
+        recent_messages = stored_memory["recent_hints"] or [
+            self._compact(message, _PROMPT_MESSAGE_LIMIT)
+            for message in project.recent_messages[-_PROMPT_RECENT_MESSAGE_COUNT:]
+            if (message or "").strip()
+        ]
+        focus = stored_memory["focus"] or self._summary_field(project.summary, "Current focus:")
+        recent_context = stored_memory["recent_context"] or self._summary_field(project.summary, "Recent context:")
+        memory = stored_memory["memory"] or (
+            self._compact(self._summary_compact_text(project.summary), _PROMPT_FIELD_LIMIT) if project.summary else ""
+        )
+        return {
+            "project_id": project.project_id,
+            "workspace": self._compact(project.workspace_path, _PROMPT_FIELD_LIMIT),
+            "profile": self._compact(project.profile, _PROMPT_PROFILE_LIMIT),
+            "focus": self._compact(focus, _PROMPT_FIELD_LIMIT) if focus else "",
+            "recent_context": self._compact(recent_context, _PROMPT_FIELD_LIMIT) if recent_context else "",
+            "memory": self._compact(memory, _PROMPT_FIELD_LIMIT) if memory else "",
+            "recent_hints": recent_messages,
+        }
+
+    def get_project_memory(self, project_id: str) -> dict[str, Any]:
+        if not project_id or not self.db_path.exists():
+            return {"focus": "", "recent_context": "", "memory": "", "recent_hints": []}
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT focus, recent_context, memory, recent_hints_json
+                FROM project_memory
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            return {"focus": "", "recent_context": "", "memory": "", "recent_hints": []}
+        return {
+            "focus": self._compact(row["focus"], _PROMPT_FIELD_LIMIT) if row["focus"] else "",
+            "recent_context": self._compact(row["recent_context"], _PROMPT_FIELD_LIMIT) if row["recent_context"] else "",
+            "memory": self._compact(row["memory"], _PROMPT_FIELD_LIMIT) if row["memory"] else "",
+            "recent_hints": self._parse_hints_json(row["recent_hints_json"]),
+        }
+
+    def get_provider_binding(self, project_id: str, provider: str) -> str | None:
+        if not project_id or not provider or not self.db_path.exists():
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT raw_session_id
+                FROM provider_bindings
+                WHERE project_id = ? AND provider = ?
+                """,
+                (project_id, provider),
+            ).fetchone()
+        if row is None:
+            return None
+        return (row["raw_session_id"] or "").strip() or None
+
+    def set_provider_binding(self, project_id: str, provider: str, raw_session_id: str) -> None:
+        if not project_id or not provider or not raw_session_id:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO provider_bindings (project_id, provider, raw_session_id, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(project_id, provider) DO UPDATE SET
+                    raw_session_id = excluded.raw_session_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (project_id, provider, raw_session_id),
+            )
+
+    def upsert_project_memory(
+        self,
+        project_id: str,
+        *,
+        focus: str = "",
+        recent_context: str = "",
+        memory: str = "",
+        recent_hints: list[str] | None = None,
+    ) -> None:
+        if not project_id:
+            return
+        hints = [self._compact(item, _PROMPT_MESSAGE_LIMIT) for item in (recent_hints or []) if (item or '').strip()][:_PROMPT_RECENT_MESSAGE_COUNT]
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO project_memory (project_id, focus, recent_context, memory, recent_hints_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    focus = CASE WHEN excluded.focus != '' THEN excluded.focus ELSE project_memory.focus END,
+                    recent_context = CASE WHEN excluded.recent_context != '' THEN excluded.recent_context ELSE project_memory.recent_context END,
+                    memory = CASE WHEN excluded.memory != '' THEN excluded.memory ELSE project_memory.memory END,
+                    recent_hints_json = CASE WHEN excluded.recent_hints_json != '[]' THEN excluded.recent_hints_json ELSE project_memory.recent_hints_json END,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (project_id, focus.strip(), recent_context.strip(), memory.strip(), json.dumps(hints, ensure_ascii=False)),
+            )
+
+    @staticmethod
+    def _compact(text: str | None, limit: int) -> str:
+        value = " ".join((text or "").split())
+        if len(value) <= limit:
+            return value
+        return value[: max(0, limit - 3)].rstrip() + "..."
+
+    @staticmethod
+    def _summary_field(summary: str | None, prefix: str) -> str:
+        for line in (summary or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith(prefix):
+                return stripped.removeprefix(prefix).strip()
+        return ""
+
+    @classmethod
+    def _summary_compact_text(cls, summary: str | None) -> str:
+        parts: list[str] = []
+        for line in (summary or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if ":" in stripped:
+                key, value = stripped.split(":", 1)
+                if key.strip() in {"Project", "Workspace", "Current focus", "Recent context"}:
+                    continue
+                stripped = value.strip() or stripped
+            parts.append(stripped)
+        return " | ".join(parts[:2])
+
+    @classmethod
+    def _parse_hints_json(cls, raw: str | None) -> list[str]:
+        if not raw:
+            return []
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [
+            cls._compact(str(item), _PROMPT_MESSAGE_LIMIT)
+            for item in payload
+            if str(item).strip()
+        ][:_PROMPT_RECENT_MESSAGE_COUNT]

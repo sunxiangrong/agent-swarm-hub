@@ -43,6 +43,21 @@ def _init_project_session_db(db_path: Path, workspace_path: str) -> None:
                 raw_session_id TEXT NOT NULL,
                 project_id TEXT NOT NULL
             );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
             """
         )
         conn.execute(
@@ -178,6 +193,40 @@ def test_confirm_replays_pending_write_and_returns_result(tmp_path) -> None:
     assert "Backend: echo" in confirmed.text
 
 
+def test_write_updates_project_memory(tmp_path, monkeypatch) -> None:
+    session_db = tmp_path / "sessions.sqlite3"
+    project_db = tmp_path / "project-sessions.sqlite3"
+    workspace_dir = tmp_path / "sheep-gwas"
+    workspace_dir.mkdir()
+    _init_project_session_db(project_db, str(workspace_dir.resolve()))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(project_db))
+
+    store = SessionStore(session_db)
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
+    _bind_workspace(adapter, workspace_id="sheep-gwas")
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Draft GWAS plotting checklist",
+        )
+    )
+
+    assert response.task_id is not None
+    with sqlite3.connect(project_db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT focus, recent_context, memory, recent_hints_json FROM project_memory WHERE project_id = ?",
+            ("sheep-gwas",),
+        ).fetchone()
+    assert row is not None
+    assert row["focus"] == "Draft GWAS plotting checklist"
+    assert "Draft GWAS plotting checklist" in row["memory"]
+    assert "Draft GWAS plotting checklist" in row["recent_hints_json"]
+
+
 def test_write_creates_session_and_status_reads_it(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions.sqlite3")
     adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
@@ -208,6 +257,47 @@ def test_write_creates_session_and_status_reads_it(tmp_path) -> None:
     assert "Codex Session: codex-" in status_response.text
     assert "Phase: discussion" in status_response.text
     assert f"Workspace: {workspace_id}" in status_response.text
+
+
+def test_new_flushes_project_memory_before_reset(tmp_path, monkeypatch) -> None:
+    session_db = tmp_path / "sessions.sqlite3"
+    project_db = tmp_path / "project-sessions.sqlite3"
+    workspace_dir = tmp_path / "sheep-gwas"
+    workspace_dir.mkdir()
+    _init_project_session_db(project_db, str(workspace_dir.resolve()))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(project_db))
+
+    store = SessionStore(session_db)
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
+    _bind_workspace(adapter, workspace_id="sheep-gwas")
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Review GWAS summary outputs",
+        )
+    )
+
+    cleared = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/new",
+        )
+    )
+
+    assert "Started a fresh task context" in cleared.text
+    with sqlite3.connect(project_db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT focus, recent_context, memory FROM project_memory WHERE project_id = ?",
+            ("sheep-gwas",),
+        ).fetchone()
+    assert row is not None
+    assert row["focus"] == "Review GWAS summary outputs"
+    assert row["memory"]
 
 
 def test_plain_text_continues_existing_task(tmp_path) -> None:
@@ -773,6 +863,8 @@ def test_large_task_execute_runs_planning_before_codex(tmp_path) -> None:
     assert "verification_result" in handoff_types
     assert handoff_types[-1] == "review_verdict"
     assert "suggested_subagents" in handoffs[1]["content_json"]
+    assert any('"project_memory"' in row["content_json"] for row in handoffs if row["handoff_type"] == "subagent_packet")
+    assert any('"recent_hints"' in row["content_json"] for row in handoffs if row["handoff_type"] == "subagent_packet")
     tasks = store.list_tasks("telegram:chat-1:root", workspace_id)
     assert tasks[0].status == "completed"
 
@@ -947,7 +1039,11 @@ def test_workspace_prompt_includes_shared_project_context(tmp_path, monkeypatch)
     assert executor.prompts
     assert "Project: sheep-gwas" in executor.prompts[0]
     assert "Profile: Sheep GWAS analysis workspace for plotting, QC, and result interpretation." in executor.prompts[0]
-    assert "Summary: Project: sheep-gwas" in executor.prompts[0]
+    assert "Focus: GWAS plotting" in executor.prompts[0]
+    assert "Recent Memory Hints:" in executor.prompts[0]
+    assert "user: Need GWAS plotting help" in executor.prompts[0]
+    assert "assistant: Prior GWAS plotting suggestions" in executor.prompts[0]
+    assert "Summary: Project: sheep-gwas" not in executor.prompts[0]
     assert "Assigned Agent: claude" in executor.prompts[0]
     assert "Worker Phase: discussion" in executor.prompts[0]
     assert "Task Input:\nAnalyze the GWAS inputs" in executor.prompts[0]

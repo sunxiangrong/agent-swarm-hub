@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ASH_INVOKE_DIR="${PWD}"
+export ASH_INVOKE_DIR
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -23,7 +25,7 @@ fi
 PROVIDER="${1:-${ASH_EXECUTOR:-codex}}"
 PROJECT="${2:-}"
 
-echo "[agent-swarm-hub] starting swarm shell"
+echo "[agent-swarm-hub] starting native entry"
 echo "[agent-swarm-hub] provider=$PROVIDER"
 if [[ -n "$PROJECT" ]]; then
   echo "[agent-swarm-hub] project=$PROJECT"
@@ -31,14 +33,14 @@ fi
 
 if [[ "${CONDA_DEFAULT_ENV:-}" == "cli" ]]; then
   if [[ -n "$PROJECT" ]]; then
-    PYTHONPATH=src python -m agent_swarm_hub.cli local-chat --provider "$PROVIDER" --project "$PROJECT"
+    PYTHONPATH=src python -m agent_swarm_hub.cli local-native --provider "$PROVIDER" --project "$PROJECT"
   else
-    PYTHONPATH=src python -m agent_swarm_hub.cli local-chat --provider "$PROVIDER"
+    PYTHONPATH=src python -m agent_swarm_hub.cli local-native --provider "$PROVIDER"
   fi
 else
   if [[ -n "$PROJECT" ]]; then
-    PYTHONPATH=src conda run --live-stream -n cli python -m agent_swarm_hub.cli local-chat --provider "$PROVIDER" --project "$PROJECT"
+    PYTHONPATH=src conda run --live-stream -n cli python -m agent_swarm_hub.cli local-native --provider "$PROVIDER" --project "$PROJECT"
   else
-    PYTHONPATH=src conda run --live-stream -n cli python -m agent_swarm_hub.cli local-chat --provider "$PROVIDER"
+    PYTHONPATH=src conda run --live-stream -n cli python -m agent_swarm_hub.cli local-native --provider "$PROVIDER"
   fi
 fi
