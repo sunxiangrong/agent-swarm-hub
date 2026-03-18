@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-swarm-hub"
 version = "0.1.0"
-description = "Swarm-style coordination layer for ccb-backed remote agent workflows"
+description = "Project-centric entry layer for native Claude/Codex sessions, memory, remote chat, and swarm workflows"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []

@@ -7,3 +7,9 @@ __pycache__/
 .DS_Store
 .env.local
 .agent-swarm-hub.sqlite3
+.ccb/
+pane-logs/
+*.log
+*.last.json
+.runtime/
+var/
