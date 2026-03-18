@@ -109,10 +109,11 @@ project worker
 
 1. `ash-chat codex` 或 `ash-chat claude`
 2. 启动前先选项目
-3. 进入对应项目路径，并注入 compact `project_memory` 与该项目当前的 `claude_session_id` / `codex_session_id`
-4. 根据共享项目会话库优先恢复当前 provider 绑定的原生 session
-5. 如果绑定不可用，再回退到该项目最近可用的原生 session
-6. 进入原生 `codex` / `claude` CLI
+3. 先显示该项目的稳定 `summary` 视图，并等待回车确认
+4. 进入对应项目路径
+5. 根据共享项目会话库优先恢复当前 provider 绑定的原生 session
+6. 如果绑定不可用，再回退到该项目最近可用的原生 session
+7. 进入原生 `codex` / `claude` CLI
 
 本地 swarm 模式典型流转：
 
@@ -265,8 +266,13 @@ ash-swarm claude
 
 - `start-chat.sh` / `ash-chat` 现在默认进入原生 `claude` / `codex` CLI
 - 启动前会从共享项目库里选择项目
-- 选定项目后，会优先恢复这个项目最近一次对应 provider 的原生会话
-- 找不到可恢复会话时，才进入新的原生会话
+- 选定项目后，会先显示该项目的稳定 `summary`，再回车进入原生 CLI
+- `summary` 与 `project_memory` 分层：
+  - `summary` 用于进入前的稳定项目摘要
+  - `project_memory` 用于动态工作记忆与后续回写
+- 选定项目后，会优先恢复这个项目当前绑定的 provider 原生会话
+- 找不到绑定或绑定不可恢复时，才回退到该项目最近可用的原生会话
+- 共享项目库会保留原生会话的 `active / archived` 生命周期，但真正默认恢复的是 `provider_bindings`
 - 原生 CLI 环境会注入：
   - `ASH_ACTIVE_WORKSPACE`
   - `ASH_PROJECT_PATH`
