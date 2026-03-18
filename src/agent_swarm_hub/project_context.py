@@ -345,34 +345,37 @@ class ProjectContextStore:
     ) -> None:
         if not project_id or not provider or not session_id:
             return
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO project_sessions (
-                    project_id, provider, session_id, status, title, summary, cwd, source_path, first_seen_at, last_used_at
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO project_sessions (
+                        project_id, provider, session_id, status, title, summary, cwd, source_path, first_seen_at, last_used_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, COALESCE(NULLIF(?, ''), CURRENT_TIMESTAMP))
+                    ON CONFLICT(provider, session_id) DO UPDATE SET
+                        project_id = excluded.project_id,
+                        status = excluded.status,
+                        title = CASE WHEN excluded.title != '' THEN excluded.title ELSE project_sessions.title END,
+                        summary = CASE WHEN excluded.summary != '' THEN excluded.summary ELSE project_sessions.summary END,
+                        cwd = CASE WHEN excluded.cwd != '' THEN excluded.cwd ELSE project_sessions.cwd END,
+                        source_path = CASE WHEN excluded.source_path != '' THEN excluded.source_path ELSE project_sessions.source_path END,
+                        last_used_at = COALESCE(NULLIF(excluded.last_used_at, ''), CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        project_id,
+                        provider,
+                        session_id,
+                        status,
+                        title.strip(),
+                        summary.strip(),
+                        cwd.strip(),
+                        source_path.strip(),
+                        last_used_at.strip(),
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, COALESCE(NULLIF(?, ''), CURRENT_TIMESTAMP))
-                ON CONFLICT(provider, session_id) DO UPDATE SET
-                    project_id = excluded.project_id,
-                    status = excluded.status,
-                    title = CASE WHEN excluded.title != '' THEN excluded.title ELSE project_sessions.title END,
-                    summary = CASE WHEN excluded.summary != '' THEN excluded.summary ELSE project_sessions.summary END,
-                    cwd = CASE WHEN excluded.cwd != '' THEN excluded.cwd ELSE project_sessions.cwd END,
-                    source_path = CASE WHEN excluded.source_path != '' THEN excluded.source_path ELSE project_sessions.source_path END,
-                    last_used_at = COALESCE(NULLIF(excluded.last_used_at, ''), CURRENT_TIMESTAMP)
-                """,
-                (
-                    project_id,
-                    provider,
-                    session_id,
-                    status,
-                    title.strip(),
-                    summary.strip(),
-                    cwd.strip(),
-                    source_path.strip(),
-                    last_used_at.strip(),
-                ),
-            )
+        except sqlite3.Error:
+            return
 
     def list_project_sessions(
         self,
@@ -587,7 +590,10 @@ class ProjectContextStore:
         except OSError:
             return None
         output_path = workspace / "PROJECT_MEMORY.md"
-        output_path.write_text(self.render_project_memory_markdown(project_id), encoding="utf-8")
+        try:
+            output_path.write_text(self.render_project_memory_markdown(project_id), encoding="utf-8")
+        except OSError:
+            return None
         return output_path
 
     def sync_project_skill_file(self, project_id: str) -> Path | None:
@@ -600,7 +606,10 @@ class ProjectContextStore:
         except OSError:
             return None
         output_path = workspace / "PROJECT_SKILL.md"
-        output_path.write_text(self.render_project_skill_markdown(project_id), encoding="utf-8")
+        try:
+            output_path.write_text(self.render_project_skill_markdown(project_id), encoding="utf-8")
+        except OSError:
+            return None
         return output_path
 
     def sync_all_project_memory_files(self) -> list[Path]:
@@ -661,20 +670,23 @@ class ProjectContextStore:
         ][:_PROMPT_RECENT_MESSAGE_COUNT]
 
     def _project_updated_at(self, project_id: str) -> str:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT MAX(value) AS updated_at
-                FROM (
-                    SELECT updated_at AS value FROM projects WHERE project_id = ?
-                    UNION ALL
-                    SELECT updated_at AS value FROM project_memory WHERE project_id = ?
-                    UNION ALL
-                    SELECT updated_at AS value FROM provider_bindings WHERE project_id = ?
-                )
-                """,
-                (project_id, project_id, project_id),
-            ).fetchone()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT MAX(value) AS updated_at
+                    FROM (
+                        SELECT updated_at AS value FROM projects WHERE project_id = ?
+                        UNION ALL
+                        SELECT updated_at AS value FROM project_memory WHERE project_id = ?
+                        UNION ALL
+                        SELECT updated_at AS value FROM provider_bindings WHERE project_id = ?
+                    )
+                    """,
+                    (project_id, project_id, project_id),
+                ).fetchone()
+        except sqlite3.Error:
+            return ""
         return str(row["updated_at"] or "").strip() or ""
 
     @classmethod

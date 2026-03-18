@@ -1160,6 +1160,8 @@ class CCConnectAdapter:
             memory=memory,
             recent_hints=hints,
         )
+        self.project_context_store.sync_project_memory_file(project_id)
+        self.project_context_store.sync_project_skill_file(project_id)
 
     @staticmethod
     def _project_focus(summary: str | None) -> str:

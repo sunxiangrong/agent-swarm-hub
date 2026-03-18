@@ -153,7 +153,9 @@ def _upsert_project_workspace(*, store: SessionStore, title: str, workspace_path
         backend="claude",
         transport="direct",
     )
-    ProjectContextStore(str(db_path)).sync_project_memory_file(project_id)
+    context_store = ProjectContextStore(str(db_path))
+    context_store.sync_project_memory_file(project_id)
+    context_store.sync_project_skill_file(project_id)
     return store.get_workspace(project_id) or WorkspaceRecord(
         workspace_id=project_id,
         title=title.strip() or project_id,
@@ -784,22 +786,25 @@ def _record_provider_binding_and_memory(
     source_path = str(session_meta.get("source_path") or "")
     cwd = str(session_meta.get("cwd") or workspace_path)
     last_used_at = str(session_meta.get("last_used_at") or "")
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, notes, source_path, cwd, last_used_at)
-            VALUES (?, ?, ?, 'active', ?, ?, ?, ?)
-            ON CONFLICT(provider, raw_session_id) DO UPDATE SET
-                project_id=excluded.project_id,
-                status='active',
-                notes=excluded.notes,
-                source_path=excluded.source_path,
-                cwd=excluded.cwd,
-                last_used_at=excluded.last_used_at
-            """,
-            (provider, session_id, project_id, notes, source_path, cwd, last_used_at),
-        )
-        conn.commit()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, notes, source_path, cwd, last_used_at)
+                VALUES (?, ?, ?, 'active', ?, ?, ?, ?)
+                ON CONFLICT(provider, raw_session_id) DO UPDATE SET
+                    project_id=excluded.project_id,
+                    status='active',
+                    notes=excluded.notes,
+                    source_path=excluded.source_path,
+                    cwd=excluded.cwd,
+                    last_used_at=excluded.last_used_at
+                """,
+                (provider, session_id, project_id, notes, source_path, cwd, last_used_at),
+            )
+            conn.commit()
+    except sqlite3.Error:
+        pass
     context_store.upsert_project_session(
         project_id,
         provider,
@@ -834,6 +839,42 @@ def _record_provider_binding_and_memory(
         recent_hints=hints or fallback_snapshot.get("recent_hints", []),
     )
     context_store.sync_project_memory_file(project_id)
+    context_store.sync_project_skill_file(project_id)
+
+
+def _backfill_workspace_provider_sessions(
+    *,
+    context_store: ProjectContextStore,
+    project_id: str,
+    workspace_path: str,
+    fallback_snapshot: dict[str, str],
+) -> dict[str, str]:
+    adopted: dict[str, str] = {}
+    for provider in ("claude", "codex"):
+        existing = context_store.get_provider_binding(project_id, provider)
+        if existing:
+            adopted[provider] = existing
+            continue
+        session_meta = _select_postrun_session(
+            provider=provider,
+            workspace_path=workspace_path,
+            before={},
+            preferred_session_id=None,
+        )
+        if session_meta is None:
+            continue
+        _record_provider_binding_and_memory(
+            context_store=context_store,
+            project_id=project_id,
+            provider=provider,
+            workspace_path=workspace_path,
+            session_meta=session_meta,
+            fallback_snapshot=fallback_snapshot,
+        )
+        session_id = str(session_meta.get("session_id") or "").strip()
+        if session_id:
+            adopted[provider] = session_id
+    return adopted
 
 
 def _extract_project_memory_from_messages(
@@ -904,6 +945,7 @@ def _is_meta_project_memory_message(text: str) -> bool:
     if not normalized:
         return False
     patterns = (
+        "project summary for this session",
         "当前是新对话吗",
         "这是新对话吗",
         "有之前的记忆吗",
@@ -1034,6 +1076,18 @@ def _run_local_native(*, provider: str, project: str | None) -> int:
             workspace_path=workspace.path,
             context_store=context_store,
         )
+        if not provider_sessions:
+            _backfill_workspace_provider_sessions(
+                context_store=context_store,
+                project_id=workspace.workspace_id,
+                workspace_path=workspace.path,
+                fallback_snapshot=snapshot,
+            )
+            provider_sessions = _project_provider_sessions(
+                project_id=workspace.workspace_id,
+                workspace_path=workspace.path,
+                context_store=context_store,
+            )
         if provider_sessions.get("claude"):
             env["ASH_CLAUDE_SESSION_ID"] = provider_sessions["claude"]
         if provider_sessions.get("codex"):
