@@ -239,6 +239,20 @@ Telegram / Lark
 - worker 运行态
 - 临时消息与执行流
 
+## 路径约定
+
+默认项目目录根是：
+
+`/Users/sunxiangrong/dev/cli/projects`
+
+也就是通过 `add-project` 新建项目时，会默认创建到：
+
+`/Users/sunxiangrong/dev/cli/projects/<project-id>`
+
+如果需要覆盖，可以设置：
+
+`ASH_PROJECTS_DIR=/your/projects/root`
+
 运行日志、pane 输出和临时运行产物建议统一视为 runtime 数据，不作为仓库内容本身的一部分。
 
 ## 推荐配置

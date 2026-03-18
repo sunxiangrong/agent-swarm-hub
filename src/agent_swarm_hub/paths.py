@@ -17,6 +17,17 @@ def default_project_session_db() -> Path:
     return cli_root() / "local-skills" / "project-session-manager" / "data" / "sessions.sqlite3"
 
 
+def default_projects_root() -> Path:
+    return cli_root() / "projects"
+
+
+def projects_root() -> Path:
+    explicit = (os.getenv("ASH_PROJECTS_DIR") or "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    return default_projects_root()
+
+
 def project_session_db_path() -> Path:
     explicit = (os.getenv("ASH_PROJECT_SESSION_DB") or "").strip()
     if explicit:

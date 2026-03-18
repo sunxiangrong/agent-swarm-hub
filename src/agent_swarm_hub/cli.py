@@ -13,7 +13,7 @@ from .config import RuntimeConfig, apply_runtime_env, load_env_file
 from .executor import build_executor_for_config
 from .lark_ws_runner import LarkWebSocketRunner
 from .project_context import ProjectContextStore
-from .paths import project_session_db_path, provider_command
+from .paths import project_session_db_path, projects_root, provider_command
 from .remote import RemoteMessage, RemotePlatform
 from .session_store import SessionStore, WorkspaceRecord
 from .telegram_polling import TelegramPollingRunner
@@ -88,12 +88,22 @@ def _invocation_dir() -> Path:
         return Path.cwd()
 
 
-def _upsert_project_workspace(*, store: SessionStore, title: str, workspace_path: Path) -> WorkspaceRecord:
+def _project_slug(title: str) -> str:
     project_id = title.strip().lower().replace(" ", "-")
     keep = [ch for ch in project_id if ch.isalnum() or ch in {"-", "_", "."}]
-    project_id = "".join(keep) or "default"
+    return "".join(keep) or "default"
+
+
+def _new_project_workspace_path(title: str) -> Path:
+    workspace_path = projects_root() / _project_slug(title)
+    return workspace_path.expanduser().resolve()
+
+
+def _upsert_project_workspace(*, store: SessionStore, title: str, workspace_path: Path) -> WorkspaceRecord:
+    project_id = _project_slug(title)
     db_path = project_session_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    workspace_path.mkdir(parents=True, exist_ok=True)
     summary = f"Project: {project_id}\nWorkspace: {workspace_path}"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -143,6 +153,7 @@ def _upsert_project_workspace(*, store: SessionStore, title: str, workspace_path
         backend="claude",
         transport="direct",
     )
+    ProjectContextStore(str(db_path)).sync_project_memory_file(project_id)
     return store.get_workspace(project_id) or WorkspaceRecord(
         workspace_id=project_id,
         title=title.strip() or project_id,
@@ -167,7 +178,11 @@ def _pick_startup_workspace(*, store: SessionStore, require_path: bool = False) 
             if not title:
                 print("Temporary mode selected.")
                 return None
-            workspace = _upsert_project_workspace(store=store, title=title, workspace_path=_invocation_dir())
+            workspace = _upsert_project_workspace(
+                store=store,
+                title=title,
+                workspace_path=_new_project_workspace_path(title),
+            )
             print(f"Added project `{workspace.workspace_id}` at {workspace.path}.")
             return workspace.workspace_id
         print("No workspaces found. Temporary mode selected.")
@@ -176,7 +191,7 @@ def _pick_startup_workspace(*, store: SessionStore, require_path: bool = False) 
     print("Available workspaces:")
     for index, workspace in enumerate(workspaces, start=1):
         print(f"{index}. {workspace.workspace_id} ({workspace.backend}/{workspace.transport})")
-    print(f"{len(workspaces) + 1}. add-project (bind current directory as a new project)")
+    print(f"{len(workspaces) + 1}. add-project (create a new project directory)")
 
     prompt = "Select project by number/name, or type temporary"
     if workspaces:
@@ -194,7 +209,11 @@ def _pick_startup_workspace(*, store: SessionStore, require_path: bool = False) 
             if not title:
                 print("Project name cannot be empty.")
                 continue
-            workspace = _upsert_project_workspace(store=store, title=title, workspace_path=_invocation_dir())
+            workspace = _upsert_project_workspace(
+                store=store,
+                title=title,
+                workspace_path=_new_project_workspace_path(title),
+            )
             print(f"Added project `{workspace.workspace_id}` at {workspace.path}.")
             return workspace.workspace_id
         if resolved is None:
@@ -411,19 +430,24 @@ def _project_summary_field(summary: str, prefix: str) -> str:
 def _build_project_summary_prompt(*, workspace_id: str, work_dir: str, summary: str, snapshot: dict[str, str]) -> str:
     focus = _project_summary_field(summary, "Current focus:") or snapshot.get("focus") or ""
     recent_context = _project_summary_field(summary, "Recent context:") or snapshot.get("recent_context") or ""
-    compact_summary = ProjectContextStore._summary_compact_text(summary) or snapshot.get("memory") or ""
+    next_step = (snapshot.get("recent_hints") or [""])[-1] if snapshot.get("recent_hints") else ""
+    if next_step.startswith("user:") or next_step.startswith("assistant:"):
+        _, _, next_step = next_step.partition(":")
+        next_step = next_step.strip()
     lines = [
         "Project summary for this session:",
         f"- Project: {workspace_id}",
         f"- Path: {work_dir}",
     ]
     if focus:
-        lines.append(f"- Focus: {focus}")
+        lines.append(f"- Current Focus: {focus}")
     if recent_context:
-        lines.append(f"- Recent context: {recent_context}")
-    if compact_summary:
-        lines.append(f"- Summary: {compact_summary}")
-    lines.append("Use this as the project summary context for the session.")
+        lines.append(f"- Current State: {recent_context}")
+    if next_step:
+        lines.append(f"- Next Step: {next_step}")
+    lines.append(f"- Read first: {work_dir}/PROJECT_MEMORY.md")
+    lines.append(f"- Rules file: {work_dir}/PROJECT_SKILL.md")
+    lines.append("Use these project files plus this summary as the project context for the session.")
     return "\n".join(lines)
 
 
@@ -498,6 +522,30 @@ def _prepend_path(env: dict[str, str], entry: str) -> None:
         env["PATH"] = current
         return
     env["PATH"] = os.pathsep.join([entry, *parts])
+
+
+def _clear_project_runtime_env(env: dict[str, str]) -> None:
+    for key in (
+        "ASH_ACTIVE_WORKSPACE",
+        "ASH_PROJECT_PATH",
+        "ASH_PROJECT_PROVIDER",
+        "ASH_PROJECT_SESSION_MODE",
+        "ASH_PROJECT_SESSION_ID",
+        "ASH_PROJECT_IDENTITY_TEXT",
+        "ASH_PROJECT_MEMORY_PROJECT_ID",
+        "ASH_PROJECT_MEMORY_WORKSPACE",
+        "ASH_PROJECT_MEMORY_PROFILE",
+        "ASH_PROJECT_MEMORY_FOCUS",
+        "ASH_PROJECT_MEMORY_RECENT_CONTEXT",
+        "ASH_PROJECT_MEMORY_SUMMARY",
+        "ASH_PROJECT_MEMORY_HINTS",
+        "ASH_PROVIDER_SESSION_ID",
+        "ASH_CLAUDE_SESSION_ID",
+        "ASH_CODEX_SESSION_ID",
+        "CCB_WORK_DIR",
+        "CCB_RUN_DIR",
+    ):
+        env.pop(key, None)
 
 
 def _inject_project_identity_env(
@@ -768,30 +816,87 @@ def _record_provider_binding_and_memory(
     fallback_recent_context = fallback_snapshot.get("recent_context") or ""
     fallback_memory = fallback_snapshot.get("memory") or ""
     fallback_hints = fallback_snapshot.get("recent_hints", [])
-    focus = fallback_snapshot.get("focus") or ""
-    last_user_message = ""
-    if messages:
-        for item in reversed(messages):
-            if item.startswith("user:"):
-                candidate = item.removeprefix("user:").strip()
-                last_user_message = candidate
-                if candidate and not _is_meta_project_memory_message(candidate):
-                    focus = candidate
-                break
-    recent_context = messages[-1] if messages else fallback_recent_context
-    memory = " | ".join(messages[-2:]) if messages else fallback_memory
-    if messages and _is_meta_project_memory_message(last_user_message):
+    extracted = _extract_project_memory_from_messages(messages, fallback_snapshot=fallback_snapshot)
+    focus = extracted["focus"]
+    recent_context = extracted["recent_context"]
+    memory = extracted["memory"]
+    hints = extracted["recent_hints"]
+    if extracted["fallback_only"]:
         focus = fallback_focus
         recent_context = fallback_recent_context
         memory = fallback_memory
-        messages = [str(item).strip() for item in fallback_hints if str(item).strip()]
+        hints = [str(item).strip() for item in fallback_hints if str(item).strip()]
     context_store.upsert_project_memory(
         project_id,
         focus=focus,
         recent_context=recent_context,
         memory=memory,
-        recent_hints=messages[-2:] or fallback_snapshot.get("recent_hints", []),
+        recent_hints=hints or fallback_snapshot.get("recent_hints", []),
     )
+    context_store.sync_project_memory_file(project_id)
+
+
+def _extract_project_memory_from_messages(
+    messages: list[str],
+    *,
+    fallback_snapshot: dict[str, str],
+) -> dict[str, object]:
+    filtered = [item for item in messages if _is_meaningful_project_memory_message(item)]
+    user_messages = [
+        item.removeprefix("user:").strip()
+        for item in filtered
+        if item.startswith("user:")
+    ]
+    assistant_messages = [
+        item.removeprefix("assistant:").strip()
+        for item in filtered
+        if item.startswith("assistant:")
+    ]
+    hints = filtered[-2:]
+    focus = user_messages[-1] if user_messages else (fallback_snapshot.get("focus") or "")
+    recent_context_parts: list[str] = []
+    if assistant_messages:
+        recent_context_parts.append(assistant_messages[-1])
+    elif filtered:
+        recent_context_parts.append(filtered[-1])
+    if user_messages and user_messages[-1] != focus:
+        recent_context_parts.append(user_messages[-1])
+    recent_context = " | ".join(part for part in recent_context_parts if part).strip()
+    if not recent_context:
+        recent_context = fallback_snapshot.get("recent_context") or ""
+    memory_parts: list[str] = []
+    if focus:
+        memory_parts.append(f"Task: {focus}")
+    if recent_context:
+        memory_parts.append(f"State: {recent_context}")
+    if assistant_messages:
+        memory_parts.append(f"Latest result: {assistant_messages[-1]}")
+    memory = " | ".join(part for part in memory_parts[:3]).strip()
+    if not memory:
+        memory = fallback_snapshot.get("memory") or ""
+    return {
+        "focus": focus,
+        "recent_context": recent_context,
+        "memory": memory,
+        "recent_hints": hints,
+        "fallback_only": not filtered,
+    }
+
+
+def _is_meaningful_project_memory_message(text: str) -> bool:
+    normalized = " ".join((text or "").split()).strip()
+    if not normalized:
+        return False
+    if _is_meta_project_memory_message(normalized):
+        return False
+    content = normalized
+    if normalized.startswith("user:") or normalized.startswith("assistant:"):
+        _, _, content = normalized.partition(":")
+        content = content.strip()
+    if len(content) < 6:
+        return False
+    low_signal = {"继续", "好的", "ok", "okay", "hi", "hello", "收到", "看下", "看看", "嗯", "是的"}
+    return content.lower() not in low_signal
 
 
 def _is_meta_project_memory_message(text: str) -> bool:
@@ -898,6 +1003,7 @@ def _run_local_native(*, provider: str, project: str | None) -> int:
 
     work_dir = workspace.path if workspace and workspace.path else os.getcwd()
     env = os.environ.copy()
+    _clear_project_runtime_env(env)
     postrun_before: dict[str, dict[str, object]] = {}
     fallback_snapshot: dict[str, str] = {
         "focus": "",

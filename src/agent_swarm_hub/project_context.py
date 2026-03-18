@@ -285,17 +285,20 @@ class ProjectContextStore:
     def set_provider_binding(self, project_id: str, provider: str, raw_session_id: str) -> None:
         if not project_id or not provider or not raw_session_id:
             return
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO provider_bindings (project_id, provider, raw_session_id, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(project_id, provider) DO UPDATE SET
-                    raw_session_id = excluded.raw_session_id,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (project_id, provider, raw_session_id),
-            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO provider_bindings (project_id, provider, raw_session_id, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(project_id, provider) DO UPDATE SET
+                        raw_session_id = excluded.raw_session_id,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (project_id, provider, raw_session_id),
+                )
+        except sqlite3.Error:
+            return
 
     def upsert_project_memory(
         self,
@@ -309,20 +312,23 @@ class ProjectContextStore:
         if not project_id:
             return
         hints = [self._compact(item, _PROMPT_MESSAGE_LIMIT) for item in (recent_hints or []) if (item or '').strip()][:_PROMPT_RECENT_MESSAGE_COUNT]
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO project_memory (project_id, focus, recent_context, memory, recent_hints_json, updated_at)
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(project_id) DO UPDATE SET
-                    focus = CASE WHEN excluded.focus != '' THEN excluded.focus ELSE project_memory.focus END,
-                    recent_context = CASE WHEN excluded.recent_context != '' THEN excluded.recent_context ELSE project_memory.recent_context END,
-                    memory = CASE WHEN excluded.memory != '' THEN excluded.memory ELSE project_memory.memory END,
-                    recent_hints_json = CASE WHEN excluded.recent_hints_json != '[]' THEN excluded.recent_hints_json ELSE project_memory.recent_hints_json END,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (project_id, focus.strip(), recent_context.strip(), memory.strip(), json.dumps(hints, ensure_ascii=False)),
-            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO project_memory (project_id, focus, recent_context, memory, recent_hints_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(project_id) DO UPDATE SET
+                        focus = CASE WHEN excluded.focus != '' THEN excluded.focus ELSE project_memory.focus END,
+                        recent_context = CASE WHEN excluded.recent_context != '' THEN excluded.recent_context ELSE project_memory.recent_context END,
+                        memory = CASE WHEN excluded.memory != '' THEN excluded.memory ELSE project_memory.memory END,
+                        recent_hints_json = CASE WHEN excluded.recent_hints_json != '[]' THEN excluded.recent_hints_json ELSE project_memory.recent_hints_json END,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (project_id, focus.strip(), recent_context.strip(), memory.strip(), json.dumps(hints, ensure_ascii=False)),
+                )
+        except sqlite3.Error:
+            return
 
     def upsert_project_session(
         self,
@@ -424,6 +430,190 @@ class ProjectContextStore:
             if (row["provider"] or "").strip() and (row["raw_session_id"] or "").strip()
         }
 
+    def render_project_memory_markdown(self, project_id: str) -> str:
+        project = self.get_project(project_id)
+        if project is None:
+            return ""
+        stored_memory = self.get_project_memory(project_id)
+        bindings = self.get_current_project_sessions(project_id)
+        sessions = self.list_project_sessions(project_id, include_archived=False)
+        focus = stored_memory.get("focus", "") or self._summary_field(project.summary, "Current focus:")
+        current_state = stored_memory.get("recent_context", "") or self._summary_field(project.summary, "Recent context:")
+        next_step = self._derive_next_step(
+            focus=focus,
+            current_state=current_state,
+            memory=stored_memory.get("memory", ""),
+            hints=stored_memory.get("recent_hints", []),
+        )
+        lines = [
+            "# PROJECT_MEMORY",
+            "",
+            "## Project",
+            project.project_id,
+            "",
+            "## Path",
+            project.workspace_path or "",
+            "",
+            "## Summary",
+            project.summary or "",
+            "",
+            "## Current Focus",
+        ]
+        if focus:
+            lines.append(focus)
+        else:
+            lines.append("No focus recorded yet.")
+        lines.extend(
+            [
+                "",
+                "## Current State",
+            ]
+        )
+        if current_state:
+            lines.append(current_state)
+        else:
+            lines.append("No current state recorded yet.")
+        lines.extend(
+            [
+                "",
+                "## Next Step",
+            ]
+        )
+        if next_step:
+            lines.append(next_step)
+        else:
+            lines.append("No next step recorded yet.")
+        lines.extend(
+            [
+                "",
+                "## Key Rules",
+            ]
+        )
+        key_rules = [project.profile.strip(), stored_memory.get("memory", "").strip()]
+        for item in key_rules:
+            if item:
+                lines.append(f"- {item}")
+        if not any(item for item in key_rules):
+            lines.append("- No key rules recorded yet.")
+        lines.extend(
+            [
+                "",
+                "## Current Sessions",
+            ]
+        )
+        if bindings:
+            for provider in sorted(bindings):
+                lines.append(f"- {provider}: {bindings[provider]}")
+        else:
+            lines.append("- No current provider bindings.")
+        lines.extend(
+            [
+                "",
+                "## Active Session History",
+            ]
+        )
+        if sessions:
+            for session in sessions[:8]:
+                title = self._compact(
+                    " ".join(
+                        str(session.get("title") or session.get("summary") or session.get("session_id") or "").split()
+                    ),
+                    96,
+                )
+                lines.append(
+                    f"- {session.get('provider', '')}: {title} [{session.get('session_id', '')}]"
+                )
+        else:
+            lines.append("- No active session history.")
+        lines.extend(
+            [
+                "",
+                "## Updated At",
+                self._project_updated_at(project_id),
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    def render_project_skill_markdown(self, project_id: str) -> str:
+        project = self.get_project(project_id)
+        if project is None:
+            return ""
+        stored_memory = self.get_project_memory(project_id)
+        focus = stored_memory.get("focus", "") or self._summary_field(project.summary, "Current focus:")
+        recent_context = stored_memory.get("recent_context", "") or self._summary_field(project.summary, "Recent context:")
+        lines = [
+            "# PROJECT_SKILL",
+            "",
+            "## Startup",
+            f"- First read `PROJECT_MEMORY.md` in `{project.workspace_path}`.",
+            "- Treat `Current Focus` as the default priority unless the user changes direction.",
+            "- Treat `Current State` as the latest known status, not as a full history replay.",
+            "",
+            "## Work Rules",
+        ]
+        work_rules = [
+            "Prefer continuing the current project thread over starting a new framing from scratch.",
+            "Keep outputs, notes, and temporary artifacts inside the project workspace when possible.",
+            focus and f"Default focus: {focus}",
+            recent_context and f"Latest known state: {recent_context}",
+        ]
+        for item in work_rules:
+            if item:
+                lines.append(f"- {item}")
+        lines.extend(
+            [
+                "",
+                "## Memory Rules",
+                "- Do not overwrite project memory with meta chat such as asking whether memory exists.",
+                "- When the task meaningfully changes, update project memory through the shared sync flow.",
+                "",
+                "## Files",
+                f"- Workspace: `{project.workspace_path}`",
+                "- Durable state file: `PROJECT_MEMORY.md`",
+                "- Instruction file: `PROJECT_SKILL.md`",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    def sync_project_memory_file(self, project_id: str) -> Path | None:
+        project = self.get_project(project_id)
+        if project is None or not (project.workspace_path or "").strip():
+            return None
+        workspace = Path(project.workspace_path).expanduser()
+        try:
+            workspace.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        output_path = workspace / "PROJECT_MEMORY.md"
+        output_path.write_text(self.render_project_memory_markdown(project_id), encoding="utf-8")
+        return output_path
+
+    def sync_project_skill_file(self, project_id: str) -> Path | None:
+        project = self.get_project(project_id)
+        if project is None or not (project.workspace_path or "").strip():
+            return None
+        workspace = Path(project.workspace_path).expanduser()
+        try:
+            workspace.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        output_path = workspace / "PROJECT_SKILL.md"
+        output_path.write_text(self.render_project_skill_markdown(project_id), encoding="utf-8")
+        return output_path
+
+    def sync_all_project_memory_files(self) -> list[Path]:
+        written: list[Path] = []
+        for project in self.list_projects():
+            path = self.sync_project_memory_file(project.project_id)
+            if path is not None:
+                written.append(path)
+            skill_path = self.sync_project_skill_file(project.project_id)
+            if skill_path is not None:
+                written.append(skill_path)
+        return written
+
     @staticmethod
     def _compact(text: str | None, limit: int) -> str:
         value = " ".join((text or "").split())
@@ -469,3 +659,43 @@ class ProjectContextStore:
             for item in payload
             if str(item).strip()
         ][:_PROMPT_RECENT_MESSAGE_COUNT]
+
+    def _project_updated_at(self, project_id: str) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT MAX(value) AS updated_at
+                FROM (
+                    SELECT updated_at AS value FROM projects WHERE project_id = ?
+                    UNION ALL
+                    SELECT updated_at AS value FROM project_memory WHERE project_id = ?
+                    UNION ALL
+                    SELECT updated_at AS value FROM provider_bindings WHERE project_id = ?
+                )
+                """,
+                (project_id, project_id, project_id),
+            ).fetchone()
+        return str(row["updated_at"] or "").strip() or ""
+
+    @classmethod
+    def _derive_next_step(
+        cls,
+        *,
+        focus: str,
+        current_state: str,
+        memory: str,
+        hints: list[str],
+    ) -> str:
+        for hint in reversed(hints):
+            value = " ".join(str(hint).split())
+            if value:
+                if value.startswith("user:") or value.startswith("assistant:"):
+                    _, _, value = value.partition(":")
+                    value = value.strip()
+                if value:
+                    return cls._compact(value, 220)
+        if current_state:
+            return cls._compact(current_state, 220)
+        if memory:
+            return cls._compact(memory, 220)
+        return cls._compact(focus, 220) if focus else ""

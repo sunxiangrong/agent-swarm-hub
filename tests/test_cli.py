@@ -195,14 +195,13 @@ def test_cli_local_chat_prompts_for_project_or_temporary(monkeypatch, capsys) ->
 def test_cli_local_native_can_add_project_from_picker(monkeypatch, tmp_path, capsys) -> None:
     db_path = tmp_path / "sessions.sqlite3"
     shared_db_path = tmp_path / "shared-projects.sqlite3"
-    invoke_dir = tmp_path / "new-project-dir"
-    invoke_dir.mkdir()
+    projects_dir = tmp_path / "projects"
     captured = {}
 
     inputs = iter(["My New Project", ""])
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
-    monkeypatch.setenv("ASH_INVOKE_DIR", str(invoke_dir))
+    monkeypatch.setenv("ASH_PROJECTS_DIR", str(projects_dir))
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     _patch_native_run(monkeypatch, captured)
@@ -216,15 +215,27 @@ def test_cli_local_native_can_add_project_from_picker(monkeypatch, tmp_path, cap
     assert "Added project `my-new-project`" in output
     assert "Press Enter to enter native codex CLI..." in output
     assert captured["env"]["ASH_ACTIVE_WORKSPACE"] == "my-new-project"
-    assert captured["env"]["ASH_PROJECT_PATH"] == str(invoke_dir)
+    assert captured["env"]["ASH_PROJECT_PATH"] == str(projects_dir / "my-new-project")
+    assert (projects_dir / "my-new-project").is_dir()
 
 
 def test_cli_local_chat_reprompts_for_invalid_project_selection(monkeypatch, capsys) -> None:
     inputs = iter(["project", "1", "/quit"])
-
     monkeypatch.setenv("ASH_EXECUTOR", "echo")
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(
+        "agent_swarm_hub.cli._shared_projects_as_workspaces",
+        lambda: [
+            SimpleNamespace(
+                workspace_id="agent-swarm-hub",
+                title="agent-swarm-hub",
+                path="/tmp/agent-swarm-hub",
+                backend="claude",
+                transport="direct",
+            )
+        ],
+    )
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-chat", "--provider", "echo"])
 
     exit_code = main()
@@ -273,7 +284,9 @@ def test_cli_local_native_launches_provider_in_workspace(monkeypatch, tmp_path) 
     assert "Project summary for this session:" in captured["argv"][-1]
     assert f"- Project: project-alpha" in captured["argv"][-1]
     assert f"- Path: {workspace_path}" in captured["argv"][-1]
-    assert "Use this as the project summary context for the session." in captured["argv"][-1]
+    assert f"- Read first: {workspace_path}/PROJECT_MEMORY.md" in captured["argv"][-1]
+    assert f"- Rules file: {workspace_path}/PROJECT_SKILL.md" in captured["argv"][-1]
+    assert "Use these project files plus this summary as the project context for the session." in captured["argv"][-1]
 
 
 def test_cli_local_native_resumes_shared_project_session(monkeypatch, tmp_path) -> None:
@@ -363,7 +376,8 @@ def test_cli_local_native_resumes_shared_project_session(monkeypatch, tmp_path) 
     assert captured["env"]["ASH_PROJECT_SESSION_MODE"] == "resume-project-context"
     assert captured["env"]["ASH_PROJECT_SESSION_ID"] == "codex-session-123"
     assert "Project summary for this session:" in captured["argv"][-1]
-    assert "- Focus: Keep resume stable" in captured["argv"][-1]
+    assert "- Current Focus: Keep resume stable" in captured["argv"][-1]
+    assert "- Current State: Native CLI entry should reuse the right conversation" in captured["argv"][-1]
 
 
 def test_cli_local_native_skips_codex_resume_when_session_file_is_missing(monkeypatch, tmp_path, capsys) -> None:
@@ -1122,7 +1136,7 @@ def test_cli_local_native_fresh_codex_run_rebinds_project_session_and_memory(mon
     assert memory == (
         "Remember the current focus",
         "user: Remember the current focus",
-        "user: Need stable project chat | user: Remember the current focus",
+        "Task: Remember the current focus | State: user: Remember the current focus",
     )
 
 
@@ -1237,6 +1251,108 @@ def test_cli_local_native_meta_memory_questions_do_not_override_project_memory(m
         "Continue the project instead of memory meta discussion",
         "Existing compact project memory",
         '["user: Real project task"]',
+    )
+
+
+def test_cli_local_native_extracts_memory_from_meaningful_messages(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "project-alpha"
+    workspace_path.mkdir()
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "project-alpha",
+                "project-alpha",
+                str(workspace_path),
+                "Project alpha profile",
+                "Project: project-alpha\nCurrent focus: Old focus\nRecent context: Old context",
+            ),
+        )
+
+    captured = {}
+
+    def after_run(_argv, _env, _cwd) -> None:
+        _write_codex_session(fake_home, "codex-session-new", str(workspace_path))
+        _write_codex_history(
+            fake_home,
+            "codex-session-new",
+            "继续",
+            "需要整理 agent-browser 的命令用法并写成一份可复用说明",
+            "已经确认 open、wait、snapshot、click 是最小工作流，下一步补成模板",
+        )
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setenv("HOME", str(fake_home))
+    _patch_native_run(monkeypatch, captured, after_run=after_run)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    with sqlite3.connect(shared_db_path) as conn:
+        memory = conn.execute(
+            "SELECT focus, recent_context, memory, recent_hints_json FROM project_memory WHERE project_id = ?",
+            ("project-alpha",),
+        ).fetchone()
+
+    assert memory[0] == "已经确认 open、wait、snapshot、click 是最小工作流，下一步补成模板"
+    assert memory[1] == "user: 已经确认 open、wait、snapshot、click 是最小工作流，下一步补成模板"
+    assert "Task: 已经确认 open、wait、snapshot、click 是最小工作流，下一步补成模板" in memory[2]
+    assert "State: user: 已经确认 open、wait、snapshot、click 是最小工作流，下一步补成模板" in memory[2]
+    assert memory[3] == json.dumps(
+        [
+            "user: 需要整理 agent-browser 的命令用法并写成一份可复用说明",
+            "user: 已经确认 open、wait、snapshot、click 是最小工作流，下一步补成模板",
+        ],
+        ensure_ascii=False,
     )
 
 
