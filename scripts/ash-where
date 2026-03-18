@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "--json" ]]; then
+  python3 - <<'JSON'
+import json
+import os
+
+payload = {
+    "project": os.getenv("ASH_ACTIVE_WORKSPACE", "temporary"),
+    "path": os.getenv("ASH_PROJECT_PATH", os.getcwd()),
+    "provider": os.getenv("ASH_PROJECT_PROVIDER", ""),
+    "session_mode": os.getenv("ASH_PROJECT_SESSION_MODE", ""),
+    "session_id": os.getenv("ASH_PROJECT_SESSION_ID", ""),
+    "memory_project_id": os.getenv("ASH_PROJECT_MEMORY_PROJECT_ID", ""),
+    "focus": os.getenv("ASH_PROJECT_MEMORY_FOCUS", ""),
+    "recent_context": os.getenv("ASH_PROJECT_MEMORY_RECENT_CONTEXT", ""),
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+JSON
+  exit 0
+fi
+
+echo "Project: ${ASH_ACTIVE_WORKSPACE:-temporary}"
+echo "Path: ${ASH_PROJECT_PATH:-$PWD}"
+echo "Provider: ${ASH_PROJECT_PROVIDER:-unknown}"
+echo "Session Mode: ${ASH_PROJECT_SESSION_MODE:-unknown}"
+if [[ -n "${ASH_PROJECT_SESSION_ID:-}" ]]; then
+  echo "Session ID: ${ASH_PROJECT_SESSION_ID}"
+fi
+if [[ -n "${ASH_PROJECT_MEMORY_FOCUS:-}" ]]; then
+  echo "Focus: ${ASH_PROJECT_MEMORY_FOCUS}"
+fi
+if [[ -n "${ASH_PROJECT_MEMORY_RECENT_CONTEXT:-}" ]]; then
+  echo "Recent Context: ${ASH_PROJECT_MEMORY_RECENT_CONTEXT}"
+fi

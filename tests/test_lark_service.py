@@ -1,6 +1,18 @@
 import json
 
-from agent_swarm_hub import EchoExecutor, LarkConfig, LarkService
+from agent_swarm_hub import CCConnectAdapter, EchoExecutor, LarkConfig, LarkService, RemoteMessage, RemotePlatform, SessionStore
+
+
+def _bind_workspace(adapter: CCConnectAdapter) -> None:
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.LARK,
+            chat_id="oc_456",
+            user_id="ou_789",
+            text="/use project-alpha",
+        )
+    )
+    assert "project-alpha" in response.text
 
 
 def test_lark_service_builds_create_message_request() -> None:
@@ -33,9 +45,11 @@ def test_lark_service_handles_challenge() -> None:
     assert response == {"challenge": "abc123"}
 
 
-def test_lark_service_dispatches_event_to_outbound_text() -> None:
+def test_lark_service_dispatches_event_to_outbound_text(tmp_path) -> None:
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
+    _bind_workspace(adapter)
     service = LarkService(LarkConfig(enabled=True, app_id="app", app_secret="secret"))
-    service.runner.adapter.executor = EchoExecutor()
+    service.runner.adapter = adapter
 
     dispatch = service.handle_event(
         {

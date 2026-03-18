@@ -22,14 +22,14 @@ export ASH_LARK_VERIFY_TOKEN='your verification token'
 ## Verify Effective Config
 
 ```bash
-cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 PYTHONPATH=src conda run -n cli python -m agent_swarm_hub.cli lark-ws --print-config
 ```
 
 ## Start the Local WebSocket Client
 
 ```bash
-cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 PYTHONPATH=src conda run -n cli python -m agent_swarm_hub.cli lark-ws
 ```
 

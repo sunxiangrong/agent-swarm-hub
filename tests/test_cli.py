@@ -1,7 +1,10 @@
+import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 from agent_swarm_hub.cli import main
+from agent_swarm_hub.paths import ccb_lib_dir, project_session_db_path, provider_command
 
 
 def _write_codex_session(home: Path, session_id: str, cwd: str) -> Path:
@@ -13,6 +16,75 @@ def _write_codex_session(home: Path, session_id: str, cwd: str) -> Path:
         encoding="utf-8",
     )
     return session_file
+
+
+def _write_codex_history(home: Path, session_id: str, *texts: str) -> Path:
+    history_path = home / ".codex" / "history.jsonl"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    with history_path.open("a", encoding="utf-8") as handle:
+        for text in texts:
+            handle.write(json.dumps({"session_id": session_id, "text": text}, ensure_ascii=False) + "\n")
+    return history_path
+
+
+def _patch_native_run(monkeypatch, captured: dict, *, after_run=None) -> None:
+    def fake_run(argv, env=None, cwd=None, check=False):
+        captured["command"] = argv[0]
+        captured["argv"] = argv
+        captured["env"] = env or {}
+        captured["cwd"] = cwd
+        if after_run is not None:
+            after_run(argv, env or {}, cwd)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("agent_swarm_hub.cli.subprocess.run", fake_run)
+
+
+def test_provider_command_prefers_path_binary_when_wrapper_missing(monkeypatch, tmp_path) -> None:
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("ASH_CODEX_BIN", raising=False)
+    monkeypatch.setattr("agent_swarm_hub.paths.shutil.which", lambda name: f"/opt/test/{name}" if name == "codex" else None)
+
+    assert provider_command("codex") == "/opt/test/codex"
+
+
+def test_provider_command_prefers_explicit_env(monkeypatch) -> None:
+    monkeypatch.setenv("ASH_CLAUDE_BIN", "/tmp/custom-claude")
+
+    assert provider_command("claude") == "/tmp/custom-claude"
+
+
+def test_project_session_db_defaults_to_cli_root() -> None:
+    expected = Path("/Users/sunxiangrong/dev/cli/local-skills/project-session-manager/data/sessions.sqlite3")
+    assert project_session_db_path() == expected
+
+
+def test_ccb_lib_dir_defaults_to_cli_root() -> None:
+    expected = Path("/Users/sunxiangrong/dev/cli/Codex/claude_code_bridge/lib")
+    assert ccb_lib_dir() == expected
+
+
+def test_ash_where_script_reports_project_identity(monkeypatch, tmp_path):
+    script = Path("/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/scripts/ash-where")
+    monkeypatch.setenv("ASH_ACTIVE_WORKSPACE", "project-alpha")
+    monkeypatch.setenv("ASH_PROJECT_PATH", str(tmp_path))
+    monkeypatch.setenv("ASH_PROJECT_PROVIDER", "codex")
+    monkeypatch.setenv("ASH_PROJECT_SESSION_MODE", "resume-project-context")
+    monkeypatch.setenv("ASH_PROJECT_SESSION_ID", "codex-session-123")
+    monkeypatch.setenv("ASH_PROJECT_MEMORY_FOCUS", "Keep resume stable")
+
+    import subprocess
+
+    result = subprocess.run([str(script), "--json"], check=True, capture_output=True, text=True)
+    payload = json.loads(result.stdout)
+
+    assert payload["project"] == "project-alpha"
+    assert payload["provider"] == "codex"
+    assert payload["session_mode"] == "resume-project-context"
+    assert payload["session_id"] == "codex-session-123"
+    assert payload["focus"] == "Keep resume stable"
 
 
 def test_cli_prints_lark_ws_config(monkeypatch, capsys) -> None:
@@ -127,29 +199,22 @@ def test_cli_local_native_can_add_project_from_picker(monkeypatch, tmp_path, cap
     invoke_dir.mkdir()
     captured = {}
 
-    def fake_execvpe(command, argv, env):
-        captured["command"] = command
-        captured["argv"] = argv
-        captured["env"] = env
-        raise SystemExit(0)
-
-    inputs = iter(["My New Project"])
+    inputs = iter(["My New Project", ""])
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
     monkeypatch.setenv("ASH_INVOKE_DIR", str(invoke_dir))
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    monkeypatch.setattr("os.execvpe", fake_execvpe)
+    _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex"])
 
-    try:
-        main()
-    except SystemExit as exc:
-        assert exc.code == 0
+    exit_code = main()
 
     output = capsys.readouterr().out
+    assert exit_code == 0
     assert "No workspaces with an enterable path were found." in output
     assert "Added project `my-new-project`" in output
+    assert "Press Enter to enter native codex CLI..." in output
     assert captured["env"]["ASH_ACTIVE_WORKSPACE"] == "my-new-project"
     assert captured["env"]["ASH_PROJECT_PATH"] == str(invoke_dir)
 
@@ -188,25 +253,27 @@ def test_cli_local_native_launches_provider_in_workspace(monkeypatch, tmp_path) 
 
     captured = {}
 
-    def fake_execvpe(command, argv, env):
-        captured["command"] = command
-        captured["argv"] = argv
-        captured["env"] = env
-        raise SystemExit(0)
-
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
-    monkeypatch.setattr("os.execvpe", fake_execvpe)
+    _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
 
-    try:
-        main()
-    except SystemExit as exc:
-        assert exc.code == 0
+    exit_code = main()
 
+    assert exit_code == 0
     assert captured["command"].endswith("codex")
     assert captured["env"]["ASH_ACTIVE_WORKSPACE"] == "project-alpha"
     assert captured["env"]["CCB_WORK_DIR"] == str(workspace_path)
     assert captured["env"]["CCB_RUN_DIR"] == str(workspace_path)
+    assert captured["env"]["PWD"] == str(workspace_path)
+    assert captured["env"]["ASH_PROJECT_PROVIDER"] == "codex"
+    assert captured["env"]["ASH_PROJECT_SESSION_MODE"] == "fresh-project-context"
+    assert "project=project-alpha" in captured["env"]["ASH_PROJECT_IDENTITY_TEXT"]
+    assert captured["env"]["ASH_PROJECT_WHERE_COMMAND"] == "ash-where"
+    assert any(part.endswith("/scripts") for part in captured["env"]["PATH"].split(":"))
+    assert "Project summary for this session:" in captured["argv"][-1]
+    assert f"- Project: project-alpha" in captured["argv"][-1]
+    assert f"- Path: {workspace_path}" in captured["argv"][-1]
+    assert "Use this as the project summary context for the session." in captured["argv"][-1]
 
 
 def test_cli_local_native_resumes_shared_project_session(monkeypatch, tmp_path) -> None:
@@ -275,31 +342,28 @@ def test_cli_local_native_resumes_shared_project_session(monkeypatch, tmp_path) 
 
     captured = {}
 
-    def fake_execvpe(command, argv, env):
-        captured["command"] = command
-        captured["argv"] = argv
-        captured["env"] = env
-        raise SystemExit(0)
-
     _write_codex_session(fake_home, "codex-session-123", str(workspace_path))
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
     monkeypatch.setenv("HOME", str(fake_home))
-    monkeypatch.setattr("os.execvpe", fake_execvpe)
+    _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
 
-    try:
-        main()
-    except SystemExit as exc:
-        assert exc.code == 0
+    exit_code = main()
 
-    assert captured["argv"][1:] == ["resume", "codex-session-123"]
+    assert exit_code == 0
+    assert captured["argv"][1:-1] == ["--no-alt-screen", "-C", str(workspace_path), "resume", "codex-session-123"]
     assert captured["env"]["ASH_PROVIDER_SESSION_ID"] == "codex-session-123"
     assert captured["env"]["ASH_CODEX_SESSION_ID"] == "codex-session-123"
     assert captured["env"]["ASH_PROJECT_PATH"] == str(workspace_path)
+    assert captured["env"]["PWD"] == str(workspace_path)
     assert captured["env"]["ASH_PROJECT_MEMORY_PROJECT_ID"] == "project-alpha"
     assert captured["env"]["ASH_PROJECT_MEMORY_PROFILE"] == "Project alpha profile"
     assert captured["env"]["ASH_PROJECT_MEMORY_FOCUS"] == "Keep resume stable"
+    assert captured["env"]["ASH_PROJECT_SESSION_MODE"] == "resume-project-context"
+    assert captured["env"]["ASH_PROJECT_SESSION_ID"] == "codex-session-123"
+    assert "Project summary for this session:" in captured["argv"][-1]
+    assert "- Focus: Keep resume stable" in captured["argv"][-1]
 
 
 def test_cli_local_native_skips_codex_resume_when_session_file_is_missing(monkeypatch, tmp_path, capsys) -> None:
@@ -358,26 +422,19 @@ def test_cli_local_native_skips_codex_resume_when_session_file_is_missing(monkey
 
     captured = {}
 
-    def fake_execvpe(command, argv, env):
-        captured["command"] = command
-        captured["argv"] = argv
-        captured["env"] = env
-        raise SystemExit(0)
-
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
     monkeypatch.setenv("HOME", str(fake_home))
-    monkeypatch.setattr("os.execvpe", fake_execvpe)
+    _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+    exit_code = main()
 
-    try:
-        main()
-    except SystemExit as exc:
-        assert exc.code == 0
-
+    assert exit_code == 0
     output = capsys.readouterr().out
-    assert captured["argv"] == [captured["command"]]
-    assert "memory_summary=" in output
+    assert captured["argv"][:4] == [captured["command"], "--no-alt-screen", "-C", str(workspace_path)]
+    assert "[agent-swarm-hub] project=project-alpha" in output
+    assert "[agent-swarm-hub] focus=Skip stale resume ids" in output
+    assert "[agent-swarm-hub] current_codex_session=none" in output
     assert "Project selected: project-alpha" not in output
     assert "ASH_PROVIDER_SESSION_ID" not in captured["env"]
 
@@ -444,26 +501,19 @@ def test_cli_local_native_skips_codex_resume_when_session_workspace_mismatches(m
 
     captured = {}
 
-    def fake_execvpe(command, argv, env):
-        captured["command"] = command
-        captured["argv"] = argv
-        captured["env"] = env
-        raise SystemExit(0)
-
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
     monkeypatch.setenv("HOME", str(fake_home))
-    monkeypatch.setattr("os.execvpe", fake_execvpe)
+    _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+    exit_code = main()
 
-    try:
-        main()
-    except SystemExit as exc:
-        assert exc.code == 0
-
+    assert exit_code == 0
     output = capsys.readouterr().out
-    assert captured["argv"] == [captured["command"]]
-    assert "memory_summary=" in output
+    assert captured["argv"][:4] == [captured["command"], "--no-alt-screen", "-C", str(workspace_path)]
+    assert "[agent-swarm-hub] project=project-alpha" in output
+    assert "[agent-swarm-hub] focus=Avoid wrong resumes" in output
+    assert "[agent-swarm-hub] current_codex_session=none" in output
     assert "Project selected: project-alpha" not in output
     assert "ASH_PROVIDER_SESSION_ID" not in captured["env"]
 
@@ -523,27 +573,20 @@ def test_cli_local_native_resolves_shared_workspace_without_local_row(monkeypatc
 
     captured = {}
 
-    def fake_execvpe(command, argv, env):
-        captured["command"] = command
-        captured["argv"] = argv
-        captured["env"] = env
-        raise SystemExit(0)
-
     _write_codex_session(fake_home, "codex-session-123", str(workspace_path))
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
     monkeypatch.setenv("HOME", str(fake_home))
-    monkeypatch.setattr("os.execvpe", fake_execvpe)
+    _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "claude", "--project", "project-alpha"])
+    exit_code = main()
 
-    try:
-        main()
-    except SystemExit as exc:
-        assert exc.code == 0
-
+    assert exit_code == 0
     assert captured["argv"][1:] == ["--resume", "claude-session-abc"]
     assert captured["env"]["ASH_ACTIVE_WORKSPACE"] == "project-alpha"
     assert captured["env"]["CCB_WORK_DIR"] == str(workspace_path)
+    assert captured["cwd"] == str(workspace_path)
+    assert captured["env"]["PWD"] == str(workspace_path)
     assert captured["env"]["ASH_CLAUDE_SESSION_ID"] == "claude-session-abc"
     assert captured["env"]["ASH_PROJECT_PATH"] == str(workspace_path)
     assert captured["env"]["ASH_PROJECT_MEMORY_PROJECT_ID"] == "project-alpha"
@@ -626,27 +669,102 @@ def test_cli_local_native_prefers_provider_binding_over_latest_session(monkeypat
 
     captured = {}
 
-    def fake_execvpe(command, argv, env):
-        captured["command"] = command
-        captured["argv"] = argv
-        captured["env"] = env
-        raise SystemExit(0)
-
     _write_codex_session(fake_home, "codex-session-latest", str(workspace_path))
     _write_codex_session(fake_home, "codex-session-bound", str(workspace_path))
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
     monkeypatch.setenv("HOME", str(fake_home))
-    monkeypatch.setattr("os.execvpe", fake_execvpe)
+    _patch_native_run(monkeypatch, captured)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+    exit_code = main()
+
+    assert exit_code == 0
+    assert captured["argv"][1:-1] == ["--no-alt-screen", "-C", str(workspace_path), "resume", "codex-session-bound"]
+    assert captured["env"]["ASH_PROVIDER_SESSION_ID"] == "codex-session-bound"
+
+
+def test_cli_local_native_resumes_bound_codex_session_after_project_path_migration(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    workspace_path = tmp_path / "project"
+    workspace_path.mkdir()
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    fake_home = tmp_path / "home"
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "project-alpha",
+                "project-alpha",
+                str(workspace_path),
+                "Project alpha profile",
+                "Project: project-alpha\nCurrent focus: Keep the same project thread after path migration",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, notes, source_path, cwd, last_used_at)
+            VALUES (?, ?, ?, 'active', '', '', ?, '2026-03-17T10:00:00+00:00')
+            """,
+            ("codex", "codex-session-bound", "project-alpha", "/Users/sunxiangrong/Desktop/CLI/Codex"),
+        )
+        conn.execute(
+            """
+            INSERT INTO provider_bindings (project_id, provider, raw_session_id)
+            VALUES (?, ?, ?)
+            """,
+            ("project-alpha", "codex", "codex-session-bound"),
+        )
+
+    captured = {}
+
+    _write_codex_session(fake_home, "codex-session-bound", "/Users/sunxiangrong/Desktop/CLI/Codex")
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setenv("HOME", str(fake_home))
+    _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
 
-    try:
-        main()
-    except SystemExit as exc:
-        assert exc.code == 0
+    exit_code = main()
 
-    assert captured["argv"][1:] == ["resume", "codex-session-bound"]
+    assert exit_code == 0
+    assert captured["argv"][1:-1] == ["--no-alt-screen", "-C", str(workspace_path), "resume", "codex-session-bound"]
     assert captured["env"]["ASH_PROVIDER_SESSION_ID"] == "codex-session-bound"
+    assert "Project summary for this session:" in captured["argv"][-1]
 
 
 def test_cli_local_native_exports_both_project_provider_sessions(monkeypatch, tmp_path) -> None:
@@ -711,24 +829,15 @@ def test_cli_local_native_exports_both_project_provider_sessions(monkeypatch, tm
 
     captured = {}
 
-    def fake_execvpe(command, argv, env):
-        captured["command"] = command
-        captured["argv"] = argv
-        captured["env"] = env
-        raise SystemExit(0)
-
     _write_codex_session(fake_home, "codex-session-123", str(workspace_path))
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
     monkeypatch.setenv("HOME", str(fake_home))
-    monkeypatch.setattr("os.execvpe", fake_execvpe)
+    _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "claude", "--project", "project-alpha"])
+    exit_code = main()
 
-    try:
-        main()
-    except SystemExit as exc:
-        assert exc.code == 0
-
+    assert exit_code == 0
     assert captured["argv"][1:] == ["--resume", "claude-session-abc"]
     assert captured["env"]["ASH_PROVIDER_SESSION_ID"] == "claude-session-abc"
     assert captured["env"]["ASH_CLAUDE_SESSION_ID"] == "claude-session-abc"
@@ -817,25 +926,20 @@ def test_cli_local_native_picker_hides_projects_without_path(monkeypatch, tmp_pa
 
     captured = {}
 
-    def fake_execvpe(command, argv, env):
-        captured["env"] = env
-        raise SystemExit(0)
-
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
-    monkeypatch.setattr("builtins.input", lambda _prompt="": "1")
+    inputs = iter(["1", ""])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    monkeypatch.setattr("os.execvpe", fake_execvpe)
+    _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex"])
+    exit_code = main()
 
-    try:
-        main()
-    except SystemExit as exc:
-        assert exc.code == 0
-
+    assert exit_code == 0
     output = capsys.readouterr().out
     assert "1. good-project" in output
     assert "bad-project" not in output
+    assert "Press Enter to enter native codex CLI..." in output
     assert captured["env"]["ASH_ACTIVE_WORKSPACE"] == "good-project"
 
 
@@ -876,26 +980,264 @@ def test_cli_local_native_picker_hides_projects_with_missing_directory(monkeypat
 
     captured = {}
 
-    def fake_execvpe(command, argv, env):
-        captured["env"] = env
-        raise SystemExit(0)
-
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
-    monkeypatch.setattr("builtins.input", lambda _prompt="": "1")
+    inputs = iter(["1", ""])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    monkeypatch.setattr("os.execvpe", fake_execvpe)
+    _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex"])
+    exit_code = main()
 
-    try:
-        main()
-    except SystemExit as exc:
-        assert exc.code == 0
-
+    assert exit_code == 0
     output = capsys.readouterr().out
     assert "1. good-project" in output
     assert "missing-project" not in output
+    assert "Press Enter to enter native codex CLI..." in output
     assert captured["env"]["ASH_ACTIVE_WORKSPACE"] == "good-project"
+
+
+def test_cli_local_native_fresh_codex_run_rebinds_project_session_and_memory(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    workspace_path = tmp_path / "project"
+    workspace_path.mkdir()
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    fake_home = tmp_path / "home"
+
+    from agent_swarm_hub.session_store import SessionStore
+
+    store = SessionStore(db_path)
+    store.upsert_workspace(
+        workspace_id="project-alpha",
+        title="project-alpha",
+        path=str(workspace_path),
+        backend="codex",
+        transport="direct",
+    )
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "project-alpha",
+                "project-alpha",
+                str(workspace_path),
+                "Project alpha profile",
+                "Project: project-alpha\nCurrent focus: Keep project continuity\nRecent context: Fresh native runs should bind back automatically",
+            ),
+        )
+
+    captured = {}
+
+    def after_run(_argv, _env, _cwd) -> None:
+        _write_codex_session(fake_home, "codex-session-new", str(workspace_path))
+        _write_codex_history(fake_home, "codex-session-new", "Need stable project chat", "Remember the current focus")
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setenv("HOME", str(fake_home))
+    _patch_native_run(monkeypatch, captured, after_run=after_run)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert captured["argv"][:4] == [captured["command"], "--no-alt-screen", "-C", str(workspace_path)]
+    with sqlite3.connect(shared_db_path) as conn:
+        binding = conn.execute(
+            "SELECT raw_session_id FROM provider_bindings WHERE project_id = ? AND provider = ?",
+            ("project-alpha", "codex"),
+        ).fetchone()
+        memory = conn.execute(
+            "SELECT focus, recent_context, memory FROM project_memory WHERE project_id = ?",
+            ("project-alpha",),
+        ).fetchone()
+        session = conn.execute(
+            "SELECT raw_session_id, cwd FROM provider_sessions WHERE project_id = ? AND provider = ?",
+            ("project-alpha", "codex"),
+        ).fetchone()
+        project_session = conn.execute(
+            "SELECT session_id, status, title, cwd FROM project_sessions WHERE project_id = ? AND provider = ?",
+            ("project-alpha", "codex"),
+        ).fetchone()
+
+    assert binding == ("codex-session-new",)
+    assert session == ("codex-session-new", str(workspace_path))
+    assert project_session == ("codex-session-new", "active", "Remember the current focus", str(workspace_path))
+    assert memory == (
+        "Remember the current focus",
+        "user: Remember the current focus",
+        "user: Need stable project chat | user: Remember the current focus",
+    )
+
+
+def test_cli_local_native_meta_memory_questions_do_not_override_project_memory(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    workspace_path = tmp_path / "project"
+    workspace_path.mkdir()
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    fake_home = tmp_path / "home"
+
+    from agent_swarm_hub.session_store import SessionStore
+
+    store = SessionStore(db_path)
+    store.upsert_workspace(
+        workspace_id="project-alpha",
+        title="project-alpha",
+        path=str(workspace_path),
+        backend="codex",
+        transport="direct",
+    )
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "project-alpha",
+                "project-alpha",
+                str(workspace_path),
+                "Project alpha profile",
+                "Project: project-alpha\nCurrent focus: Keep the real task focus\nRecent context: Continue the project instead of memory meta discussion",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_memory (project_id, focus, recent_context, memory, recent_hints_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "project-alpha",
+                "Keep the real task focus",
+                "Continue the project instead of memory meta discussion",
+                "Existing compact project memory",
+                json.dumps(["user: Real project task"], ensure_ascii=False),
+            ),
+        )
+
+    captured = {}
+
+    def after_run(_argv, _env, _cwd) -> None:
+        _write_codex_session(fake_home, "codex-session-new", str(workspace_path))
+        _write_codex_history(fake_home, "codex-session-new", "当前是新对话吗 有之前的记忆吗")
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setenv("HOME", str(fake_home))
+    _patch_native_run(monkeypatch, captured, after_run=after_run)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    with sqlite3.connect(shared_db_path) as conn:
+        memory = conn.execute(
+            "SELECT focus, recent_context, memory, recent_hints_json FROM project_memory WHERE project_id = ?",
+            ("project-alpha",),
+        ).fetchone()
+
+    assert memory == (
+        "Keep the real task focus",
+        "Continue the project instead of memory meta discussion",
+        "Existing compact project memory",
+        '["user: Real project task"]',
+    )
 
 
 def test_cli_local_native_rejects_workspace_without_path(monkeypatch, tmp_path, capsys) -> None:
@@ -920,3 +1262,128 @@ def test_cli_local_native_rejects_workspace_without_path(monkeypatch, tmp_path, 
 
     assert exit_code == 2
     assert "has no enterable path" in err
+
+
+def test_cli_project_sessions_current_and_list(monkeypatch, tmp_path, capsys) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute("INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)", ("post-gwas", "post-gwas", "/tmp/post-gwas"))
+        conn.execute("INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)", ("post-gwas", "codex", "codex-current"))
+        conn.execute(
+            "INSERT INTO project_sessions (project_id, provider, session_id, status, title, summary, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("post-gwas", "codex", "codex-current", "active", "Current task", "Current task summary", "2026-03-18T10:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO project_sessions (project_id, provider, session_id, status, title, summary, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("post-gwas", "codex", "codex-old", "archived", "Old task", "Old task summary", "2026-03-17T10:00:00Z"),
+        )
+
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "current", "post-gwas"])
+    exit_code = main()
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "codex: codex-current" in output
+
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "list", "post-gwas"])
+    exit_code = main()
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "codex | current | codex-current" in output
+    assert "codex | archived | codex-old" in output
+
+
+def test_cli_project_sessions_use_switches_binding(monkeypatch, tmp_path, capsys) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute("INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)", ("post-gwas", "post-gwas", "/tmp/post-gwas"))
+        conn.execute("INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)", ("post-gwas", "codex", "codex-old"))
+        conn.execute(
+            "INSERT INTO project_sessions (project_id, provider, session_id, status, title, last_used_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("post-gwas", "codex", "codex-old", "archived", "Old task", "2026-03-17T10:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO project_sessions (project_id, provider, session_id, status, title, last_used_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("post-gwas", "codex", "codex-new", "active", "New task", "2026-03-18T10:00:00Z"),
+        )
+
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "use", "post-gwas", "codex", "codex-new"])
+    exit_code = main()
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Current codex session for `post-gwas` set to codex-new." in output
+
+    with sqlite3.connect(shared_db_path) as conn:
+        binding = conn.execute(
+            "SELECT raw_session_id FROM provider_bindings WHERE project_id = ? AND provider = ?",
+            ("post-gwas", "codex"),
+        ).fetchone()
+
+    assert binding == ("codex-new",)

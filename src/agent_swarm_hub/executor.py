@@ -7,6 +7,8 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from .paths import ccb_lib_dir
 import json
 
 
@@ -131,7 +133,7 @@ class FallbackExecutor(Executor):
 def send_bridge_confirmation(*, mode: str, work_dir: str | None) -> bool:
     if not work_dir:
         return False
-    lib_dir = Path(os.getenv("ASH_CCB_LIB_DIR", "/Users/sunxiangrong/Desktop/CLI/Codex/claude_code_bridge/lib"))
+    lib_dir = ccb_lib_dir()
     if not lib_dir.exists():
         return False
 

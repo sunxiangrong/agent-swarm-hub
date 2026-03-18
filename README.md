@@ -196,35 +196,35 @@ project worker
 Telegram:
 
 ```bash
-cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 ./scripts/start-telegram.sh
 ```
 
 飞书:
 
 ```bash
-cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 ./scripts/start-lark.sh
 ```
 
 一起启动:
 
 ```bash
-cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 ./scripts/start-local.sh
 ```
 
 本地原生 CLI 入口:
 
 ```bash
-cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 ./scripts/start-chat.sh
 ```
 
 本地 swarm shell 入口:
 
 ```bash
-cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 ./scripts/start-swarm.sh
 ```
 
@@ -267,6 +267,16 @@ ash-swarm claude
 - 启动前会从共享项目库里选择项目
 - 选定项目后，会优先恢复这个项目最近一次对应 provider 的原生会话
 - 找不到可恢复会话时，才进入新的原生会话
+- 原生 CLI 环境会注入：
+  - `ASH_ACTIVE_WORKSPACE`
+  - `ASH_PROJECT_PATH`
+  - `ASH_PROJECT_PROVIDER`
+  - `ASH_PROJECT_SESSION_MODE`
+  - `ASH_PROJECT_IDENTITY_TEXT`
+- 原生 CLI 里可以直接运行：
+  - `ash-where`
+  - `ash-where --json`
+  查询当前项目、路径、provider 和 session 状态
 - `start-swarm.sh` / `ash-swarm` 进入统一 swarm shell
 - `local-chat` 仍然保留，用于统一命令层
 
@@ -303,16 +313,16 @@ ASH_PROXY_URL=http://127.0.0.1:6789
 这套系统现在有两套数据库：
 
 - 共享项目库  
-  [`/Users/sunxiangrong/Desktop/CLI/local-skills/project-session-manager/data/sessions.sqlite3`](/Users/sunxiangrong/Desktop/CLI/local-skills/project-session-manager/data/sessions.sqlite3)  
+  [`/Users/sunxiangrong/dev/cli/local-skills/project-session-manager/data/sessions.sqlite3`](/Users/sunxiangrong/dev/cli/local-skills/project-session-manager/data/sessions.sqlite3)  
   负责项目总账、项目画像、项目摘要、Claude/Codex 历史归类。
 
 - 本地运行时库  
-  [`/Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub/.agent-swarm-hub.sqlite3`](/Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub/.agent-swarm-hub.sqlite3)  
+  [`/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/.agent-swarm-hub.sqlite3`](/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/.agent-swarm-hub.sqlite3)  
   负责 chat 绑定、task、phase、handoff、ephemeral、agent message 流。
 
 ## 文档
 
-- [操作手册](/Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub/docs/操作手册.md)
-- [实现手册](/Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub/docs/实现手册.md)
-- [开发日志](/Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub/docs/开发日志.md)
-- [架构说明](/Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub/docs/swarm-architecture.md)
+- [操作手册](/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/docs/操作手册.md)
+- [实现手册](/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/docs/实现手册.md)
+- [开发日志](/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/docs/开发日志.md)
+- [架构说明](/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/docs/swarm-architecture.md)

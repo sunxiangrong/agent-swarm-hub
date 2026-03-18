@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .paths import project_session_db_path
 
-DEFAULT_PROJECT_SESSION_DB = "/Users/sunxiangrong/Desktop/CLI/local-skills/project-session-manager/data/sessions.sqlite3"
+
 _PROMPT_PROFILE_LIMIT = 160
 _PROMPT_FIELD_LIMIT = 180
 _PROMPT_MESSAGE_LIMIT = 120
@@ -31,7 +32,7 @@ class ProjectContext:
 
 class ProjectContextStore:
     def __init__(self, db_path: str | None = None):
-        self.db_path = Path(db_path or os.getenv("ASH_PROJECT_SESSION_DB", "").strip() or DEFAULT_PROJECT_SESSION_DB)
+        self.db_path = Path(db_path).expanduser() if db_path else project_session_db_path()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -82,6 +83,23 @@ class ProjectContextStore:
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (project_id, provider)
                 );
+
+                CREATE TABLE IF NOT EXISTS project_sessions (
+                    project_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    title TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL DEFAULT '',
+                    source_path TEXT NOT NULL DEFAULT '',
+                    first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (provider, session_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_project_sessions_project
+                ON project_sessions(project_id, provider, status, last_used_at DESC);
                 """
             )
 
@@ -305,6 +323,106 @@ class ProjectContextStore:
                 """,
                 (project_id, focus.strip(), recent_context.strip(), memory.strip(), json.dumps(hints, ensure_ascii=False)),
             )
+
+    def upsert_project_session(
+        self,
+        project_id: str,
+        provider: str,
+        session_id: str,
+        *,
+        status: str = "active",
+        title: str = "",
+        summary: str = "",
+        cwd: str = "",
+        source_path: str = "",
+        last_used_at: str = "",
+    ) -> None:
+        if not project_id or not provider or not session_id:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO project_sessions (
+                    project_id, provider, session_id, status, title, summary, cwd, source_path, first_seen_at, last_used_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, COALESCE(NULLIF(?, ''), CURRENT_TIMESTAMP))
+                ON CONFLICT(provider, session_id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    status = excluded.status,
+                    title = CASE WHEN excluded.title != '' THEN excluded.title ELSE project_sessions.title END,
+                    summary = CASE WHEN excluded.summary != '' THEN excluded.summary ELSE project_sessions.summary END,
+                    cwd = CASE WHEN excluded.cwd != '' THEN excluded.cwd ELSE project_sessions.cwd END,
+                    source_path = CASE WHEN excluded.source_path != '' THEN excluded.source_path ELSE project_sessions.source_path END,
+                    last_used_at = COALESCE(NULLIF(excluded.last_used_at, ''), CURRENT_TIMESTAMP)
+                """,
+                (
+                    project_id,
+                    provider,
+                    session_id,
+                    status,
+                    title.strip(),
+                    summary.strip(),
+                    cwd.strip(),
+                    source_path.strip(),
+                    last_used_at.strip(),
+                ),
+            )
+
+    def list_project_sessions(
+        self,
+        project_id: str,
+        provider: str | None = None,
+        include_archived: bool = True,
+    ) -> list[dict[str, Any]]:
+        if not project_id or not self.db_path.exists():
+            return []
+        query = """
+            SELECT project_id, provider, session_id, status, title, summary, cwd, source_path, first_seen_at, last_used_at
+            FROM project_sessions
+            WHERE project_id = ?
+        """
+        params: list[str] = [project_id]
+        if provider:
+            query += " AND provider = ?"
+            params.append(provider)
+        if not include_archived:
+            query += " AND status = 'active'"
+        query += " ORDER BY provider ASC, last_used_at DESC, session_id DESC"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_project_session_status(self, provider: str, session_id: str, status: str) -> None:
+        if not provider or not session_id or not status:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE project_sessions
+                SET status = ?, last_used_at = CURRENT_TIMESTAMP
+                WHERE provider = ? AND session_id = ?
+                """,
+                (status, provider, session_id),
+            )
+
+    def get_current_project_sessions(self, project_id: str) -> dict[str, str]:
+        if not project_id or not self.db_path.exists():
+            return {}
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT provider, raw_session_id
+                FROM provider_bindings
+                WHERE project_id = ?
+                ORDER BY provider ASC
+                """,
+                (project_id,),
+            ).fetchall()
+        return {
+            str(row["provider"]).strip(): str(row["raw_session_id"]).strip()
+            for row in rows
+            if (row["provider"] or "").strip() and (row["raw_session_id"] or "").strip()
+        }
 
     @staticmethod
     def _compact(text: str | None, limit: int) -> str:

@@ -1,10 +1,24 @@
 import json
 
-from agent_swarm_hub import EchoExecutor, LarkConfig, LarkRunner, TelegramConfig, TelegramRunner
+from agent_swarm_hub import CCConnectAdapter, EchoExecutor, LarkConfig, LarkRunner, RemoteMessage, RemotePlatform, SessionStore, TelegramConfig, TelegramRunner
 
 
-def test_telegram_runner_dispatches_write_flow() -> None:
-    runner = TelegramRunner(TelegramConfig(enabled=True, bot_token="token"), adapter=None)
+def _bind_workspace(adapter: CCConnectAdapter, *, platform: RemotePlatform) -> None:
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=platform,
+            chat_id="123" if platform is RemotePlatform.TELEGRAM else "oc_1",
+            user_id="456" if platform is RemotePlatform.TELEGRAM else "ou_1",
+            text="/use project-alpha",
+        )
+    )
+    assert "project-alpha" in response.text
+
+
+def test_telegram_runner_dispatches_write_flow(tmp_path) -> None:
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
+    _bind_workspace(adapter, platform=RemotePlatform.TELEGRAM)
+    runner = TelegramRunner(TelegramConfig(enabled=True, bot_token="token"), adapter=adapter)
     runner.adapter.executor = EchoExecutor()
 
     result = runner.handle_update(
@@ -24,8 +38,10 @@ def test_telegram_runner_dispatches_write_flow() -> None:
     assert "Backend: echo" in result.outbound.text
 
 
-def test_lark_runner_dispatches_status_flow() -> None:
-    runner = LarkRunner(LarkConfig(enabled=True, app_id="app", app_secret="secret"), adapter=None)
+def test_lark_runner_dispatches_status_flow(tmp_path) -> None:
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
+    _bind_workspace(adapter, platform=RemotePlatform.LARK)
+    runner = LarkRunner(LarkConfig(enabled=True, app_id="app", app_secret="secret"), adapter=adapter)
     runner.adapter.executor = EchoExecutor()
 
     runner.handle_event(
@@ -55,4 +71,6 @@ def test_lark_runner_dispatches_status_flow() -> None:
 
     assert result.platform == "lark"
     assert result.task_id is not None
-    assert json.loads(result.outbound.content)["text"].startswith("Task ID:")
+    text = json.loads(result.outbound.content)["text"]
+    assert "Workspace: project-alpha" in text
+    assert "Stage: pending" in text

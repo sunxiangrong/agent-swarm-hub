@@ -44,14 +44,14 @@ Simplest startup:
 Print config:
 
 ```bash
-cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 PYTHONPATH=src conda run -n cli python -m agent_swarm_hub.cli telegram-poll --print-config
 ```
 
 Run one polling cycle:
 
 ```bash
-cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 PYTHONPATH=src conda run -n cli python -m agent_swarm_hub.cli telegram-poll --once
 ```
 
@@ -72,7 +72,7 @@ Simplest startup:
 Print config:
 
 ```bash
-cd /Users/sunxiangrong/Desktop/CLI/git/agent-swarm-hub
+cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 PYTHONPATH=src conda run -n cli python -m agent_swarm_hub.cli lark-ws --print-config
 ```
 
