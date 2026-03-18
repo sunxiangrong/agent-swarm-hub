@@ -81,7 +81,7 @@ class TaskRecord:
 
 class SessionStore:
     def __init__(self, db_path: str | os.PathLike[str] | None = None):
-        raw_path = db_path or os.getenv("ASH_SESSION_DB", "").strip() or "var/agent-swarm-hub.sqlite3"
+        raw_path = db_path or os.getenv("ASH_SESSION_DB", "").strip() or "var/db/agent-swarm-hub.sqlite3"
         self.db_path = Path(raw_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()

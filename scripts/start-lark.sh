@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+mkdir -p var/db var/log var/panes
+
+export ASH_SESSION_DB="${ASH_SESSION_DB:-var/db/agent-swarm-hub.sqlite3}"
 
 if [[ -f ".env.local" ]]; then
   set -a

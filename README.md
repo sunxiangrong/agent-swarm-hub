@@ -228,7 +228,7 @@ Telegram / Lark
 
 ### 本地运行时库
 
-`/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/var/agent-swarm-hub.sqlite3`
+`/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/var/db/agent-swarm-hub.sqlite3`
 
 负责：
 
@@ -275,6 +275,7 @@ ASH_PROXY_URL=http://127.0.0.1:6789
 
 ## 文档
 
+- [文档索引](/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/docs/README.md)
 - [操作手册](/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/docs/操作手册.md)
 - [实现手册](/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/docs/实现手册.md)
 - [开发日志](/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/docs/开发日志.md)
