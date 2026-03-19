@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -85,6 +86,83 @@ def test_ash_where_script_reports_project_identity(monkeypatch, tmp_path):
     assert payload["session_mode"] == "resume-project-context"
     assert payload["session_id"] == "codex-session-123"
     assert payload["focus"] == "Keep resume stable"
+
+
+def _write_capture_executable(path: Path, body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def test_start_chat_script_routes_to_local_native(tmp_path) -> None:
+    script = Path("/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/scripts/start-chat.sh")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    capture = tmp_path / "capture.json"
+    python_bin = fake_bin / "python"
+    _write_capture_executable(
+        python_bin,
+        f"""#!/usr/bin/env python3
+import json, os, sys
+with open({str(capture)!r}, "w", encoding="utf-8") as handle:
+    json.dump({{"argv": sys.argv[1:], "cwd": os.getcwd(), "pythonpath": os.getenv("PYTHONPATH"), "session_db": os.getenv("ASH_SESSION_DB")}}, handle)
+""",
+    )
+
+    env = {
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "CONDA_DEFAULT_ENV": "cli",
+        "HOME": str(tmp_path / "home"),
+    }
+    result = subprocess.run(["/bin/bash", str(script), "codex", "agent-browser"], check=True, text=True, capture_output=True, env=env)
+    payload = json.loads(capture.read_text(encoding="utf-8"))
+
+    assert result.returncode == 0
+    assert payload["argv"] == ["-m", "agent_swarm_hub.cli", "local-native", "--provider", "codex", "--project", "agent-browser"]
+    assert payload["cwd"] == "/Users/sunxiangrong/dev/cli/git/agent-swarm-hub"
+    assert payload["pythonpath"] == "src"
+    assert payload["session_db"] == "var/db/agent-swarm-hub.sqlite3"
+
+
+def test_start_swarm_script_routes_to_local_chat(tmp_path) -> None:
+    script = Path("/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/scripts/start-swarm.sh")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    capture = tmp_path / "capture.json"
+    conda_bin = fake_bin / "conda"
+    _write_capture_executable(
+        conda_bin,
+        f"""#!/usr/bin/env python3
+import json, os, sys
+with open({str(capture)!r}, "w", encoding="utf-8") as handle:
+    json.dump({{"argv": sys.argv[1:], "cwd": os.getcwd(), "pythonpath": os.getenv("PYTHONPATH"), "session_db": os.getenv("ASH_SESSION_DB")}}, handle)
+""",
+    )
+
+    env = {
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "HOME": str(tmp_path / "home"),
+    }
+    result = subprocess.run(["/bin/bash", str(script), "claude", "agent-swarm-hub"], check=True, text=True, capture_output=True, env=env)
+    payload = json.loads(capture.read_text(encoding="utf-8"))
+
+    assert result.returncode == 0
+    assert payload["argv"] == [
+        "run",
+        "--live-stream",
+        "-n",
+        "cli",
+        "python",
+        "-m",
+        "agent_swarm_hub.cli",
+        "local-chat",
+        "--provider",
+        "claude",
+        "--project",
+        "agent-swarm-hub",
+    ]
+    assert payload["cwd"] == "/Users/sunxiangrong/dev/cli/git/agent-swarm-hub"
+    assert payload["pythonpath"] == "src"
+    assert payload["session_db"] == "var/db/agent-swarm-hub.sqlite3"
 
 
 def test_cli_prints_lark_ws_config(monkeypatch, capsys) -> None:
@@ -1129,15 +1207,155 @@ def test_cli_local_native_fresh_codex_run_rebinds_project_session_and_memory(mon
             "SELECT session_id, status, title, cwd FROM project_sessions WHERE project_id = ? AND provider = ?",
             ("project-alpha", "codex"),
         ).fetchone()
+        summary = conn.execute(
+            "SELECT summary FROM projects WHERE project_id = ?",
+            ("project-alpha",),
+        ).fetchone()[0]
 
     assert binding == ("codex-session-new",)
     assert session == ("codex-session-new", str(workspace_path))
     assert project_session == ("codex-session-new", "active", "Remember the current focus", str(workspace_path))
     assert memory == (
-        "Remember the current focus",
+        "Need stable project chat",
         "user: Remember the current focus",
-        "Task: Remember the current focus | State: user: Remember the current focus",
+        "Task: Need stable project chat | State: user: Remember the current focus",
     )
+    assert "Current sessions: codex=codex-session-new" in summary
+
+
+def test_cli_local_native_fresh_codex_run_archives_previous_project_session(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    workspace_path = tmp_path / "project"
+    workspace_path.mkdir()
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    fake_home = tmp_path / "home"
+
+    from agent_swarm_hub.session_store import SessionStore
+
+    store = SessionStore(db_path)
+    store.upsert_workspace(
+        workspace_id="project-alpha",
+        title="project-alpha",
+        path=str(workspace_path),
+        backend="codex",
+        transport="direct",
+    )
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "project-alpha",
+                "project-alpha",
+                str(workspace_path),
+                "Project alpha profile",
+                "Project: project-alpha\nCurrent focus: Keep project continuity\nRecent context: Fresh native runs should bind back automatically",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO provider_bindings (project_id, provider, raw_session_id)
+            VALUES (?, ?, ?)
+            """,
+            ("project-alpha", "codex", "codex-session-old"),
+        )
+        conn.execute(
+            """
+            INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, notes, source_path, cwd, last_used_at)
+            VALUES (?, ?, ?, 'active', '', '', ?, '2026-03-17T10:00:00+00:00')
+            """,
+            ("codex", "codex-session-old", "project-alpha", str(workspace_path)),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_sessions (project_id, provider, session_id, status, title, cwd, last_used_at)
+            VALUES (?, ?, ?, 'active', ?, ?, '2026-03-17T10:00:00+00:00')
+            """,
+            ("project-alpha", "codex", "codex-session-old", "Old task", str(workspace_path)),
+        )
+
+    captured = {}
+
+    def after_run(_argv, _env, _cwd) -> None:
+        _write_codex_session(fake_home, "codex-session-new", str(workspace_path))
+        _write_codex_history(fake_home, "codex-session-new", "Need stable project chat")
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setenv("HOME", str(fake_home))
+    _patch_native_run(monkeypatch, captured, after_run=after_run)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    with sqlite3.connect(shared_db_path) as conn:
+        project_sessions = conn.execute(
+            "SELECT session_id, status FROM project_sessions WHERE project_id = ? AND provider = ? ORDER BY session_id",
+            ("project-alpha", "codex"),
+        ).fetchall()
+        provider_sessions = conn.execute(
+            "SELECT raw_session_id, status FROM provider_sessions WHERE project_id = ? AND provider = ? ORDER BY raw_session_id",
+            ("project-alpha", "codex"),
+        ).fetchall()
+
+    assert project_sessions == [("codex-session-new", "active"), ("codex-session-old", "archived")]
+    assert provider_sessions == [("codex-session-new", "active"), ("codex-session-old", "archived")]
 
 
 def test_cli_local_native_meta_memory_questions_do_not_override_project_memory(monkeypatch, tmp_path) -> None:
@@ -1343,9 +1561,9 @@ def test_cli_local_native_extracts_memory_from_meaningful_messages(monkeypatch, 
             ("project-alpha",),
         ).fetchone()
 
-    assert memory[0] == "已经确认 open、wait、snapshot、click 是最小工作流，下一步补成模板"
+    assert memory[0] == "需要整理 agent-browser 的命令用法并写成一份可复用说明"
     assert memory[1] == "user: 已经确认 open、wait、snapshot、click 是最小工作流，下一步补成模板"
-    assert "Task: 已经确认 open、wait、snapshot、click 是最小工作流，下一步补成模板" in memory[2]
+    assert "Task: 需要整理 agent-browser 的命令用法并写成一份可复用说明" in memory[2]
     assert "State: user: 已经确认 open、wait、snapshot、click 是最小工作流，下一步补成模板" in memory[2]
     assert memory[3] == json.dumps(
         [
@@ -1354,6 +1572,197 @@ def test_cli_local_native_extracts_memory_from_meaningful_messages(monkeypatch, 
         ],
         ensure_ascii=False,
     )
+
+
+def test_cli_local_native_project_summary_prompt_avoids_repeating_last_hint(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    workspace_path = tmp_path / "project"
+    workspace_path.mkdir()
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    fake_home = tmp_path / "home"
+
+    from agent_swarm_hub.session_store import SessionStore
+
+    store = SessionStore(db_path)
+    store.upsert_workspace(
+        workspace_id="agent-browser",
+        title="agent-browser",
+        path=str(workspace_path),
+        backend="codex",
+        transport="direct",
+    )
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "agent-browser",
+                "agent-browser",
+                str(workspace_path),
+                "Browser automation exploration",
+                "Project: agent-browser\nCurrent focus: chrome会做的更好吗\nRecent context: chrome会做的更好吗",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_memory (project_id, focus, recent_context, memory, recent_hints_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "agent-browser",
+                "chrome会做的更好吗",
+                "chrome会做的更好吗",
+                "Compare whether Chrome-native tooling would produce a more reliable browser workflow.",
+                json.dumps(["user: chrome会做的更好吗"], ensure_ascii=False),
+            ),
+        )
+
+    captured = {}
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setenv("HOME", str(fake_home))
+    _patch_native_run(monkeypatch, captured)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "agent-browser"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert "- Current Focus: chrome会做的更好吗" in captured["argv"][-1]
+    assert "- Current State: chrome会做的更好吗" in captured["argv"][-1]
+    assert "- Next Step:" not in captured["argv"][-1]
+    assert "- Project Memory: Compare whether Chrome-native tooling would produce a more reliable browser workflow." in captured["argv"][-1]
+
+
+def test_project_context_sync_updates_structured_project_summary(tmp_path) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "agent-browser"
+    workspace_path.mkdir()
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "agent-browser",
+                "agent-browser",
+                str(workspace_path),
+                "Browser automation exploration",
+                "Project: agent-browser\nCurrent focus: stale\nRecent context: stale",
+            ),
+        )
+
+    from agent_swarm_hub.project_context import ProjectContextStore
+
+    store = ProjectContextStore(str(shared_db_path))
+    store.upsert_project_memory(
+        "agent-browser",
+        focus="chrome会做的更好吗",
+        recent_context="已经确认当前问题是项目级上下文摘要过度退化",
+        memory="Compare whether Chrome-native tooling would produce a more reliable browser workflow.",
+        recent_hints=["user: 整理项目级长期记忆"],
+    )
+    store.sync_project_summary("agent-browser")
+
+    with sqlite3.connect(shared_db_path) as conn:
+        summary = conn.execute(
+            "SELECT summary FROM projects WHERE project_id = ?",
+            ("agent-browser",),
+        ).fetchone()[0]
+
+    assert "Current focus: chrome会做的更好吗" in summary
+    assert "Recent context: 已经确认当前问题是项目级上下文摘要过度退化" in summary
+    assert "Next step: 整理项目级长期记忆" in summary
+    assert "Long-term memory: Compare whether Chrome-native tooling would produce a more reliable browser workflow." in summary
 
 
 def test_cli_local_native_rejects_workspace_without_path(monkeypatch, tmp_path, capsys) -> None:
@@ -1442,8 +1851,120 @@ def test_cli_project_sessions_current_and_list(monkeypatch, tmp_path, capsys) ->
     assert "codex | archived | codex-old" in output
 
 
+def test_cli_project_sessions_sync_memory(monkeypatch, tmp_path, capsys) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "agent-browser"
+    workspace_path.mkdir()
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path, profile, summary) VALUES (?, ?, ?, ?, ?)",
+            ("agent-browser", "agent-browser", str(workspace_path), "Browser automation exploration", "stale"),
+        )
+        conn.execute(
+            "INSERT INTO project_memory (project_id, focus, recent_context, memory, recent_hints_json) VALUES (?, ?, ?, ?, ?)",
+            (
+                "agent-browser",
+                "chrome会做的更好吗",
+                "已经确认当前问题是项目级上下文摘要过度退化",
+                "Compare whether Chrome-native tooling would produce a more reliable browser workflow.",
+                json.dumps(["user: 整理项目级长期记忆"], ensure_ascii=False),
+            ),
+        )
+
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "sync-memory", "agent-browser"])
+    exit_code = main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Synced project memory for `agent-browser`." in output
+    assert (workspace_path / "PROJECT_MEMORY.md").exists()
+    assert (workspace_path / "PROJECT_SKILL.md").exists()
+    with sqlite3.connect(shared_db_path) as conn:
+        summary = conn.execute("SELECT summary FROM projects WHERE project_id = ?", ("agent-browser",)).fetchone()[0]
+    assert "Current focus: chrome会做的更好吗" in summary
+
+
+def test_cli_project_sessions_sync_memory_all(monkeypatch, tmp_path, capsys) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_a = tmp_path / "alpha"
+    workspace_b = tmp_path / "beta"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.executemany(
+            "INSERT INTO projects (project_id, title, workspace_path, profile, summary) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("alpha", "alpha", str(workspace_a), "", "stale"),
+                ("beta", "beta", str(workspace_b), "", "stale"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO project_memory (project_id, focus, recent_context, memory, recent_hints_json) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("alpha", "Focus alpha", "State alpha", "Memory alpha", "[]"),
+                ("beta", "Focus beta", "State beta", "Memory beta", "[]"),
+            ],
+        )
+
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "sync-memory", "--all"])
+    exit_code = main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Synced project memory for `alpha`." in output
+    assert "Synced project memory for `beta`." in output
+    assert (workspace_a / "PROJECT_MEMORY.md").exists()
+    assert (workspace_b / "PROJECT_MEMORY.md").exists()
+
+
 def test_cli_project_sessions_use_switches_binding(monkeypatch, tmp_path, capsys) -> None:
     shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "post-gwas"
+    workspace_path.mkdir()
     with sqlite3.connect(shared_db_path) as conn:
         conn.executescript(
             """
@@ -1478,7 +1999,7 @@ def test_cli_project_sessions_use_switches_binding(monkeypatch, tmp_path, capsys
             );
             """
         )
-        conn.execute("INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)", ("post-gwas", "post-gwas", "/tmp/post-gwas"))
+        conn.execute("INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)", ("post-gwas", "post-gwas", str(workspace_path)))
         conn.execute("INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)", ("post-gwas", "codex", "codex-old"))
         conn.execute(
             "INSERT INTO project_sessions (project_id, provider, session_id, status, title, last_used_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1501,5 +2022,16 @@ def test_cli_project_sessions_use_switches_binding(monkeypatch, tmp_path, capsys
             "SELECT raw_session_id FROM provider_bindings WHERE project_id = ? AND provider = ?",
             ("post-gwas", "codex"),
         ).fetchone()
+        statuses = conn.execute(
+            "SELECT session_id, status FROM project_sessions WHERE project_id = ? AND provider = ? ORDER BY session_id",
+            ("post-gwas", "codex"),
+        ).fetchall()
+        summary = conn.execute(
+            "SELECT summary FROM projects WHERE project_id = ?",
+            ("post-gwas",),
+        ).fetchone()[0]
 
     assert binding == ("codex-new",)
+    assert statuses == [("codex-new", "active"), ("codex-old", "archived")]
+    assert "Current sessions: codex=codex-new" in summary
+    assert (workspace_path / "PROJECT_MEMORY.md").exists()

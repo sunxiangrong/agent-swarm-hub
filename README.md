@@ -68,12 +68,12 @@ ash-chat claude
 进入流程：
 
 1. 选择项目
-2. 显示项目 `summary`
+2. 显示项目摘要
 3. 回车确认进入
 4. 切到项目 `path`
 5. 优先恢复该项目当前绑定的原生会话
-6. 绑定不可用时，回退到最近可用原生会话
-7. 进入原生 `codex` / `claude` CLI
+6. 如果当前 provider 没有绑定会话，则在正确项目路径里启动 fresh native session
+7. 退出 native CLI 后回写项目记忆、刷新项目摘要，并在需要时归档旧会话
 
 ### 2. 本地 swarm shell
 
@@ -104,49 +104,26 @@ ash-swarm claude
 
 ## 快速开始
 
+最短路径如下。
+
 ### 本地原生 CLI
 
 ```bash
-cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 ./scripts/start-chat.sh codex
 ./scripts/start-chat.sh claude
-```
-
-或全局入口：
-
-```bash
-ash-chat codex
-ash-chat claude
 ```
 
 ### 本地 swarm shell
 
 ```bash
-cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 ./scripts/start-swarm.sh codex
 ./scripts/start-swarm.sh claude
 ```
 
-或全局入口：
-
-```bash
-ash-swarm codex
-ash-swarm claude
-```
-
 ### 远程入口
 
-Telegram:
-
 ```bash
-cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 ./scripts/start-telegram.sh
-```
-
-飞书:
-
-```bash
-cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 ./scripts/start-lark.sh
 ```
 
@@ -156,11 +133,13 @@ cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
 
 ```text
 选择项目
-  -> 看 summary
+  -> 看项目摘要
   -> 回车确认
   -> 进入项目路径
   -> 恢复绑定的原生 Claude/Codex 会话
+  -> 或启动 fresh native session
   -> 继续实现
+  -> 退出后自动回写项目记忆与摘要
 ```
 
 ### 远程聊天工作流
@@ -208,6 +187,14 @@ Telegram / Lark
 - `ash-where --json`
 
 用于查看当前项目、路径、provider 和 session 状态。
+
+项目级 native 会话维护命令：
+
+- `project-sessions current <project>`
+- `project-sessions list <project>`
+- `project-sessions use <project> <provider> <session-id>`
+- `project-sessions sync-memory <project>`
+- `project-sessions sync-memory --all`
 
 ## 数据层
 
@@ -275,11 +262,12 @@ ASH_PROXY_URL=http://127.0.0.1:6789
 
 目前已经比较稳定的主线是：
 
-- `ash-chat` 进入前显示项目 `summary`
+- `ash-chat` 进入前显示结构化项目摘要
 - 进入项目时切到正确路径
 - 优先恢复项目当前绑定的 Claude / Codex 原生会话
-- 项目长期记忆和动态记忆分层管理
-- 原生会话开始按项目归档，而不是零散漂浮
+- 无绑定时在正确路径里启动 fresh native session
+- 退出 native CLI 后自动回写项目长期记忆和动态记忆
+- 原生会话按项目归档，切换当前绑定时自动归档旧会话
 
 仍然在持续打磨的部分主要是：
 

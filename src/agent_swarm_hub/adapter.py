@@ -1125,9 +1125,14 @@ class CCConnectAdapter:
         for line in lines:
             if line.startswith('Recent context:'):
                 return line.removeprefix('Recent context:').strip()
-        if len(lines) >= 2:
-            return lines[1]
-        return lines[0] if lines else ''
+        for line in lines:
+            if line.startswith('Recent:'):
+                return line.removeprefix('Recent:').strip()
+        for line in lines:
+            if line.startswith(('Task:', 'Stage:', 'Tasks:')):
+                continue
+            return line
+        return ''
 
     def _sync_project_memory(
         self,
@@ -1172,6 +1177,10 @@ class CCConnectAdapter:
             stripped = line.strip()
             if stripped.startswith("Current focus:"):
                 return stripped.removeprefix("Current focus:").strip()
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Task:"):
+                return stripped.removeprefix("Task:").strip()
         for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith("Recent context:"):

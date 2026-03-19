@@ -432,21 +432,25 @@ def _project_summary_field(summary: str, prefix: str) -> str:
 def _build_project_summary_prompt(*, workspace_id: str, work_dir: str, summary: str, snapshot: dict[str, str]) -> str:
     focus = _project_summary_field(summary, "Current focus:") or snapshot.get("focus") or ""
     recent_context = _project_summary_field(summary, "Recent context:") or snapshot.get("recent_context") or ""
-    next_step = (snapshot.get("recent_hints") or [""])[-1] if snapshot.get("recent_hints") else ""
-    if next_step.startswith("user:") or next_step.startswith("assistant:"):
-        _, _, next_step = next_step.partition(":")
-        next_step = next_step.strip()
+    brief = ProjectContextStore.derive_session_brief(
+        focus=focus,
+        recent_context=recent_context,
+        memory=snapshot.get("memory") or ProjectContextStore._summary_compact_text(summary),
+        hints=snapshot.get("recent_hints") or [],
+    )
     lines = [
         "Project summary for this session:",
         f"- Project: {workspace_id}",
         f"- Path: {work_dir}",
     ]
-    if focus:
-        lines.append(f"- Current Focus: {focus}")
-    if recent_context:
-        lines.append(f"- Current State: {recent_context}")
-    if next_step:
-        lines.append(f"- Next Step: {next_step}")
+    if brief["focus"]:
+        lines.append(f"- Current Focus: {brief['focus']}")
+    if brief["recent_context"]:
+        lines.append(f"- Current State: {brief['recent_context']}")
+    if brief["next_step"]:
+        lines.append(f"- Next Step: {brief['next_step']}")
+    if brief["memory"]:
+        lines.append(f"- Project Memory: {brief['memory']}")
     lines.append(f"- Read first: {work_dir}/PROJECT_MEMORY.md")
     lines.append(f"- Rules file: {work_dir}/PROJECT_SKILL.md")
     lines.append("Use these project files plus this summary as the project context for the session.")
@@ -838,8 +842,7 @@ def _record_provider_binding_and_memory(
         memory=memory,
         recent_hints=hints or fallback_snapshot.get("recent_hints", []),
     )
-    context_store.sync_project_memory_file(project_id)
-    context_store.sync_project_skill_file(project_id)
+    _sync_project_memory_artifacts(context_store, project_id)
 
 
 def _backfill_workspace_provider_sessions(
@@ -894,14 +897,18 @@ def _extract_project_memory_from_messages(
         if item.startswith("assistant:")
     ]
     hints = filtered[-2:]
-    focus = user_messages[-1] if user_messages else (fallback_snapshot.get("focus") or "")
+    focus = user_messages[0] if user_messages else (fallback_snapshot.get("focus") or "")
     recent_context_parts: list[str] = []
     if assistant_messages:
         recent_context_parts.append(assistant_messages[-1])
     elif filtered:
         recent_context_parts.append(filtered[-1])
     if user_messages and user_messages[-1] != focus:
-        recent_context_parts.append(user_messages[-1])
+        latest_part = recent_context_parts[-1] if recent_context_parts else ""
+        normalized_latest = ProjectContextStore._strip_memory_label(latest_part)
+        normalized_user = ProjectContextStore._strip_memory_label(user_messages[-1])
+        if normalized_user != normalized_latest:
+            recent_context_parts.append(user_messages[-1])
     recent_context = " | ".join(part for part in recent_context_parts if part).strip()
     if not recent_context:
         recent_context = fallback_snapshot.get("recent_context") or ""
@@ -1015,7 +1022,37 @@ def _project_sessions_use(project_id: str, provider: str, session_id: str) -> in
         return 2
     store.set_project_session_status(provider, session_id, "active")
     store.set_provider_binding(project_id, provider, session_id)
+    _sync_project_memory_artifacts(store, project_id)
     print(f"Current {provider} session for `{project_id}` set to {session_id}.")
+    return 0
+
+
+def _sync_project_memory_artifacts(store: ProjectContextStore, project_id: str) -> None:
+    store.sync_project_summary(project_id)
+    store.sync_project_memory_file(project_id)
+    store.sync_project_skill_file(project_id)
+
+
+def _project_sessions_sync_memory(project_id: str | None, *, sync_all: bool) -> int:
+    store = ProjectContextStore()
+    if sync_all:
+        projects = store.list_projects()
+        if not projects:
+            print("No projects recorded.")
+            return 0
+        for project in projects:
+            _sync_project_memory_artifacts(store, project.project_id)
+            print(f"Synced project memory for `{project.project_id}`.")
+        return 0
+    if not project_id:
+        print("Provide a project id or use --all.", file=sys.stderr)
+        return 2
+    project = store.get_project(project_id)
+    if project is None:
+        print(f"Unknown project: {project_id}", file=sys.stderr)
+        return 2
+    _sync_project_memory_artifacts(store, project_id)
+    print(f"Synced project memory for `{project_id}`.")
     return 0
 
 
@@ -1210,6 +1247,12 @@ def main() -> int:
     project_sessions_use.add_argument("project")
     project_sessions_use.add_argument("provider")
     project_sessions_use.add_argument("session_id")
+    project_sessions_sync = project_sessions_sub.add_parser(
+        "sync-memory",
+        help="Rebuild structured project summary, PROJECT_MEMORY.md, and PROJECT_SKILL.md",
+    )
+    project_sessions_sync.add_argument("project", nargs="?")
+    project_sessions_sync.add_argument("--all", action="store_true")
 
     args = parser.parse_args()
     load_env_file(args.env_file)
@@ -1278,6 +1321,8 @@ def main() -> int:
             return _project_sessions_list(args.project, args.provider)
         if args.project_sessions_command == "use":
             return _project_sessions_use(args.project, args.provider.strip().lower(), args.session_id.strip())
+        if args.project_sessions_command == "sync-memory":
+            return _project_sessions_sync_memory(args.project, sync_all=args.all)
 
     return 1
 

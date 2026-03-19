@@ -259,6 +259,42 @@ def test_write_creates_session_and_status_reads_it(tmp_path) -> None:
     assert f"Workspace: {workspace_id}" in status_response.text
 
 
+def test_project_memory_prefers_recent_progress_over_stage_line(tmp_path, monkeypatch) -> None:
+    session_db = tmp_path / "sessions.sqlite3"
+    project_db = tmp_path / "project-sessions.sqlite3"
+    workspace_dir = tmp_path / "sheep-gwas"
+    workspace_dir.mkdir()
+    _init_project_session_db(project_db, str(workspace_dir.resolve()))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(project_db))
+
+    store = SessionStore(session_db)
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
+    _bind_workspace(adapter, workspace_id="sheep-gwas")
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Draft GWAS plotting checklist",
+        )
+    )
+
+    assert response.task_id is not None
+    with sqlite3.connect(project_db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT focus, recent_context, memory FROM project_memory WHERE project_id = ?",
+            ("sheep-gwas",),
+        ).fetchone()
+
+    assert row is not None
+    assert row["focus"] == "Draft GWAS plotting checklist"
+    assert row["recent_context"] == "No notable updates yet."
+    assert row["recent_context"] != "Stage: pending"
+    assert "Stage: pending" in row["memory"]
+
+
 def test_new_flushes_project_memory_before_reset(tmp_path, monkeypatch) -> None:
     session_db = tmp_path / "sessions.sqlite3"
     project_db = tmp_path / "project-sessions.sqlite3"

@@ -245,6 +245,38 @@ class ProjectContextStore:
             "recent_hints": recent_messages,
         }
 
+    @classmethod
+    def derive_session_brief(
+        cls,
+        *,
+        focus: str,
+        recent_context: str,
+        memory: str,
+        hints: list[str] | None,
+    ) -> dict[str, str]:
+        normalized_focus = cls._compact(" ".join((focus or "").split()), 220) if focus else ""
+        normalized_state = cls._compact(" ".join((recent_context or "").split()), 220) if recent_context else ""
+        compact_memory = cls._compact(" ".join((memory or "").split()), 220) if memory else ""
+        next_step = cls._derive_next_step(
+            focus=normalized_focus,
+            current_state=normalized_state,
+            memory=compact_memory,
+            hints=hints or [],
+        )
+        if cls._memory_values_match(next_step, normalized_focus) or cls._memory_values_match(next_step, normalized_state):
+            next_step = ""
+        memory_brief = compact_memory
+        if memory_brief:
+            memory_brief = cls._strip_memory_label(memory_brief)
+            if cls._memory_values_match(memory_brief, normalized_focus) or cls._memory_values_match(memory_brief, normalized_state):
+                memory_brief = ""
+        return {
+            "focus": normalized_focus,
+            "recent_context": normalized_state,
+            "next_step": next_step,
+            "memory": memory_brief,
+        }
+
     def get_project_memory(self, project_id: str) -> dict[str, Any]:
         if not project_id or not self.db_path.exists():
             return {"focus": "", "recent_context": "", "memory": "", "recent_hints": []}
@@ -297,6 +329,36 @@ class ProjectContextStore:
                     """,
                     (project_id, provider, raw_session_id),
                 )
+        except sqlite3.Error:
+            return
+        self.archive_other_project_sessions(project_id, provider, raw_session_id)
+
+    def archive_other_project_sessions(self, project_id: str, provider: str, keep_session_id: str) -> None:
+        if not project_id or not provider or not keep_session_id or not self.db_path.exists():
+            return
+        try:
+            with self._connect() as conn:
+                tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                if "project_sessions" in tables:
+                    conn.execute(
+                        """
+                        UPDATE project_sessions
+                        SET status = 'archived', last_used_at = CURRENT_TIMESTAMP
+                        WHERE project_id = ? AND provider = ? AND session_id != ? AND status != 'archived'
+                        """,
+                        (project_id, provider, keep_session_id),
+                    )
+                if "provider_sessions" in tables:
+                    provider_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_sessions)").fetchall()}
+                    if "status" in provider_columns:
+                        conn.execute(
+                            """
+                            UPDATE provider_sessions
+                            SET status = 'archived', last_used_at = CURRENT_TIMESTAMP
+                            WHERE project_id = ? AND provider = ? AND raw_session_id != ? AND status != 'archived'
+                            """,
+                            (project_id, provider, keep_session_id),
+                        )
         except sqlite3.Error:
             return
 
@@ -442,12 +504,13 @@ class ProjectContextStore:
         sessions = self.list_project_sessions(project_id, include_archived=False)
         focus = stored_memory.get("focus", "") or self._summary_field(project.summary, "Current focus:")
         current_state = stored_memory.get("recent_context", "") or self._summary_field(project.summary, "Recent context:")
-        next_step = self._derive_next_step(
+        brief = self.derive_session_brief(
             focus=focus,
-            current_state=current_state,
+            recent_context=current_state,
             memory=stored_memory.get("memory", ""),
             hints=stored_memory.get("recent_hints", []),
         )
+        next_step = brief["next_step"]
         lines = [
             "# PROJECT_MEMORY",
             "",
@@ -538,6 +601,44 @@ class ProjectContextStore:
         )
         return "\n".join(lines)
 
+    def render_project_summary(self, project_id: str) -> str:
+        project = self.get_project(project_id)
+        if project is None:
+            return ""
+        stored_memory = self.get_project_memory(project_id)
+        bindings = self.get_current_project_sessions(project_id)
+        sessions = self.list_project_sessions(project_id, include_archived=False)
+        brief = self.derive_session_brief(
+            focus=stored_memory.get("focus", "") or self._summary_field(project.summary, "Current focus:"),
+            recent_context=stored_memory.get("recent_context", "") or self._summary_field(project.summary, "Recent context:"),
+            memory=stored_memory.get("memory", "") or self._summary_compact_text(project.summary),
+            hints=stored_memory.get("recent_hints", []),
+        )
+        lines = [
+            f"Project: {project.project_id}",
+            f"Workspace: {project.workspace_path or ''}",
+        ]
+        if brief["focus"]:
+            lines.append(f"Current focus: {brief['focus']}")
+        if brief["recent_context"]:
+            lines.append(f"Recent context: {brief['recent_context']}")
+        if brief["next_step"]:
+            lines.append(f"Next step: {brief['next_step']}")
+        if brief["memory"]:
+            lines.append(f"Long-term memory: {brief['memory']}")
+        if bindings:
+            providers = ", ".join(f"{provider}={bindings[provider]}" for provider in sorted(bindings))
+            lines.append(f"Current sessions: {providers}")
+        elif sessions:
+            providers = ", ".join(
+                f"{session.get('provider', '')}={session.get('session_id', '')}"
+                for session in sessions[:2]
+                if session.get("provider") and session.get("session_id")
+            )
+            if providers:
+                lines.append(f"Current sessions: {providers}")
+        return "\n".join(lines)
+
     def render_project_skill_markdown(self, project_id: str) -> str:
         project = self.get_project(project_id)
         if project is None:
@@ -584,6 +685,10 @@ class ProjectContextStore:
         project = self.get_project(project_id)
         if project is None or not (project.workspace_path or "").strip():
             return None
+        self.sync_project_summary(project_id)
+        project = self.get_project(project_id)
+        if project is None:
+            return None
         workspace = Path(project.workspace_path).expanduser()
         try:
             workspace.mkdir(parents=True, exist_ok=True)
@@ -599,6 +704,10 @@ class ProjectContextStore:
     def sync_project_skill_file(self, project_id: str) -> Path | None:
         project = self.get_project(project_id)
         if project is None or not (project.workspace_path or "").strip():
+            return None
+        self.sync_project_summary(project_id)
+        project = self.get_project(project_id)
+        if project is None:
             return None
         workspace = Path(project.workspace_path).expanduser()
         try:
@@ -622,6 +731,26 @@ class ProjectContextStore:
             if skill_path is not None:
                 written.append(skill_path)
         return written
+
+    def sync_project_summary(self, project_id: str) -> bool:
+        if not project_id or not self.db_path.exists():
+            return False
+        summary = self.render_project_summary(project_id)
+        if not summary:
+            return False
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE projects
+                    SET summary = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE project_id = ?
+                    """,
+                    (summary, project_id),
+                )
+        except sqlite3.Error:
+            return False
+        return True
 
     @staticmethod
     def _compact(text: str | None, limit: int) -> str:
@@ -701,13 +830,40 @@ class ProjectContextStore:
         for hint in reversed(hints):
             value = " ".join(str(hint).split())
             if value:
-                if value.startswith("user:") or value.startswith("assistant:"):
-                    _, _, value = value.partition(":")
-                    value = value.strip()
+                value = cls._strip_memory_label(value)
                 if value:
                     return cls._compact(value, 220)
         if current_state:
             return cls._compact(current_state, 220)
         if memory:
-            return cls._compact(memory, 220)
+            return cls._compact(cls._strip_memory_label(memory), 220)
         return cls._compact(focus, 220) if focus else ""
+
+    @classmethod
+    def _strip_memory_label(cls, value: str | None) -> str:
+        text = " ".join((value or "").split()).strip()
+        if not text:
+            return ""
+        changed = True
+        while changed:
+            changed = False
+            for prefix in (
+                "user:",
+                "assistant:",
+                "Task:",
+                "State:",
+                "Latest result:",
+                "Recent:",
+                "Recent context:",
+                "Current focus:",
+            ):
+                if text.startswith(prefix):
+                    text = text.removeprefix(prefix).strip()
+                    changed = True
+        return text
+
+    @classmethod
+    def _memory_values_match(cls, left: str | None, right: str | None) -> bool:
+        normalized_left = cls._strip_memory_label(left).casefold()
+        normalized_right = cls._strip_memory_label(right).casefold()
+        return bool(normalized_left and normalized_right and normalized_left == normalized_right)
