@@ -82,6 +82,7 @@ def build_dashboard_snapshot(
                 "swarm_session_key": str(swarm.get("session_key") or ""),
                 "swarm_task_id": str(swarm.get("task_id") or ""),
                 "swarm_summary": str(swarm.get("summary") or ""),
+                "swarm_orchestrator_launch": dict(swarm.get("orchestrator_launch") or {}),
                 "swarm_handoff_count": int(swarm.get("handoff_count") or 0),
                 "swarm_agent_count": int(swarm.get("agent_count") or 0),
                 "swarm_agents": list(swarm.get("agents") or []),
@@ -211,6 +212,7 @@ def _load_swarm_activity(session_store: SessionStore) -> dict[str, dict[str, Any
                 "session_key": session_key,
                 "task_id": task_id,
                 "summary": _compact_text(str(row["conversation_summary"] or "").strip(), 180),
+                "orchestrator_launch": _extract_orchestrator_launch(str(row["conversation_summary"] or "").strip()),
                 "handoff_count": len(handoffs),
                 "agent_count": 0,
                 "agents": _summarize_swarm_agents(handoffs),
@@ -320,9 +322,15 @@ def _summarize_swarm_agents(handoffs: list[sqlite3.Row]) -> list[dict[str, Any]]
                     "status": "pending",
                     "backend": "",
                     "summary": "",
+                    "launch_status": "",
+                    "launch_pane_id": "",
                 },
             )
             item["summary"] = _compact_text(str(content.get("task") or content.get("instructions") or item["summary"]), 120)
+            worker_launch = content.get("worker_launch")
+            if isinstance(worker_launch, dict):
+                item["launch_status"] = str(worker_launch.get("status") or item.get("launch_status") or "")
+                item["launch_pane_id"] = str(worker_launch.get("pane_id") or item.get("launch_pane_id") or "")
         elif handoff_type == "subagent_result" and source_agent:
             backend = str(content.get("backend") or "").strip()
             output = _compact_text(str(content.get("output") or "").strip(), 120)
@@ -333,11 +341,17 @@ def _summarize_swarm_agents(handoffs: list[sqlite3.Row]) -> list[dict[str, Any]]
                     "status": "completed",
                     "backend": backend,
                     "summary": output,
+                    "launch_status": "",
+                    "launch_pane_id": "",
                 },
             )
             item["backend"] = backend or item.get("backend", "")
             item["summary"] = output or item.get("summary", "")
             item["status"] = "failed" if backend == "error" or output.lower().startswith("execution error") else "completed"
+            worker_launch = content.get("worker_launch")
+            if isinstance(worker_launch, dict):
+                item["launch_status"] = str(worker_launch.get("status") or item.get("launch_status") or "")
+                item["launch_pane_id"] = str(worker_launch.get("pane_id") or item.get("launch_pane_id") or "")
         elif handoff_type == "verification_packet":
             item = agents.setdefault(
                 "verification",
@@ -365,6 +379,22 @@ def _summarize_swarm_agents(handoffs: list[sqlite3.Row]) -> list[dict[str, Any]]
             item["summary"] = output or item.get("summary", "")
             item["status"] = "failed" if backend == "error" or output.lower().startswith("execution error") else "completed"
     return list(agents.values())
+
+
+def _extract_orchestrator_launch(summary: str) -> dict[str, Any]:
+    for line in summary.splitlines():
+        text = line.strip()
+        if not text.startswith("Orchestrator: "):
+            continue
+        rest = text.removeprefix("Orchestrator: ").strip()
+        if rest.endswith(")") and "(" in rest:
+            provider, _, status = rest.rpartition("(")
+            return {
+                "provider": provider.strip(),
+                "status": status.rstrip(")").strip(),
+            }
+        return {"provider": rest, "status": ""}
+    return {}
 
 
 def _parse_content_json(value: str) -> dict[str, Any]:

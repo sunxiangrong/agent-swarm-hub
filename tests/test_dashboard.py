@@ -331,7 +331,7 @@ def test_build_dashboard_snapshot_includes_swarm_activity(tmp_path) -> None:
         claude_session_id="claude-1",
         codex_session_id="codex-1",
         phase="executing",
-        conversation_summary="Task: improve swarm visibility\nRecent: coordinating sub-agents",
+        conversation_summary="Task: improve swarm visibility\nOrchestrator: claude (launched)\nRecent: coordinating sub-agents",
         swarm_state_json='{"root_task_id":"task-1"}',
         escalations_json="[]",
     )
@@ -342,7 +342,13 @@ def test_build_dashboard_snapshot_includes_swarm_activity(tmp_path) -> None:
         handoff_type="subagent_packet",
         source_agent="worker",
         target_agent="researcher",
-        content_json=json.dumps({"task": "Inspect current dashboard swarm visibility."}, ensure_ascii=False),
+        content_json=json.dumps(
+            {
+                "task": "Inspect current dashboard swarm visibility.",
+                "worker_launch": {"status": "existing", "pane_id": "%2"},
+            },
+            ensure_ascii=False,
+        ),
     )
     session_store.append_task_handoff(
         session_key="local-cli",
@@ -351,7 +357,14 @@ def test_build_dashboard_snapshot_includes_swarm_activity(tmp_path) -> None:
         handoff_type="subagent_result",
         source_agent="researcher",
         target_agent="worker",
-        content_json=json.dumps({"backend": "codex", "output": "Found missing swarm agent visibility in dashboard."}, ensure_ascii=False),
+        content_json=json.dumps(
+            {
+                "backend": "codex",
+                "output": "Found missing swarm agent visibility in dashboard.",
+                "worker_launch": {"status": "existing", "pane_id": "%2"},
+            },
+            ensure_ascii=False,
+        ),
     )
 
     payload = build_dashboard_snapshot(
@@ -369,8 +382,11 @@ def test_build_dashboard_snapshot_includes_swarm_activity(tmp_path) -> None:
     assert project["swarm_roles"]["orchestrator"] == "claude"
     assert project["swarm_roles"]["executor"] == "codex"
     assert project["driver_session_id"] == "claude-1"
+    assert project["swarm_orchestrator_launch"]["status"] == "launched"
     assert project["swarm_agents"][0]["name"] == "researcher"
     assert project["swarm_agents"][0]["status"] == "completed"
+    assert project["swarm_agents"][0]["launch_status"] == "existing"
+    assert project["swarm_agents"][0]["launch_pane_id"] == "%2"
 
 
 def test_build_dashboard_snapshot_maps_driver_to_tmux_pane(monkeypatch, tmp_path) -> None:

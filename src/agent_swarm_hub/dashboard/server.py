@@ -534,6 +534,7 @@ def _dashboard_html() -> str:
           <strong>${escapeHtml(agent.name || 'agent')}</strong>
           <span class="status-badge" data-tone="${statusTone(agent.status)}">${escapeHtml(agent.status || 'idle')}</span>
           <div class="timestamp">${escapeHtml(agent.backend || 'native cli')}</div>
+          ${agent.launch_status ? `<div class="timestamp">launch ${escapeHtml(agent.launch_status)} ${escapeHtml(agent.launch_pane_id || '')}</div>` : ''}
           <div>${escapeHtml(agent.summary || 'No result summary yet.')}</div>
         </div>
       `).join('');
@@ -555,6 +556,11 @@ def _dashboard_html() -> str:
         ? `
               <div class="runtime-item">Task: ${escapeHtml(project.swarm_task_id || 'none')}</div>
               <div class="runtime-item">Session: ${escapeHtml(project.swarm_session_key || 'none')}</div>
+              ${
+                project.swarm_orchestrator_launch && project.swarm_orchestrator_launch.status
+                  ? `<div class="runtime-item">Orchestrator Launch: ${escapeHtml(project.swarm_orchestrator_launch.provider || 'claude')} (${escapeHtml(project.swarm_orchestrator_launch.status || '')})</div>`
+                  : ''
+              }
               <div class="runtime-item">Agents: ${escapeHtml(String(project.swarm_agent_count || 0))} | Handoffs: ${escapeHtml(String(project.swarm_handoff_count || 0))}</div>
               <div class="runtime-item">${escapeHtml(project.swarm_summary || 'Swarm execution is active.')}</div>
               ${swarmAgents || '<div class="runtime-item">No active sub-agent runs recorded.</div>'}
