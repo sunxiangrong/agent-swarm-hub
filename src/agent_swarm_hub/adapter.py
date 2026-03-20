@@ -8,12 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from .escalation import EscalationDecision
-from .executor import AuthenticationRequiredError, ConfirmationRequiredError, Executor, ExecutorError
+from .executor import AuthenticationRequiredError, ConfirmationRequiredError, EchoExecutor, Executor, ExecutorError
 from .models import Event, EventType
 from .project_context import ProjectContextStore
 from .remote import RemoteMessage, parse_remote_command
 from .session_store import SessionStore
 from .swarm import SwarmCoordinator, SwarmState
+from .swarm_launch import ensure_orchestrator_pane
+from .swarm_roles import SwarmRoles, resolve_swarm_roles
 from .worker_session import LocalExecutorSessionPool
 
 PHASE_DISCUSSION = "discussion"
@@ -103,37 +105,39 @@ class CCConnectAdapter:
         if command.name == "help":
             return AdapterResponse(
                 text=(
-                    "项目命令:\n"
-                    "/projects  查看可用项目列表\n"
-                    "/use <workspace>  切换当前项目\n"
+                    "主路径:\n"
+                    "1. /projects 查看项目列表\n"
+                    "2. /use <workspace> 进入项目\n"
+                    "3. 直接发送普通文本开始聊天\n"
+                    "4. /quit 退出当前项目模式\n\n"
+                    "默认行为:\n"
+                    "- 已绑定项目时，普通文本会自动开始任务或继续当前任务\n"
+                    "- 未绑定项目时，短消息进入 ephemeral，长消息进入 temporary swarm\n\n"
+                    "高级命令:\n"
+                    "/execute [notes]  基于当前讨论进入 planning / execution\n"
+                    "/new  清空当前项目的活跃任务上下文\n"
                     "/where  查看当前项目、profile、session 和 phase\n"
                     "/project set-path <path>  设置项目目录\n"
                     "/project set-backend <backend>  设置项目默认后端\n"
-                    "/project set-transport <transport>  设置项目默认传输层\n\n"
-                    "任务命令:\n"
-                    "/write <task>  显式创建新任务并进入讨论阶段\n"
-                    "/execute [notes]  基于当前讨论进入执行阶段\n"
-                    "/new  清空当前项目的活跃任务上下文\n"
-                    "普通文本  已绑定项目时会自动开始新任务或续聊；未绑定项目时进入 temporary swarm 或 ephemeral\n\n"
-                    "监控命令:\n"
+                    "/project set-transport <transport>  设置项目默认传输层\n"
                     "/status  查看当前任务摘要\n"
                     "/worker  查看当前 worker phase、handoff、sub-agent 运行情况\n"
                     "/tasks  查看当前项目最近任务列表\n"
                     "/sessions  查看 Claude/Codex formal 与 ephemeral 消息数量\n"
                     "/escalations  查看需要人工关注的升级事件\n\n"
-                    "确认命令:\n"
+                    "低层命令:\n"
+                    "/write <task>  显式创建新任务\n"
                     "/confirm  当 bridge 上浮确认请求时继续执行\n\n"
-                    "模式说明:\n"
-                    "未绑定项目时，短消息进入 ephemeral；长消息进入 temporary swarm，不写入项目长期记忆。\n"
-                    "使用 /use <workspace> 后进入正式项目模式。\n\n"
-                    "其他:\n"
-                    "/help  查看这份说明"
+                    "提示:\n"
+                    "远程聊天默认按自然对话使用。只有在你想查看内部状态或强制推进流程时，再使用这些命令。"
                 )
             )
         if command.name == "projects":
             return self._handle_projects(message, workspace_id)
         if command.name == "use":
             return self._handle_use(message, command.argument)
+        if command.name == "quit":
+            return self._handle_quit(message)
         if command.name == "confirm":
             return self._handle_confirm(message)
         if workspace_id is None:
@@ -184,6 +188,7 @@ class CCConnectAdapter:
         workspace_id = self._require_bound_workspace(message)
         if workspace_id is None:
             return self._formal_project_required_response()
+        roles = self._swarm_roles(workspace_id)
         executor_session_id = self._ensure_executor_session_id(message.session_key, workspace_id)
         task_id = self._make_task_id(message, argument)
         state = self.coordinator.create_root_task(task_id=task_id, title=argument, role="runtime_coordinator")
@@ -200,7 +205,7 @@ class CCConnectAdapter:
         self.store.append_agent_message(
             session_key=message.session_key,
             workspace_id=workspace_id,
-            agent="claude",
+            agent=roles.trigger,
             task_id=task_id,
             role="user",
             text=argument,
@@ -210,10 +215,17 @@ class CCConnectAdapter:
                 session_key=message.session_key,
                 workspace_id=workspace_id,
                 phase=PHASE_DISCUSSION,
-                mode="claude",
+                mode=roles.trigger,
                 prompt=argument,
             )
-            text = f"Task ID: {task_id}\nPhase: {PHASE_DISCUSSION}\nBackend: {result.backend}\n{result.output}"
+            text = (
+                f"Task ID: {task_id}\n"
+                f"Phase: {PHASE_DISCUSSION}\n"
+                f"{self._roles_summary_text(roles)}\n"
+                "Auto Coordination: complex tasks will automatically enter planning / swarm collaboration.\n"
+                f"Backend: {result.backend}\n"
+                f"{result.output}"
+            )
         except AuthenticationRequiredError as exc:
             text = self._authentication_required_text(workspace_id=workspace_id, exc=exc, task_id=task_id)
         except ConfirmationRequiredError as exc:
@@ -225,7 +237,7 @@ class CCConnectAdapter:
         self.store.append_agent_message(
             session_key=message.session_key,
             workspace_id=workspace_id,
-            agent="claude",
+            agent=roles.trigger,
             task_id=task_id,
             role="assistant",
             text=text,
@@ -342,6 +354,7 @@ class CCConnectAdapter:
         workspace_id = self._require_bound_workspace(message)
         if workspace_id is None:
             return self._formal_project_required_response()
+        roles = self._swarm_roles(workspace_id)
         executor_session_id = self._ensure_executor_session_id(message.session_key, workspace_id)
         memory_key = self._memory_key(message.session_key, workspace_id)
         state = self._load_session(message.session_key, workspace_id)
@@ -359,7 +372,7 @@ class CCConnectAdapter:
         self.store.append_agent_message(
             session_key=message.session_key,
             workspace_id=workspace_id,
-            agent="claude",
+            agent=roles.trigger,
             task_id=task_id,
             role="user",
             text=argument,
@@ -369,7 +382,7 @@ class CCConnectAdapter:
                 session_key=message.session_key,
                 workspace_id=workspace_id,
                 phase=phase,
-                mode="claude",
+                mode=roles.trigger,
                 prompt=argument,
             )
             text = f"Task ID: {task_id}\nPhase: {phase}\nBackend: {result.backend}\n{result.output}"
@@ -384,7 +397,7 @@ class CCConnectAdapter:
         self.store.append_agent_message(
             session_key=message.session_key,
             workspace_id=workspace_id,
-            agent="claude",
+            agent=roles.trigger,
             task_id=task_id,
             role="assistant",
             text=text,
@@ -402,12 +415,13 @@ class CCConnectAdapter:
         workspace_id = self._require_bound_workspace(message)
         if workspace_id is None:
             return self._formal_project_required_response()
+        roles = self._swarm_roles(workspace_id)
         executor_session_id = self._ensure_executor_session_id(message.session_key, workspace_id)
         claude_session_id = self._ensure_agent_session_id(message.session_key, workspace_id, "claude")
         codex_session_id = self._ensure_agent_session_id(message.session_key, workspace_id, "codex")
         state = self._load_session(message.session_key, workspace_id)
         if state is None:
-            return AdapterResponse(text=f"Workspace: {workspace_id}\nNo active task in this workspace yet. Use /write <task> first.")
+            return AdapterResponse(text=f"Workspace: {workspace_id}\nNo active task yet. Send a normal message to start, or use /write <task> for explicit control.")
         task_id = state.root_task_id
         memory_key = self._memory_key(message.session_key, workspace_id)
         discussion_brief = self._build_discussion_brief(
@@ -427,13 +441,21 @@ class CCConnectAdapter:
         execution_plan = None
         planning_backend = None
         complexity = self._task_complexity(state.tasks[state.root_task_id].title, argument)
+        orchestrator_launch: dict[str, str] | None = None
+        if complexity != "simple":
+            workspace = self.store.get_workspace(workspace_id)
+            orchestrator_launch = ensure_orchestrator_pane(
+                project_id=workspace_id,
+                workspace_path=workspace.path if workspace else "",
+                provider=roles.orchestrator,
+            )
         self.store.append_task_handoff(
             session_key=message.session_key,
             workspace_id=workspace_id,
             task_id=task_id,
             handoff_type="discussion_brief",
-            source_agent="claude",
-            target_agent="codex",
+            source_agent=roles.trigger,
+            target_agent=roles.orchestrator,
             content_json=SessionStore.dumps_json(discussion_brief),
         )
         if complexity != "simple":
@@ -442,7 +464,7 @@ class CCConnectAdapter:
                     session_key=message.session_key,
                     workspace_id=workspace_id,
                     phase=PHASE_PLANNING,
-                    mode="claude",
+                    mode=roles.planner,
                     prompt=self._build_planning_prompt(
                         state=state,
                         operator_note=argument,
@@ -461,7 +483,7 @@ class CCConnectAdapter:
                 self.store.append_agent_message(
                     session_key=message.session_key,
                     workspace_id=workspace_id,
-                    agent="claude",
+                    agent=roles.planner,
                     task_id=task_id,
                     role="assistant",
                     text=planning_result.output,
@@ -471,7 +493,7 @@ class CCConnectAdapter:
                     workspace_id=workspace_id,
                     task_id=task_id,
                     handoff_type="execution_plan",
-                    source_agent="claude",
+                    source_agent=roles.planner,
                     target_agent="worker",
                     content_json=SessionStore.dumps_json(execution_plan),
                 )
@@ -496,8 +518,8 @@ class CCConnectAdapter:
             workspace_id=workspace_id,
             task_id=task_id,
             handoff_type="execution_packet",
-            source_agent="claude",
-            target_agent="codex",
+            source_agent=roles.orchestrator,
+            target_agent=roles.executor,
             content_json=SessionStore.dumps_json(execution_packet),
         )
         self.store.upsert_workspace_session(
@@ -516,7 +538,7 @@ class CCConnectAdapter:
         self.store.append_agent_message(
             session_key=message.session_key,
             workspace_id=workspace_id,
-            agent="codex",
+            agent=roles.executor,
             task_id=task_id,
             role="system",
             text=json.dumps(execution_packet, ensure_ascii=False),
@@ -535,7 +557,7 @@ class CCConnectAdapter:
                 self.store.append_agent_message(
                     session_key=message.session_key,
                     workspace_id=workspace_id,
-                    agent="codex",
+                    agent=roles.executor,
                     task_id=task_id,
                     role="system",
                     text=json.dumps({"subagent_results": subagent_results}, ensure_ascii=False),
@@ -544,14 +566,14 @@ class CCConnectAdapter:
                 session_key=message.session_key,
                 workspace_id=workspace_id,
                 phase=PHASE_EXECUTING,
-                mode="codex",
+                mode=roles.executor,
                 prompt=json.dumps(execution_packet, ensure_ascii=False, indent=2),
             )
-            self.store.append_message(session_key=memory_key, task_id=task_id, role="assistant", text=f"[codex]\n{codex_result.output}")
+            self.store.append_message(session_key=memory_key, task_id=task_id, role="assistant", text=f"[{roles.executor}]\n{codex_result.output}")
             self.store.append_agent_message(
                 session_key=message.session_key,
                 workspace_id=workspace_id,
-                agent="codex",
+                agent=roles.executor,
                 task_id=task_id,
                 role="assistant",
                 text=codex_result.output,
@@ -569,7 +591,7 @@ class CCConnectAdapter:
                 session_key=message.session_key,
                 workspace_id=workspace_id,
                 phase=PHASE_REVIEWING,
-                mode="claude",
+                mode=roles.reviewer,
                 prompt=self._build_review_prompt(
                     state=state,
                     discussion_brief=discussion_brief,
@@ -582,6 +604,14 @@ class CCConnectAdapter:
                 [
                     f"Task ID: {task_id}\n",
                     f"Phase: {PHASE_REPORTED}\n",
+                    f"{self._roles_summary_text(roles)}\n",
+                    f"Return Target: {roles.orchestrator}\n",
+                    (
+                        f"Orchestrator: {roles.orchestrator} ({orchestrator_launch.get('status', 'unknown')})\n"
+                        if orchestrator_launch
+                        else ""
+                    ),
+                    f"Coordination: {self._coordination_label(complexity=complexity, subagent_runs=len(subagent_results))}\n",
                     f"Complexity: {complexity}\n",
                     f"Planning Backend: {planning_backend}\n" if planning_backend else "",
                     f"Sub-agent Runs: {len(subagent_results)}\n" if subagent_results else "",
@@ -607,7 +637,7 @@ class CCConnectAdapter:
             self.store.append_agent_message(
                 session_key=message.session_key,
                 workspace_id=workspace_id,
-                agent="claude",
+                agent=roles.reviewer,
                 task_id=task_id,
                 role="system",
                 text=self._build_review_prompt(
@@ -621,7 +651,7 @@ class CCConnectAdapter:
             self.store.append_agent_message(
                 session_key=message.session_key,
                 workspace_id=workspace_id,
-                agent="claude",
+                agent=roles.reviewer,
                 task_id=task_id,
                 role="assistant",
                 text=text,
@@ -639,7 +669,7 @@ class CCConnectAdapter:
                 workspace_id=workspace_id,
                 task_id=task_id,
                 handoff_type="review_verdict",
-                source_agent="claude",
+                source_agent=roles.reviewer,
                 target_agent="user",
                 content_json=SessionStore.dumps_json(review_verdict),
             )
@@ -648,7 +678,7 @@ class CCConnectAdapter:
                 Event(
                     type=EventType.TASK_COMPLETED,
                     task_id=task_id,
-                    role="claude",
+                    role=roles.reviewer,
                     summary="Execution reviewed and reported.",
                 ),
             )
@@ -714,7 +744,7 @@ class CCConnectAdapter:
         self.pending_confirmations.pop(memory_key, None)
         self.confirmation_override_keys.discard(memory_key)
         self.store.clear_workspace_session(message.session_key, workspace_id)
-        return AdapterResponse(text=f"Started a fresh task context in workspace `{workspace_id}`. Send a normal message or use /write <task> to begin.")
+        return AdapterResponse(text=f"Started a fresh task context in workspace `{workspace_id}`. You can now just send a normal message to continue.")
 
     def _handle_status(self, message: RemoteMessage) -> AdapterResponse:
         workspace_id = self._require_bound_workspace(message)
@@ -733,8 +763,9 @@ class CCConnectAdapter:
                     f"Claude Session: {claude_session_id}\n"
                     f"Codex Session: {codex_session_id}\n"
                     f"Phase: {phase}\n"
+                    f"{self._roles_summary_text(self._swarm_roles(workspace_id))}\n"
                     f"{self._project_context_text(workspace_id)}"
-                    "No active task in this workspace yet. Send a normal message or use /write <task> to begin."
+                    "No active task yet. Send a normal message to start."
                 )
             )
         session_record = self.store.get_workspace_session(message.session_key, workspace_id)
@@ -746,6 +777,7 @@ class CCConnectAdapter:
                 f"Claude Session: {claude_session_id}\n"
                 f"Codex Session: {codex_session_id}\n"
                 f"Phase: {phase}\n"
+                f"{self._roles_summary_text(self._swarm_roles(workspace_id))}\n"
                 f"{self._project_context_text(workspace_id)}"
                 f"Task ID: {state.root_task_id}\n"
                 f"{summary}"
@@ -765,11 +797,14 @@ class CCConnectAdapter:
         lines = [
             f"Workspace: {workspace_id}",
             f"Phase: {phase}",
+            self._roles_summary_text(self._swarm_roles(workspace_id)),
+            f"Return Target: {self._swarm_roles(workspace_id).orchestrator}",
             f"Active Task: {task_id or 'none'}",
             f"Claude Session: {session_record.claude_session_id if session_record else 'none'}",
             f"Codex Session: {session_record.codex_session_id if session_record else 'none'}",
             f"Recent Handoffs: {len(handoffs)}",
             f"Sub-agent Runs: {len(subagent_runs)}",
+            f"Coordination: {self._worker_coordination_label(phase=phase, subagent_runs=len(subagent_runs), handoffs=len(handoffs))}",
         ]
         if handoffs:
             lines.append("Latest Handoffs:")
@@ -809,6 +844,8 @@ class CCConnectAdapter:
         lines = [
             f"Workspace: {workspace_id}",
             f"Phase: {phase}",
+            self._roles_summary_text(self._swarm_roles(workspace_id)),
+            f"Return Target: {self._swarm_roles(workspace_id).orchestrator}",
             f"Active Task: {session_record.active_task_id if session_record and session_record.active_task_id else 'none'}",
             f"Claude Session: {claude_session_id}",
             f"Codex Session: {codex_session_id}",
@@ -829,7 +866,7 @@ class CCConnectAdapter:
             return self._formal_project_required_response()
         state = self._load_session(message.session_key, workspace_id)
         if state is None:
-            return AdapterResponse(text=f"Workspace: {workspace_id}\nNo active task in this workspace yet. Send a normal message or use /write <task> to begin.")
+            return AdapterResponse(text=f"Workspace: {workspace_id}\nNo active task yet. Send a normal message to start.")
         escalated = self.escalations.get(self._memory_key(message.session_key, workspace_id), [])
         if not escalated:
             return AdapterResponse(
@@ -870,7 +907,7 @@ class CCConnectAdapter:
         lines.append("  Mode: temporary")
         lines.append("  Profile: 临时对话模式，不进入项目长期记忆；切换离开时清理临时上下文。")
         if workspace_id is None:
-            lines.append("No project is currently bound to this chat. Use /use <workspace> to enter formal project mode.")
+            lines.append("No project is currently bound to this chat. Use /use <workspace> to enter a project, then just chat normally.")
         return AdapterResponse(text="\n".join(lines))
 
     def _handle_use(self, message: RemoteMessage, argument: str) -> AdapterResponse:
@@ -901,7 +938,27 @@ class CCConnectAdapter:
             workspace_id=workspace_id,
         )
         self._load_session(message.session_key, workspace_id)
-        return AdapterResponse(text=f"Current workspace switched to `{workspace_id}`.")
+        return AdapterResponse(
+            text=(
+                f"Current workspace switched to `{workspace_id}`.\n"
+                "You can now just send a normal message to start chatting in this project.\n"
+                "Use /execute only when you want to force planning and execution explicitly."
+            )
+        )
+
+    def _handle_quit(self, message: RemoteMessage) -> AdapterResponse:
+        workspace_id = self._get_bound_workspace(message)
+        if workspace_id is not None:
+            self._sync_project_memory(session_key=message.session_key, workspace_id=workspace_id)
+        self._clear_pending_confirmations(message.session_key)
+        self.store.clear_chat_binding(message.session_key)
+        self.store.clear_ephemeral_messages(message.session_key, EPHEMERAL_WORKSPACE_ID)
+        return AdapterResponse(
+            text=(
+                "Exited current project mode.\n"
+                "You are no longer bound to a formal project. Use /projects and /use <workspace> to enter another one."
+            )
+        )
 
     def _handle_confirm(self, message: RemoteMessage) -> AdapterResponse:
         pending = self._find_pending_confirmation(message.session_key)
@@ -1203,7 +1260,7 @@ class CCConnectAdapter:
             conversation_summary=(
                 record.conversation_summary
                 if record and record.conversation_summary
-                else "No active task in this workspace yet. Send a normal message or use /write <task> to begin."
+                else "No active task yet. Send a normal message to start."
             ),
             swarm_state_json=record.swarm_state_json if record else "",
             escalations_json=record.escalations_json if record else "[]",
@@ -1240,7 +1297,7 @@ class CCConnectAdapter:
             conversation_summary=(
                 record.conversation_summary
                 if record and record.conversation_summary
-                else "No active task in this workspace yet. Send a normal message or use /write <task> to begin."
+                else "No active task yet. Send a normal message to start."
             ),
             swarm_state_json=record.swarm_state_json if record else "",
             escalations_json=record.escalations_json if record else "[]",
@@ -1266,9 +1323,9 @@ class CCConnectAdapter:
             executor_session_id=agent_session_id,
             prompt=final_prompt,
             mode=mode,
-            transport=workspace.transport if workspace else self._current_transport(),
+            transport=self._transport_for_mode(workspace_id=workspace_id, mode=mode, coordinated=phase in {PHASE_PLANNING, PHASE_EXECUTING, PHASE_REVIEWING}),
             work_dir=workspace.path if workspace else None,
-            executor_override=self.executor,
+            executor_override=self._executor_override_for_mode(mode),
             extra_env=self._bridge_extra_env(
                 session_key=session_key,
                 workspace_id=workspace_id,
@@ -1300,6 +1357,18 @@ class CCConnectAdapter:
         if not context:
             return prompt
         return f"{context}\n\nCurrent User Request:\n{prompt}"
+
+    def _swarm_roles(self, workspace_id: str) -> SwarmRoles:
+        workspace = self.store.get_workspace(workspace_id)
+        preferred_trigger = workspace.backend if workspace and workspace.backend else self._current_backend()
+        return resolve_swarm_roles(preferred_trigger)
+
+    @staticmethod
+    def _roles_summary_text(roles: SwarmRoles) -> str:
+        return (
+            f"Roles: trigger={roles.trigger} | orchestrator={roles.orchestrator} | planner={roles.planner} | "
+            f"executor={roles.executor} | reviewer={roles.reviewer}"
+        )
 
     def _current_phase(self, session_key: str, workspace_id: str) -> str:
         record = self.store.get_workspace_session(session_key, workspace_id)
@@ -1439,7 +1508,7 @@ class CCConnectAdapter:
             text=(
                 "No project is currently bound to this chat.\n"
                 "Formal tasks must belong to a specific project.\n"
-                "Use /projects to inspect projects, then /use <workspace> before /write, /execute, or status commands."
+                "Use /projects to inspect projects, then /use <workspace> to enter a project and start chatting."
             )
         )
 
@@ -1452,9 +1521,29 @@ class CCConnectAdapter:
             text=(
                 "This chat is currently in temporary mode only.\n"
                 "Short low-signal messages will be kept as ephemeral context and auto-expired.\n"
-                "Use /use <workspace> to move into a formal project."
+                "Use /use <workspace> to move into a formal project and start chatting."
             )
         )
+
+    @staticmethod
+    def _coordination_label(*, complexity: str, subagent_runs: int) -> str:
+        if subagent_runs > 0:
+            return f"swarm collaboration ({subagent_runs} sub-agent runs)"
+        if complexity == "simple":
+            return "single-agent execution"
+        if complexity in {"medium", "large"}:
+            return "planned execution"
+        return "single-agent execution"
+
+    @staticmethod
+    def _worker_coordination_label(*, phase: str, subagent_runs: int, handoffs: int) -> str:
+        if subagent_runs > 0:
+            return f"swarm collaboration active ({subagent_runs} sub-agent runs)"
+        if phase == PHASE_PLANNING:
+            return "planning in progress"
+        if handoffs > 0:
+            return "structured execution flow active"
+        return "single-agent chat"
 
     def _build_execution_packet(
         self,
@@ -1573,15 +1662,23 @@ class CCConnectAdapter:
         if not execution_plan or not execution_plan.get("needs_subagents"):
             return []
         results: list[dict[str, Any]] = []
+        workspace = self.store.get_workspace(workspace_id)
+        workspace_path = workspace.path if workspace else ""
         for role in execution_plan.get("suggested_subagents", []):
+            backend_mode = self._subagent_backend_mode(role)
+            worker_launch = ensure_orchestrator_pane(
+                project_id=workspace_id,
+                workspace_path=workspace_path,
+                provider=backend_mode,
+            )
             packet = self._build_subagent_packet(
                 state=state,
                 role=role,
                 execution_plan=execution_plan,
                 execution_packet=execution_packet,
                 project_memory=self._project_memory_snapshot(workspace_id),
+                worker_launch=worker_launch,
             )
-            backend_mode = self._subagent_backend_mode(role)
             self.store.append_task_handoff(
                 session_key=session_key,
                 workspace_id=workspace_id,
@@ -1605,9 +1702,9 @@ class CCConnectAdapter:
                     executor_session_id=agent_session_id,
                     prompt=self._prompt_with_project_context(workspace_id, prompt),
                     mode=backend_mode,
-                    transport=self.store.get_workspace(workspace_id).transport if self.store.get_workspace(workspace_id) else self._current_transport(),
+                    transport=self._transport_for_mode(workspace_id=workspace_id, mode=backend_mode, coordinated=True),
                     work_dir=self.store.get_workspace(workspace_id).path if self.store.get_workspace(workspace_id) else None,
-                    executor_override=self.executor,
+                    executor_override=self._executor_override_for_mode(backend_mode),
                     extra_env=self._bridge_extra_env(
                         session_key=session_key,
                         workspace_id=workspace_id,
@@ -1618,6 +1715,7 @@ class CCConnectAdapter:
                 item = {
                     "role": role,
                     "mode": backend_mode,
+                    "worker_launch": worker_launch,
                     "backend": result.backend,
                     "output": result.output,
                 }
@@ -1635,6 +1733,7 @@ class CCConnectAdapter:
                 item = {
                     "role": role,
                     "mode": backend_mode,
+                    "worker_launch": worker_launch,
                     "backend": "error",
                     "output": f"Execution error: {exc}",
                 }
@@ -1717,11 +1816,13 @@ class CCConnectAdapter:
         execution_plan: dict[str, Any],
         execution_packet: dict[str, Any],
         project_memory: dict[str, Any],
+        worker_launch: dict[str, Any],
     ) -> dict[str, Any]:
         read_only = bool(execution_packet.get("read_only"))
         return {
             "task": state.tasks[state.root_task_id].title,
             "subagent_role": role,
+            "worker_launch": worker_launch,
             "project_memory": project_memory,
             "execution_plan": execution_plan,
             "execution_packet": execution_packet,
@@ -1756,11 +1857,13 @@ class CCConnectAdapter:
         workspace_id: str,
         state: SwarmState,
     ) -> dict[str, Any]:
-        rows = self.store.list_recent_agent_messages(session_key, workspace_id, "claude", limit=6)
+        trigger = self._swarm_roles(workspace_id).trigger
+        rows = self.store.list_recent_agent_messages(session_key, workspace_id, trigger, limit=6)
         return {
             "task": state.tasks[state.root_task_id].title,
             "summary": self.coordinator.render_remote_summary(state),
-            "recent_claude_discussion": [f"{row['role']}: {row['text']}" for row in rows],
+            "trigger": trigger,
+            "recent_trigger_discussion": [f"{row['role']}: {row['text']}" for row in rows],
         }
 
     @staticmethod
@@ -1901,6 +2004,27 @@ class CCConnectAdapter:
         import os
 
         return (os.getenv("ASH_EXECUTOR_TRANSPORT") or "auto").strip() or "auto"
+
+    def _executor_override_for_mode(self, mode: str) -> Executor | None:
+        if self.executor is None:
+            return None
+        if isinstance(self.executor, EchoExecutor):
+            return self.executor
+        provider = str(getattr(self.executor, "provider", "") or "").strip().lower()
+        if provider and provider == mode:
+            return self.executor
+        primary = getattr(self.executor, "primary", None)
+        primary_provider = str(getattr(primary, "provider", "") or "").strip().lower()
+        if primary_provider and primary_provider == mode:
+            return self.executor
+        return None
+
+    def _transport_for_mode(self, *, workspace_id: str, mode: str, coordinated: bool) -> str:
+        workspace = self.store.get_workspace(workspace_id)
+        base_transport = workspace.transport if workspace else self._current_transport()
+        if coordinated and base_transport == "direct" and mode in {"claude", "codex"}:
+            return "auto"
+        return base_transport
 
     @staticmethod
     def _serialize_state(state: SwarmState) -> str:

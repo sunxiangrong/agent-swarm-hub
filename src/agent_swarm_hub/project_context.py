@@ -100,6 +100,12 @@ class ProjectContextStore:
 
                 CREATE INDEX IF NOT EXISTS idx_project_sessions_project
                 ON project_sessions(project_id, provider, status, last_used_at DESC);
+
+                CREATE TABLE IF NOT EXISTS dashboard_project_pins (
+                    project_id TEXT PRIMARY KEY,
+                    pinned INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
 
@@ -140,6 +146,40 @@ class ProjectContextStore:
             if project.project_id == project_id:
                 return project
         return None
+
+    def list_pinned_projects(self) -> set[str]:
+        if not self.db_path.exists():
+            return set()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT project_id
+                FROM dashboard_project_pins
+                WHERE pinned = 1
+                """
+            ).fetchall()
+        return {str(row["project_id"]).strip() for row in rows if (row["project_id"] or "").strip()}
+
+    def set_project_pinned(self, project_id: str, pinned: bool) -> None:
+        if not project_id:
+            return
+        try:
+            with self._connect() as conn:
+                if pinned:
+                    conn.execute(
+                        """
+                        INSERT INTO dashboard_project_pins (project_id, pinned, updated_at)
+                        VALUES (?, 1, CURRENT_TIMESTAMP)
+                        ON CONFLICT(project_id) DO UPDATE SET
+                            pinned = 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (project_id,),
+                    )
+                else:
+                    conn.execute("DELETE FROM dashboard_project_pins WHERE project_id = ?", (project_id,))
+        except sqlite3.Error:
+            return
 
     def get_for_workspace_path(self, workspace_path: str | None) -> ProjectContext | None:
         if not workspace_path or not self.db_path.exists():

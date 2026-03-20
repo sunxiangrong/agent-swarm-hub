@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-from agent_swarm_hub.cli import main
+from agent_swarm_hub.cli import ash_chat_main, ash_swarm_main, main
 from agent_swarm_hub.paths import ccb_lib_dir, project_session_db_path, provider_command
 
 
@@ -98,7 +98,9 @@ def test_start_chat_script_routes_to_local_native(tmp_path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     capture = tmp_path / "capture.json"
+    tmux_capture = tmp_path / "tmux.json"
     python_bin = fake_bin / "python"
+    tmux_bin = fake_bin / "tmux"
     _write_capture_executable(
         python_bin,
         f"""#!/usr/bin/env python3
@@ -107,20 +109,31 @@ with open({str(capture)!r}, "w", encoding="utf-8") as handle:
     json.dump({{"argv": sys.argv[1:], "cwd": os.getcwd(), "pythonpath": os.getenv("PYTHONPATH"), "session_db": os.getenv("ASH_SESSION_DB")}}, handle)
 """,
     )
+    _write_capture_executable(
+        tmux_bin,
+        f"""#!/usr/bin/env python3
+import json, sys
+with open({str(tmux_capture)!r}, "w", encoding="utf-8") as handle:
+    json.dump({{"argv": sys.argv[1:]}}, handle)
+""",
+    )
 
     env = {
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "CONDA_DEFAULT_ENV": "cli",
         "HOME": str(tmp_path / "home"),
+        "TMUX": "test-session",
     }
     result = subprocess.run(["/bin/bash", str(script), "codex", "agent-browser"], check=True, text=True, capture_output=True, env=env)
     payload = json.loads(capture.read_text(encoding="utf-8"))
+    tmux_payload = json.loads(tmux_capture.read_text(encoding="utf-8"))
 
     assert result.returncode == 0
     assert payload["argv"] == ["-m", "agent_swarm_hub.cli", "local-native", "--provider", "codex", "--project", "agent-browser"]
     assert payload["cwd"] == "/Users/sunxiangrong/dev/cli/git/agent-swarm-hub"
     assert payload["pythonpath"] == "src"
     assert payload["session_db"] == "var/db/agent-swarm-hub.sqlite3"
+    assert tmux_payload["argv"] == ["select-pane", "-T", "ash-chat | agent-browser | codex"]
 
 
 def test_start_swarm_script_routes_to_local_chat(tmp_path) -> None:
@@ -128,7 +141,9 @@ def test_start_swarm_script_routes_to_local_chat(tmp_path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     capture = tmp_path / "capture.json"
+    tmux_capture = tmp_path / "tmux.json"
     conda_bin = fake_bin / "conda"
+    tmux_bin = fake_bin / "tmux"
     _write_capture_executable(
         conda_bin,
         f"""#!/usr/bin/env python3
@@ -137,13 +152,23 @@ with open({str(capture)!r}, "w", encoding="utf-8") as handle:
     json.dump({{"argv": sys.argv[1:], "cwd": os.getcwd(), "pythonpath": os.getenv("PYTHONPATH"), "session_db": os.getenv("ASH_SESSION_DB")}}, handle)
 """,
     )
+    _write_capture_executable(
+        tmux_bin,
+        f"""#!/usr/bin/env python3
+import json, sys
+with open({str(tmux_capture)!r}, "w", encoding="utf-8") as handle:
+    json.dump({{"argv": sys.argv[1:]}}, handle)
+""",
+    )
 
     env = {
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "HOME": str(tmp_path / "home"),
+        "TMUX": "test-session",
     }
     result = subprocess.run(["/bin/bash", str(script), "claude", "agent-swarm-hub"], check=True, text=True, capture_output=True, env=env)
     payload = json.loads(capture.read_text(encoding="utf-8"))
+    tmux_payload = json.loads(tmux_capture.read_text(encoding="utf-8"))
 
     assert result.returncode == 0
     assert payload["argv"] == [
@@ -163,6 +188,7 @@ with open({str(capture)!r}, "w", encoding="utf-8") as handle:
     assert payload["cwd"] == "/Users/sunxiangrong/dev/cli/git/agent-swarm-hub"
     assert payload["pythonpath"] == "src"
     assert payload["session_db"] == "var/db/agent-swarm-hub.sqlite3"
+    assert tmux_payload["argv"] == ["select-pane", "-T", "ash-swarm | agent-swarm-hub | claude"]
 
 
 def test_cli_prints_lark_ws_config(monkeypatch, capsys) -> None:
@@ -190,6 +216,191 @@ def test_cli_prints_telegram_poll_config(monkeypatch, capsys) -> None:
     assert exit_code == 0
     assert "bot_token_configured" in output
     assert "True" in output
+
+
+def test_cli_runs_dashboard(monkeypatch) -> None:
+    called = {}
+
+    def fake_serve_dashboard(*, host: str, port: int) -> None:
+        called["host"] = host
+        called["port"] = port
+
+    monkeypatch.setattr("agent_swarm_hub.cli.serve_dashboard", fake_serve_dashboard)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "dashboard", "--host", "0.0.0.0", "--port", "9001"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert called == {"host": "0.0.0.0", "port": 9001}
+
+
+def test_cli_runs_dashboard_and_opens_browser(monkeypatch) -> None:
+    called = {}
+    opened = {}
+
+    def fake_serve_dashboard(*, host: str, port: int) -> None:
+        called["host"] = host
+        called["port"] = port
+
+    def fake_open_dashboard_url(*, host: str, port: int) -> None:
+        opened["host"] = host
+        opened["port"] = port
+
+    monkeypatch.setattr("agent_swarm_hub.cli.serve_dashboard", fake_serve_dashboard)
+    monkeypatch.setattr("agent_swarm_hub.cli._open_dashboard_url", fake_open_dashboard_url)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "dashboard", "--host", "127.0.0.1", "--port", "8765", "--open"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert called == {"host": "127.0.0.1", "port": 8765}
+    assert opened == {"host": "127.0.0.1", "port": 8765}
+
+
+def test_cli_without_command_prints_main_menu(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub"])
+
+    exit_code = main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "agent-swarm-hub" in output
+    assert "chat [provider] [project]" in output
+    assert "swarm [provider] [project]" in output
+    assert "dash" in output
+
+
+def test_cli_chat_shortcut_routes_to_local_native(monkeypatch) -> None:
+    called = {}
+
+    def fake_run_local_native(*, provider: str, project: str | None) -> int:
+        called["provider"] = provider
+        called["project"] = project
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli._run_local_native", fake_run_local_native)
+    monkeypatch.setattr("agent_swarm_hub.cli.load_env_file", lambda _path: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.apply_runtime_env", lambda: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.RuntimeConfig.from_env", lambda: SimpleNamespace(executor_mode="claude"))
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "chat", "codex", "agent-browser"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert called == {"provider": "codex", "project": "agent-browser"}
+
+
+def test_cli_swarm_shortcut_routes_to_local_chat(monkeypatch) -> None:
+    called = {}
+
+    def fake_run_local_chat(*, provider: str, chat_id: str, user_id: str, project: str | None) -> int:
+        called["provider"] = provider
+        called["chat_id"] = chat_id
+        called["user_id"] = user_id
+        called["project"] = project
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli._run_local_chat", fake_run_local_chat)
+    monkeypatch.setattr("agent_swarm_hub.cli.load_env_file", lambda _path: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.apply_runtime_env", lambda: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.RuntimeConfig.from_env", lambda: SimpleNamespace(executor_mode="claude"))
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "swarm", "agent-swarm-hub"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert called == {
+        "provider": "claude",
+        "chat_id": "local-cli",
+        "user_id": "local-user",
+        "project": "agent-swarm-hub",
+    }
+
+
+def test_cli_dash_shortcut_routes_to_dashboard(monkeypatch) -> None:
+    called = {}
+
+    def fake_serve_dashboard(*, host: str, port: int) -> None:
+        called["host"] = host
+        called["port"] = port
+
+    monkeypatch.setattr("agent_swarm_hub.cli.serve_dashboard", fake_serve_dashboard)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "dash", "--host", "0.0.0.0", "--port", "9001"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert called == {"host": "0.0.0.0", "port": 9001}
+
+
+def test_cli_dash_shortcut_can_open_browser(monkeypatch) -> None:
+    called = {}
+    opened = {}
+
+    def fake_serve_dashboard(*, host: str, port: int) -> None:
+        called["host"] = host
+        called["port"] = port
+
+    def fake_open_dashboard_url(*, host: str, port: int) -> None:
+        opened["host"] = host
+        opened["port"] = port
+
+    monkeypatch.setattr("agent_swarm_hub.cli.serve_dashboard", fake_serve_dashboard)
+    monkeypatch.setattr("agent_swarm_hub.cli._open_dashboard_url", fake_open_dashboard_url)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "dash", "--open"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert called == {"host": "127.0.0.1", "port": 8765}
+    assert opened == {"host": "127.0.0.1", "port": 8765}
+
+
+def test_ash_chat_entry_routes_to_local_native(monkeypatch) -> None:
+    called = {}
+
+    def fake_run_local_native(*, provider: str, project: str | None) -> int:
+        called["provider"] = provider
+        called["project"] = project
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli._run_local_native", fake_run_local_native)
+    monkeypatch.setattr("agent_swarm_hub.cli.load_env_file", lambda _path: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.apply_runtime_env", lambda: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.RuntimeConfig.from_env", lambda: SimpleNamespace(executor_mode="claude"))
+    monkeypatch.setattr("sys.argv", ["ash-chat", "codex", "agent-browser"])
+
+    exit_code = ash_chat_main()
+
+    assert exit_code == 0
+    assert called == {"provider": "codex", "project": "agent-browser"}
+
+
+def test_ash_swarm_entry_routes_to_local_chat(monkeypatch) -> None:
+    called = {}
+
+    def fake_run_local_chat(*, provider: str, chat_id: str, user_id: str, project: str | None) -> int:
+        called["provider"] = provider
+        called["chat_id"] = chat_id
+        called["user_id"] = user_id
+        called["project"] = project
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli._run_local_chat", fake_run_local_chat)
+    monkeypatch.setattr("agent_swarm_hub.cli.load_env_file", lambda _path: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.apply_runtime_env", lambda: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.RuntimeConfig.from_env", lambda: SimpleNamespace(executor_mode="claude"))
+    monkeypatch.setattr("sys.argv", ["ash-swarm", "agent-swarm-hub"])
+
+    exit_code = ash_swarm_main()
+
+    assert exit_code == 0
+    assert called == {
+        "provider": "claude",
+        "chat_id": "local-cli",
+        "user_id": "local-user",
+        "project": "agent-swarm-hub",
+    }
 
 
 def test_cli_runs_telegram_poll_forever_by_default(monkeypatch) -> None:
@@ -252,6 +463,7 @@ def test_cli_local_chat_binds_explicit_project(monkeypatch, capsys) -> None:
 
     assert exit_code == 0
     assert "Current workspace switched to `agent-swarm-hub`." in output
+    assert "just send a normal message" in output
 
 
 def test_cli_local_chat_prompts_for_project_or_temporary(monkeypatch, capsys) -> None:
@@ -266,8 +478,10 @@ def test_cli_local_chat_prompts_for_project_or_temporary(monkeypatch, capsys) ->
     output = capsys.readouterr().out
 
     assert exit_code == 0
-    assert "Available workspaces:" in output
-    assert "Temporary mode selected." in output
+    assert "Choose a project or temporary chat:" in output
+    assert "Temporary chat selected." in output
+    assert "Temporary local chat is ready." in output
+    assert "Complex tasks will automatically enter planning / coordinated swarm execution when needed." in output
 
 
 def test_cli_local_native_can_add_project_from_picker(monkeypatch, tmp_path, capsys) -> None:
@@ -322,6 +536,8 @@ def test_cli_local_chat_reprompts_for_invalid_project_selection(monkeypatch, cap
     assert exit_code == 0
     assert "Unknown project selection." in output
     assert "Current workspace switched to `agent-swarm-hub`." in output
+    assert "Chat naturally." in output
+    assert "Complex tasks will automatically enter planning / coordinated swarm execution when needed." in output
 
 
 def test_cli_local_native_launches_provider_in_workspace(monkeypatch, tmp_path) -> None:
@@ -456,6 +672,11 @@ def test_cli_local_native_resumes_shared_project_session(monkeypatch, tmp_path) 
     assert "Project summary for this session:" in captured["argv"][-1]
     assert "- Current Focus: Keep resume stable" in captured["argv"][-1]
     assert "- Current State: Native CLI entry should reuse the right conversation" in captured["argv"][-1]
+    assert "- Swarm Mode: complex tasks may automatically enter coordinated multi-agent execution" in captured["argv"][-1]
+    assert "- Current Trigger: codex" in captured["argv"][-1]
+    assert "- Swarm Orchestrator: claude (launched in tmux when coordination starts)" in captured["argv"][-1]
+    assert "- Coordination Roles: orchestrator=claude, planner=claude, executor=codex, reviewer=claude" in captured["argv"][-1]
+    assert "- Return Target: claude" in captured["argv"][-1]
 
 
 def test_cli_local_native_skips_codex_resume_when_session_file_is_missing(monkeypatch, tmp_path, capsys) -> None:
@@ -1221,6 +1442,117 @@ def test_cli_local_native_fresh_codex_run_rebinds_project_session_and_memory(mon
         "Task: Need stable project chat | State: user: Remember the current focus",
     )
     assert "Current sessions: codex=codex-session-new" in summary
+
+
+def test_cli_local_native_fresh_codex_run_syncs_workspace_runtime(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    workspace_path = tmp_path / "project"
+    workspace_path.mkdir()
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    fake_home = tmp_path / "home"
+
+    from agent_swarm_hub.session_store import SessionStore
+
+    store = SessionStore(db_path)
+    store.upsert_workspace(
+        workspace_id="project-alpha",
+        title="project-alpha",
+        path=str(workspace_path),
+        backend="codex",
+        transport="direct",
+    )
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "project-alpha",
+                "project-alpha",
+                str(workspace_path),
+                "Project alpha profile",
+                "Project: project-alpha\nCurrent focus: Keep project continuity\nRecent context: Fresh native runs should bind back automatically",
+            ),
+        )
+
+    captured = {}
+
+    def after_run(_argv, _env, _cwd) -> None:
+        _write_codex_session(fake_home, "codex-session-new", str(workspace_path))
+        _write_codex_history(fake_home, "codex-session-new", "Need stable project chat", "Remember the current focus")
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setenv("HOME", str(fake_home))
+    _patch_native_run(monkeypatch, captured, after_run=after_run)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    runtime = store.get_workspace_session("local-native:project-alpha:root", "project-alpha")
+    assert runtime is not None
+    assert runtime.executor_session_id == "codex-session-new"
+    assert runtime.codex_session_id == "codex-session-new"
+    assert runtime.claude_session_id is None
+    assert runtime.phase == "discussion"
+    assert runtime.active_task_id
+    assert runtime.swarm_state_json == ""
+    assert runtime.conversation_summary == "Task: Need stable project chat\nRecent: user: Remember the current focus"
 
 
 def test_cli_local_native_fresh_codex_run_archives_previous_project_session(monkeypatch, tmp_path) -> None:

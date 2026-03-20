@@ -88,7 +88,16 @@ ash-swarm claude
 - 项目级任务拆解和调度
 - 在一个统一命令层里看项目状态、任务和会话
 
-### 3. 远程聊天入口
+### 3. 本地 dashboard
+
+适合：
+
+- 同时查看多个项目
+- 看当前 focus / state / next step
+- 看当前绑定 session 和 runtime workspace session
+- 先观察，再决定切哪个项目继续工作
+
+### 4. 远程聊天入口
 
 适合：
 
@@ -113,11 +122,27 @@ ash-swarm claude
 ./scripts/start-chat.sh claude
 ```
 
+When run inside `tmux`, the script sets the pane title to `ash-chat | <project> | <provider>` for dashboard pane detection.
+
 ### 本地 swarm shell
 
 ```bash
 ./scripts/start-swarm.sh codex
 ./scripts/start-swarm.sh claude
+```
+
+When run inside `tmux`, the script sets the pane title to `ash-swarm | <project> | <provider>`.
+
+### 本地 dashboard
+
+```bash
+PYTHONPATH=src conda run -n cli python -m agent_swarm_hub.cli dashboard
+```
+
+默认地址：
+
+```text
+http://127.0.0.1:8765
 ```
 
 ### 远程入口
@@ -158,6 +183,16 @@ Telegram / Lark
   -> 进入 swarm shell
   -> 统一命令层
   -> task / worker / execute / sessions
+```
+
+### dashboard 工作流
+
+```text
+打开 dashboard
+  -> 看多项目总览
+  -> 看 current focus / state / next step
+  -> 看当前绑定 session 与 runtime session
+  -> 再切到 ash-chat / ash-swarm
 ```
 
 ## 当前重点能力

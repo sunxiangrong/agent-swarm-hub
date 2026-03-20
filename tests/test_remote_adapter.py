@@ -124,6 +124,13 @@ def test_parse_remote_command_supports_confirm() -> None:
     assert command.argument == ""
 
 
+def test_parse_remote_command_supports_quit() -> None:
+    command = parse_remote_command("/quit")
+
+    assert command.name == "quit"
+    assert command.argument == ""
+
+
 def test_parse_remote_command_supports_worker_and_tasks() -> None:
     worker = parse_remote_command("/worker")
     tasks = parse_remote_command("/tasks")
@@ -144,11 +151,12 @@ def test_help_includes_command_explanations(tmp_path) -> None:
         )
     )
 
-    assert "项目命令:" in response.text
-    assert "/projects  查看可用项目列表" in response.text
+    assert "主路径:" in response.text
+    assert "/use <workspace> 进入项目" in response.text
+    assert "/quit 退出当前项目模式" in response.text
     assert "/worker  查看当前 worker phase" in response.text
     assert "/confirm  当 bridge 上浮确认请求时继续执行" in response.text
-    assert "未绑定项目时" in response.text
+    assert "远程聊天默认按自然对话使用" in response.text
 
 
 def test_confirm_replays_pending_write_and_returns_result(tmp_path) -> None:
@@ -671,11 +679,30 @@ def test_use_switches_workspace_for_chat(tmp_path) -> None:
     )
 
     assert "switched to `sheep-gwas`" in response.text
+    assert "just send a normal message" in response.text
     assert "Current workspace: sheep-gwas" in where.text
     assert "Executor Session: exec-" in where.text
     assert "Claude Session: claude-" in where.text
     assert "Codex Session: codex-" in where.text
     assert "Phase: discussion" in where.text
+
+
+def test_quit_clears_workspace_binding(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=store)
+    _bind_workspace(adapter, workspace_id="sheep-gwas")
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/quit",
+        )
+    )
+
+    assert "Exited current project mode." in response.text
+    assert store.get_chat_binding("telegram:chat-1:root") is None
 
 
 def test_project_config_updates_workspace_metadata(tmp_path) -> None:
@@ -838,6 +865,9 @@ def test_execute_routes_codex_then_claude_review(tmp_path) -> None:
     assert any("Assigned Agent: codex" in prompt for prompt in executor.prompts)
     assert "Assigned Agent: claude" in executor.prompts[-1]
     assert "Phase: reported" in response.text
+    assert "Coordination: planned execution" in response.text
+    assert "Roles: trigger=claude | orchestrator=claude | planner=claude | executor=codex | reviewer=claude" in response.text
+    assert "Return Target: claude" in response.text
     assert "Execution Backend: echo" in response.text
     assert "Report Backend: echo" in response.text
     assert "Phase: reported" in status.text
@@ -889,6 +919,9 @@ def test_large_task_execute_runs_planning_before_codex(tmp_path) -> None:
     assert any("Assigned Agent: codex" in prompt and "subagent_results" in prompt for prompt in executor.prompts)
     assert "Assigned Agent: claude" in executor.prompts[-1]
     assert "Complexity: large" in response.text
+    assert "Coordination: swarm collaboration (3 sub-agent runs)" in response.text
+    assert "Roles: trigger=claude | orchestrator=claude | planner=claude | executor=codex | reviewer=claude" in response.text
+    assert "Return Target: claude" in response.text
     assert "Planning Backend: echo" in response.text
     assert "Sub-agent Runs: 3" in response.text
     handoff_types = [row["handoff_type"] for row in handoffs]
@@ -903,6 +936,103 @@ def test_large_task_execute_runs_planning_before_codex(tmp_path) -> None:
     assert any('"recent_hints"' in row["content_json"] for row in handoffs if row["handoff_type"] == "subagent_packet")
     tasks = store.list_tasks("telegram:chat-1:root", workspace_id)
     assert tasks[0].status == "completed"
+
+
+def test_codex_backed_workspace_uses_codex_as_driver_and_claude_as_planner(tmp_path) -> None:
+    class RecordingExecutor(EchoExecutor):
+        def __init__(self):
+            self.prompts = []
+
+        def run(self, prompt: str):
+            self.prompts.append(prompt)
+            return super().run(prompt)
+
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+    executor = RecordingExecutor()
+    adapter = CCConnectAdapter(executor=executor, store=store)
+    workspace_id = _bind_workspace(adapter)
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/project set-backend codex",
+        )
+    )
+
+    write_response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Design a large implementation with tests and docs",
+        )
+    )
+    execute_response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/execute Plan first, then execute with subagents if needed",
+        )
+    )
+
+    assert "Assigned Agent: codex" in executor.prompts[0]
+    assert any("Worker Phase: planning" in prompt and "Assigned Agent: claude" in prompt for prompt in executor.prompts)
+    assert "Roles: trigger=codex | orchestrator=claude | planner=claude | executor=codex | reviewer=claude" in write_response.text
+    assert "Return Target: claude" in execute_response.text
+    assert "Coordination:" in execute_response.text
+    assert write_response.task_id is not None
+
+
+def test_large_task_execute_launches_codex_worker_panes(tmp_path, monkeypatch) -> None:
+    class RecordingExecutor(EchoExecutor):
+        def __init__(self):
+            self.prompts = []
+
+        def run(self, prompt: str):
+            self.prompts.append(prompt)
+            return super().run(prompt)
+
+    launched = []
+
+    def fake_ensure_orchestrator_pane(*, project_id: str, workspace_path: str, provider: str = "claude"):
+        launched.append((project_id, workspace_path, provider))
+        return {"status": "launched", "provider": provider, "pane_id": f"%{len(launched)}"}
+
+    monkeypatch.setattr("agent_swarm_hub.adapter.ensure_orchestrator_pane", fake_ensure_orchestrator_pane)
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+    executor = RecordingExecutor()
+    adapter = CCConnectAdapter(executor=executor, store=store)
+    workspace_id = _bind_workspace(adapter)
+
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Design a multi-agent swarm architecture for a large refactor with tests and docs",
+        )
+    )
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/execute Plan the architecture, decide whether sub-agents are needed, then implement safely",
+        )
+    )
+
+    handoffs = store.list_task_handoffs("telegram:chat-1:root", workspace_id, response.task_id or "")
+    subagent_packets = [row for row in handoffs if row["handoff_type"] == "subagent_packet"]
+    subagent_results = [row for row in handoffs if row["handoff_type"] == "subagent_result"]
+
+    assert launched[0][2] == "claude"
+    assert all(item[2] == "codex" for item in launched[1:])
+    assert len(subagent_packets) == 3
+    assert len(subagent_results) == 3
+    assert all('"worker_launch"' in row["content_json"] for row in subagent_packets)
+    assert all('"worker_launch"' in row["content_json"] for row in subagent_results)
 
 
 def test_codex_prompt_loads_execution_guidance_docs(tmp_path) -> None:

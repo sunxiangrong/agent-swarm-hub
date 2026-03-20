@@ -6,10 +6,12 @@ import os
 import sqlite3
 import subprocess
 import sys
+from hashlib import sha1
 from pathlib import Path
 
 from .adapter import CCConnectAdapter
 from .config import RuntimeConfig, apply_runtime_env, load_env_file
+from .dashboard import serve_dashboard
 from .executor import build_executor_for_config
 from .lark_ws_runner import LarkWebSocketRunner
 from .project_context import ProjectContextStore
@@ -187,13 +189,14 @@ def _pick_startup_workspace(*, store: SessionStore, require_path: bool = False) 
             )
             print(f"Added project `{workspace.workspace_id}` at {workspace.path}.")
             return workspace.workspace_id
-        print("No workspaces found. Temporary mode selected.")
+        print("No workspaces found. Temporary chat selected.")
         return None
 
-    print("Available workspaces:")
+    print("Choose a project or temporary chat:")
     for index, workspace in enumerate(workspaces, start=1):
         print(f"{index}. {workspace.workspace_id} ({workspace.backend}/{workspace.transport})")
     print(f"{len(workspaces) + 1}. add-project (create a new project directory)")
+    print("Type temporary to start an unbound local chat.")
 
     prompt = "Select project by number/name, or type temporary"
     if workspaces:
@@ -219,7 +222,7 @@ def _pick_startup_workspace(*, store: SessionStore, require_path: bool = False) 
             print(f"Added project `{workspace.workspace_id}` at {workspace.path}.")
             return workspace.workspace_id
         if resolved is None:
-            print("Temporary mode selected. Use /use <workspace> later to move into a formal project.")
+            print("Temporary chat selected. Start chatting directly, or use /use <workspace> later to move into a project.")
             return None
         return resolved
 
@@ -242,7 +245,10 @@ def _run_local_chat(*, provider: str, chat_id: str, user_id: str, project: str |
         if selected_workspace:
             response = adapter.handle_message(_local_message(chat_id=chat_id, user_id=user_id, text=f"/use {selected_workspace}"))
             print(response.text)
-        print("Type /help to see unified project commands.")
+        else:
+            print("Temporary local chat is ready. Just start chatting.")
+        print("Chat naturally. Use /help for advanced commands or /quit to exit the current project/chat.")
+        print("Complex tasks will automatically enter planning / coordinated swarm execution when needed.")
 
     while True:
         try:
@@ -254,6 +260,8 @@ def _run_local_chat(*, provider: str, chat_id: str, user_id: str, project: str |
         if not text:
             continue
         if text in {"/quit", "/exit"}:
+            response = adapter.handle_message(_local_message(chat_id=chat_id, user_id=user_id, text="/quit"))
+            print(response.text)
             return 0
         response = adapter.handle_message(_local_message(chat_id=chat_id, user_id=user_id, text=text))
         print(response.text)
@@ -429,9 +437,10 @@ def _project_summary_field(summary: str, prefix: str) -> str:
     return ProjectContextStore._summary_field(summary, prefix)
 
 
-def _build_project_summary_prompt(*, workspace_id: str, work_dir: str, summary: str, snapshot: dict[str, str]) -> str:
+def _build_project_summary_prompt(*, workspace_id: str, work_dir: str, summary: str, snapshot: dict[str, str], driver_provider: str) -> str:
     focus = _project_summary_field(summary, "Current focus:") or snapshot.get("focus") or ""
     recent_context = _project_summary_field(summary, "Recent context:") or snapshot.get("recent_context") or ""
+    provider_driver = driver_provider or "claude"
     brief = ProjectContextStore.derive_session_brief(
         focus=focus,
         recent_context=recent_context,
@@ -451,6 +460,15 @@ def _build_project_summary_prompt(*, workspace_id: str, work_dir: str, summary: 
         lines.append(f"- Next Step: {brief['next_step']}")
     if brief["memory"]:
         lines.append(f"- Project Memory: {brief['memory']}")
+    lines.extend(
+        [
+            "- Swarm Mode: complex tasks may automatically enter coordinated multi-agent execution",
+            f"- Current Trigger: {provider_driver}",
+            "- Swarm Orchestrator: claude (launched in tmux when coordination starts)",
+            "- Coordination Roles: orchestrator=claude, planner=claude, executor=codex, reviewer=claude",
+            "- Return Target: claude",
+        ]
+    )
     lines.append(f"- Read first: {work_dir}/PROJECT_MEMORY.md")
     lines.append(f"- Rules file: {work_dir}/PROJECT_SKILL.md")
     lines.append("Use these project files plus this summary as the project context for the session.")
@@ -845,6 +863,52 @@ def _record_provider_binding_and_memory(
     _sync_project_memory_artifacts(context_store, project_id)
 
 
+def _sync_native_workspace_runtime(
+    *,
+    session_store: SessionStore,
+    context_store: ProjectContextStore,
+    project_id: str,
+    provider: str,
+    session_meta: dict[str, object] | None,
+    fallback_snapshot: dict[str, str],
+) -> None:
+    provider_sessions = _project_provider_sessions(
+        project_id=project_id,
+        workspace_path=str(session_meta.get("cwd") or "") if session_meta else "",
+        context_store=context_store,
+    )
+    messages = [str(item).strip() for item in (session_meta.get("messages", []) if session_meta else []) if str(item).strip()]
+    extracted = _extract_project_memory_from_messages(messages, fallback_snapshot=fallback_snapshot)
+    focus = str(extracted.get("focus") or fallback_snapshot.get("focus") or "").strip()
+    recent_context = str(extracted.get("recent_context") or fallback_snapshot.get("recent_context") or "").strip()
+    summary_lines: list[str] = []
+    if focus:
+        summary_lines.append(f"Task: {focus}")
+    if recent_context:
+        summary_lines.append(f"Recent: {recent_context}")
+    elif fallback_snapshot.get("memory"):
+        summary_lines.append(f"Recent: {fallback_snapshot['memory']}")
+    if not summary_lines:
+        summary_lines.append("Task: Native project session active")
+    active_task_id = ""
+    if focus:
+        active_task_id = sha1(f"{project_id}:{provider}:{focus}".encode("utf-8")).hexdigest()[:12]
+    phase = "discussion"
+    native_session_key = f"local-native:{project_id}:root"
+    session_store.upsert_workspace_session(
+        session_key=native_session_key,
+        workspace_id=project_id,
+        active_task_id=active_task_id or None,
+        executor_session_id=provider_sessions.get(provider) or str(session_meta.get("session_id") or "") if session_meta else provider_sessions.get(provider),
+        claude_session_id=provider_sessions.get("claude"),
+        codex_session_id=provider_sessions.get("codex"),
+        phase=phase,
+        conversation_summary="\n".join(summary_lines),
+        swarm_state_json="",
+        escalations_json="[]",
+    )
+
+
 def _backfill_workspace_provider_sessions(
     *,
     context_store: ProjectContextStore,
@@ -1107,6 +1171,7 @@ def _run_local_native(*, provider: str, project: str | None) -> int:
             work_dir=work_dir,
             summary=project_summary,
             snapshot=snapshot,
+            driver_provider=provider,
         )
         provider_sessions = _project_provider_sessions(
             project_id=workspace.workspace_id,
@@ -1195,7 +1260,71 @@ def _run_local_native(*, provider: str, project: str | None) -> int:
             session_meta=session_meta,
             fallback_snapshot=fallback_snapshot,
         )
+        _sync_native_workspace_runtime(
+            session_store=store,
+            context_store=context_store,
+            project_id=workspace.workspace_id,
+            provider=provider,
+            session_meta=session_meta,
+            fallback_snapshot=fallback_snapshot,
+        )
     return int(result.returncode)
+
+
+def _run_short_entry(*, mode: str) -> int:
+    parser = argparse.ArgumentParser(description=f"{mode} shortcut entry")
+    parser.add_argument("arg1", nargs="?", default=None)
+    parser.add_argument("arg2", nargs="?", default=None)
+    parser.add_argument(
+        "--env-file",
+        default=".env.local",
+        help="Optional local env file to load before reading config",
+    )
+    args = parser.parse_args()
+    load_env_file(args.env_file)
+    apply_runtime_env()
+    config = RuntimeConfig.from_env()
+    provider, project = _resolve_short_provider_project(arg1=args.arg1, arg2=args.arg2, config=config)
+    if mode == "chat":
+        return _run_local_native(provider=provider, project=project)
+    return _run_local_chat(
+        provider=provider,
+        chat_id="local-cli",
+        user_id="local-user",
+        project=project,
+    )
+
+
+def _print_main_menu() -> None:
+    print("agent-swarm-hub")
+    print("  chat [provider] [project]      enter native project chat")
+    print("  swarm [provider] [project]     enter local swarm shell")
+    print("  dash                           open local dashboard")
+    print("  project-sessions ...           inspect or switch bound sessions")
+    print("  lark-ws                        start Lark websocket listener")
+    print("  telegram-poll                  run Telegram polling loop")
+    print("")
+    print("Examples:")
+    print("  agent-swarm-hub chat codex agent-browser")
+    print("  agent-swarm-hub swarm claude")
+    print("  agent-swarm-hub dash")
+
+
+def _resolve_short_provider_project(
+    *,
+    arg1: str | None,
+    arg2: str | None,
+    config: RuntimeConfig,
+) -> tuple[str, str | None]:
+    explicit_provider = (arg1 or "").strip().lower()
+    if explicit_provider and explicit_provider not in {"codex", "claude"}:
+        return (config.executor_mode or "codex").strip().lower(), arg1
+    return explicit_provider or (config.executor_mode or "codex").strip().lower(), arg2
+
+
+def _open_dashboard_url(*, host: str, port: int) -> None:
+    subprocess.Popen(["open", f"http://{host}:{port}"])
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="agent-swarm-hub local runners")
@@ -1204,7 +1333,7 @@ def main() -> int:
         default=".env.local",
         help="Optional local env file to load before reading config",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
 
     lark_ws = subparsers.add_parser("lark-ws", help="Start the Lark websocket event listener")
     lark_ws.add_argument(
@@ -1236,6 +1365,20 @@ def main() -> int:
         help="Native provider to launch after project selection (defaults to ASH_EXECUTOR or codex)",
     )
     local_native.add_argument("--project", default=None, help="Optional project/workspace to enter immediately")
+    chat_short = subparsers.add_parser("chat", help="Shortcut for local-native")
+    chat_short.add_argument("provider", nargs="?", default=None)
+    chat_short.add_argument("project", nargs="?", default=None)
+    swarm_short = subparsers.add_parser("swarm", help="Shortcut for local-chat")
+    swarm_short.add_argument("provider", nargs="?", default=None)
+    swarm_short.add_argument("project", nargs="?", default=None)
+    dashboard = subparsers.add_parser("dashboard", help="Run a local read-only project dashboard")
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8765)
+    dashboard.add_argument("--open", action="store_true", help="Open the dashboard URL in the local browser")
+    dash_short = subparsers.add_parser("dash", help="Shortcut for dashboard")
+    dash_short.add_argument("--host", default="127.0.0.1")
+    dash_short.add_argument("--port", type=int, default=8765)
+    dash_short.add_argument("--open", action="store_true", help="Open the dashboard URL in the local browser")
     project_sessions = subparsers.add_parser("project-sessions", help="Manage project-mapped native sessions")
     project_sessions_sub = project_sessions.add_subparsers(dest="project_sessions_command", required=True)
     project_sessions_current = project_sessions_sub.add_parser("current", help="Show current bound sessions for a project")
@@ -1255,6 +1398,9 @@ def main() -> int:
     project_sessions_sync.add_argument("--all", action="store_true")
 
     args = parser.parse_args()
+    if not args.command:
+        _print_main_menu()
+        return 0
     load_env_file(args.env_file)
     apply_runtime_env()
 
@@ -1314,6 +1460,24 @@ def main() -> int:
         config = RuntimeConfig.from_env()
         provider = (args.provider or config.executor_mode or "codex").strip().lower()
         return _run_local_native(provider=provider, project=args.project)
+    if args.command == "chat":
+        config = RuntimeConfig.from_env()
+        provider, project = _resolve_short_provider_project(arg1=args.provider, arg2=args.project, config=config)
+        return _run_local_native(provider=provider, project=project)
+    if args.command == "swarm":
+        config = RuntimeConfig.from_env()
+        provider, project = _resolve_short_provider_project(arg1=args.provider, arg2=args.project, config=config)
+        return _run_local_chat(
+            provider=provider,
+            chat_id="local-cli",
+            user_id="local-user",
+            project=project,
+        )
+    if args.command in {"dashboard", "dash"}:
+        if args.open:
+            _open_dashboard_url(host=args.host, port=args.port)
+        serve_dashboard(host=args.host, port=args.port)
+        return 0
     if args.command == "project-sessions":
         if args.project_sessions_command == "current":
             return _project_sessions_current(args.project)
@@ -1329,3 +1493,11 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def ash_chat_main() -> int:
+    return _run_short_entry(mode="chat")
+
+
+def ash_swarm_main() -> int:
+    return _run_short_entry(mode="swarm")

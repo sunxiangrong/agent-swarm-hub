@@ -12,6 +12,8 @@ dependencies = []
 
 [project.scripts]
 agent-swarm-hub = "agent_swarm_hub.cli:main"
+ash-chat = "agent_swarm_hub.cli:ash_chat_main"
+ash-swarm = "agent_swarm_hub.cli:ash_swarm_main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

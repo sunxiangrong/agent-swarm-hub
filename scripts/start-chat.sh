@@ -27,6 +27,20 @@ fi
 
 PROVIDER="${1:-${ASH_EXECUTOR:-codex}}"
 PROJECT="${2:-}"
+PANE_PROJECT="${PROJECT:-no-project}"
+
+set_tmux_pane_title() {
+  if [[ -z "${TMUX:-}" ]]; then
+    return 0
+  fi
+  if ! command -v tmux >/dev/null 2>&1; then
+    return 0
+  fi
+  local title="$1"
+  tmux select-pane -T "$title" >/dev/null 2>&1 || true
+}
+
+set_tmux_pane_title "ash-chat | ${PANE_PROJECT} | ${PROVIDER}"
 
 echo "[agent-swarm-hub] starting native entry"
 echo "[agent-swarm-hub] provider=$PROVIDER"

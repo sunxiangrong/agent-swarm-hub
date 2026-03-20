@@ -2,6 +2,7 @@
 
 from .adapter import AdapterResponse, CCConnectAdapter
 from .config import LarkConfig, RuntimeConfig, TelegramConfig, apply_runtime_env, load_env_file
+from .dashboard import build_dashboard_snapshot, serve_dashboard
 from .escalation import EscalationDecision, EscalationPolicy
 from .executor import (
     AskExecutor,
@@ -89,8 +90,10 @@ __all__ = [
     "build_lark_text_outbound",
     "build_executor",
     "build_executor_for_config",
+    "build_dashboard_snapshot",
     "build_telegram_outbound",
     "lark_event_to_remote_message",
     "parse_remote_command",
+    "serve_dashboard",
     "telegram_update_to_remote_message",
 ]

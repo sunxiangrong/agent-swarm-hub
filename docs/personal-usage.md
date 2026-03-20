@@ -108,6 +108,8 @@ Enter a specific project directly:
 ./scripts/start-chat.sh claude agent-browser
 ```
 
+When launched inside `tmux`, `ash-chat` sets the current pane title to `ash-chat | <project> | <provider>` so the dashboard can map panes back to watched projects more reliably.
+
 Debug-only raw CLI:
 
 ```bash
@@ -159,6 +161,42 @@ What you usually do not need:
 - you usually do not need to call `local-native` directly
 - you usually do not need to manually edit `PROJECT_MEMORY.md` or `PROJECT_SKILL.md`
 - you usually do not need to run `sync-memory` after normal native usage, because `ash-chat` and `project-sessions use` already refresh memory automatically
+
+## Project Dashboard
+
+Use the local dashboard when you want overview first and execution second.
+
+Start it with:
+
+```bash
+cd /Users/sunxiangrong/dev/cli/git/agent-swarm-hub
+PYTHONPATH=src conda run -n cli python -m agent_swarm_hub.cli dashboard
+```
+
+Default address:
+
+```text
+http://127.0.0.1:8765
+```
+
+What it shows:
+
+- active projects first
+- pinned projects override active-only ordering and stay in the `Watching Now` section
+- the smallest useful set per project:
+  - current focus
+  - current state
+  - next step
+  - live summary
+  - current bound sessions
+  - active vs archived session count
+
+Current scope:
+
+- read-only
+- supports pin / unpin for deciding which projects stay in your main watch list
+- no direct session switching buttons yet
+- use `ash-chat`, `ash-swarm`, or `project-sessions use` for actual entry and switching
 
 ## When To Add A Daemon
 
