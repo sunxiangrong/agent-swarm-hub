@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,8 +13,14 @@ from .paths import ccb_lib_dir
 import json
 
 
+_CODEX_SESSION_REUSE_SKIP_CACHE: dict[str, tuple[float, bool]] = {}
+_CODEX_SESSION_REUSE_SKIP_TTL_S = 15.0
+
+
 class ExecutorError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, strategy: str = ""):
+        super().__init__(message)
+        self.strategy = strategy
 
 
 class ConfirmationRequiredError(ExecutorError):
@@ -35,6 +42,7 @@ class AuthenticationRequiredError(ExecutorError):
 class ExecutionResult:
     output: str
     backend: str
+    strategy: str = ""
 
 
 class Executor:
@@ -44,7 +52,7 @@ class Executor:
 
 class EchoExecutor(Executor):
     def run(self, prompt: str) -> ExecutionResult:
-        return ExecutionResult(output=prompt, backend="echo")
+        return ExecutionResult(output=prompt, backend="echo", strategy="echo")
 
 
 class AskExecutor(Executor):
@@ -70,14 +78,17 @@ class AskExecutor(Executor):
             env.setdefault("CCB_WORK_DIR", self.work_dir)
             env.setdefault("CCB_RUN_DIR", self.work_dir)
         env.update({key: value for key, value in self.extra_env.items() if value})
-        proc = subprocess.run(
-            [self.command, self.provider, "--foreground", "--timeout", str(self.timeout_s), prompt],
-            cwd=self.work_dir or None,
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_s + 15,
-            env=env,
-        )
+        try:
+            proc = subprocess.run(
+                [self.command, self.provider, "--foreground", "--timeout", str(self.timeout_s), prompt],
+                cwd=self.work_dir or None,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_s + 15,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ExecutorError(f"ask {self.provider} timed out after {exc.timeout} seconds", strategy="askd-session")
         marker = "[CCB_CONFIRMATION_REQUIRED]"
         auth_marker = "[CCB_AUTHENTICATION_REQUIRED]"
         stdout_text = (proc.stdout or "").strip()
@@ -105,12 +116,12 @@ class AskExecutor(Executor):
                     agent=str(payload.get("agent") or self.provider),
                 )
         if proc.returncode != 0:
-            raise ExecutorError(stderr_text or stdout_text or f"ask {self.provider} failed")
+            raise ExecutorError(stderr_text or stdout_text or f"ask {self.provider} failed", strategy="askd-session")
         output = stdout_text
         if not output:
-            raise ExecutorError(f"ask {self.provider} returned no final message")
+            raise ExecutorError(f"ask {self.provider} returned no final message", strategy="askd-session")
         print(f"[agent-swarm-hub] executor=ask provider={self.provider} completed", file=sys.stderr, flush=True)
-        return ExecutionResult(output=output, backend=self.provider)
+        return ExecutionResult(output=output, backend=self.provider, strategy="askd-session")
 
 
 class FallbackExecutor(Executor):
@@ -128,6 +139,17 @@ class FallbackExecutor(Executor):
         except ExecutorError as exc:
             print(f"[agent-swarm-hub] primary executor failed, falling back: {exc}", file=sys.stderr, flush=True)
             return self.fallback.run(prompt)
+
+
+class SkipPrimaryExecutor(Executor):
+    def __init__(self, fallback: Executor, *, label: str):
+        self.fallback = fallback
+        self.label = label
+
+    def run(self, prompt: str) -> ExecutionResult:
+        print(f"[agent-swarm-hub] executor={self.label} skipping session reuse and using direct fallback", file=sys.stderr, flush=True)
+        result = self.fallback.run(prompt)
+        return ExecutionResult(output=result.output, backend=result.backend, strategy=f"{self.label}-direct-fallback")
 
 
 def send_bridge_confirmation(*, mode: str, work_dir: str | None) -> bool:
@@ -178,16 +200,19 @@ class ClaudePrintExecutor(Executor):
         self.timeout_s = timeout_s
 
     def run(self, prompt: str) -> ExecutionResult:
-        proc = subprocess.run(
-            [self.command, "-p", "--dangerously-skip-permissions", prompt],
-            cwd=self.work_dir or None,
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_s,
-        )
+        try:
+            proc = subprocess.run(
+                [self.command, "-p", "--dangerously-skip-permissions", prompt],
+                cwd=self.work_dir or None,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ExecutorError(f"claude -p timed out after {exc.timeout} seconds", strategy="claude-direct")
         if proc.returncode != 0:
-            raise ExecutorError(proc.stderr.strip() or proc.stdout.strip() or "claude -p failed")
-        return ExecutionResult(output=proc.stdout.strip(), backend="claude")
+            raise ExecutorError(proc.stderr.strip() or proc.stdout.strip() or "claude -p failed", strategy="claude-direct")
+        return ExecutionResult(output=proc.stdout.strip(), backend="claude", strategy="claude-direct")
 
 
 class CodexExecExecutor(Executor):
@@ -200,29 +225,32 @@ class CodexExecExecutor(Executor):
         print("[agent-swarm-hub] executor=codex starting", file=sys.stderr, flush=True)
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as handle:
             output_path = handle.name
-        proc = subprocess.run(
-            [
-                self.command,
-                "exec",
-                "--skip-git-repo-check",
-                "--sandbox",
-                "workspace-write",
-                "--output-last-message",
-                output_path,
-                prompt,
-            ],
-            cwd=self.work_dir or None,
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_s,
-        )
+        try:
+            proc = subprocess.run(
+                [
+                    self.command,
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--sandbox",
+                    "workspace-write",
+                    "--output-last-message",
+                    output_path,
+                    prompt,
+                ],
+                cwd=self.work_dir or None,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ExecutorError(f"codex exec timed out after {exc.timeout} seconds", strategy="codex-direct")
         if proc.returncode != 0:
-            raise ExecutorError(proc.stderr.strip() or proc.stdout.strip() or "codex exec failed")
+            raise ExecutorError(proc.stderr.strip() or proc.stdout.strip() or "codex exec failed", strategy="codex-direct")
         output = Path(output_path).read_text(encoding="utf-8", errors="replace").strip()
         if not output:
-            raise ExecutorError("codex exec returned no final message")
+            raise ExecutorError("codex exec returned no final message", strategy="codex-direct")
         print("[agent-swarm-hub] executor=codex completed", file=sys.stderr, flush=True)
-        return ExecutionResult(output=output, backend="codex")
+        return ExecutionResult(output=output, backend="codex", strategy="codex-direct")
 
 
 def _askd_available(ask_command: str) -> bool:
@@ -234,6 +262,46 @@ def _askd_available(ask_command: str) -> bool:
         return True
     sibling = Path(ask_command).resolve().with_name("askd")
     return sibling.exists()
+
+
+def _should_skip_codex_session_reuse(work_dir: str | None) -> bool:
+    if not work_dir:
+        return False
+    cache_key = str(Path(work_dir).resolve())
+    cached = _CODEX_SESSION_REUSE_SKIP_CACHE.get(cache_key)
+    now = time.time()
+    if cached and now - cached[0] < _CODEX_SESSION_REUSE_SKIP_TTL_S:
+        return cached[1]
+    lib_dir = ccb_lib_dir()
+    if not lib_dir.exists():
+        return False
+    cwd_before = Path.cwd()
+    try:
+        os.chdir(work_dir)
+        sys.path.insert(0, str(lib_dir))
+        from caskd_session import load_project_session  # type: ignore
+
+        session = load_project_session(Path(work_dir))
+        if not session:
+            _CODEX_SESSION_REUSE_SKIP_CACHE[cache_key] = (now, False)
+            return False
+        ok, pane_or_err = session.ensure_pane()
+        if ok:
+            _CODEX_SESSION_REUSE_SKIP_CACHE[cache_key] = (now, False)
+            return False
+        text = str(pane_or_err or "")
+        should_skip = "respawn failed" in text or "Pane not alive" in text or "Session pane not available" in text
+        _CODEX_SESSION_REUSE_SKIP_CACHE[cache_key] = (now, should_skip)
+        return should_skip
+    except Exception:
+        _CODEX_SESSION_REUSE_SKIP_CACHE[cache_key] = (now, False)
+        return False
+    finally:
+        try:
+            sys.path = [p for p in sys.path if p != str(lib_dir)]
+        except Exception:
+            pass
+        os.chdir(cwd_before)
 
 
 def build_executor_for_config(
@@ -257,6 +325,8 @@ def build_executor_for_config(
                 fallback = ClaudePrintExecutor(work_dir=work_dir, timeout_s=timeout_s)
             else:
                 fallback = CodexExecExecutor(work_dir=work_dir, timeout_s=timeout_s)
+            if mode == "codex" and _should_skip_codex_session_reuse(work_dir):
+                return SkipPrimaryExecutor(fallback, label="codex")
             return FallbackExecutor(
                 primary=AskExecutor(
                     provider=mode,

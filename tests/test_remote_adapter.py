@@ -12,6 +12,7 @@ from agent_swarm_hub import (
     SessionStore,
     parse_remote_command,
 )
+from agent_swarm_hub.executor import SkipPrimaryExecutor, build_executor_for_config
 
 
 def _bind_workspace(adapter: CCConnectAdapter, *, workspace_id: str = "project-alpha") -> str:
@@ -556,6 +557,7 @@ def test_worker_and_tasks_report_project_runtime(tmp_path) -> None:
 
     assert "Sub-agent Runs:" in worker.text
     assert "Latest Handoffs:" in worker.text
+    assert "Recent Worker TMUX:" in worker.text
     assert "Recent Tasks:" in tasks.text
     assert "Build a multi-agent rollout workflow" in tasks.text
 
@@ -865,11 +867,15 @@ def test_execute_routes_codex_then_claude_review(tmp_path) -> None:
     assert any("Assigned Agent: codex" in prompt for prompt in executor.prompts)
     assert "Assigned Agent: claude" in executor.prompts[-1]
     assert "Phase: reported" in response.text
+    assert "Planning:" in response.text
+    assert "Subtasks:" in response.text
+    assert "TMUX:" in response.text
+    assert "Result:" in response.text
     assert "Coordination: planned execution" in response.text
     assert "Roles: trigger=claude | orchestrator=claude | planner=claude | executor=codex | reviewer=claude" in response.text
     assert "Return Target: claude" in response.text
-    assert "Execution Backend: echo" in response.text
-    assert "Report Backend: echo" in response.text
+    assert "- Execution Backend: echo" in response.text
+    assert "- Report Backend: echo" in response.text
     assert "Phase: reported" in status.text
     handoff_types = [row["handoff_type"] for row in handoffs]
     assert handoff_types[0] == "discussion_brief"
@@ -918,12 +924,19 @@ def test_large_task_execute_runs_planning_before_codex(tmp_path) -> None:
     assert any("Assigned Agent: codex" in prompt and "subagent_role" in prompt for prompt in executor.prompts)
     assert any("Assigned Agent: codex" in prompt and "subagent_results" in prompt for prompt in executor.prompts)
     assert "Assigned Agent: claude" in executor.prompts[-1]
+    assert "Planning:" in response.text
+    assert "Subtasks:" in response.text
+    assert "TMUX:" in response.text
+    assert "Result:" in response.text
     assert "Complexity: large" in response.text
     assert "Coordination: swarm collaboration (3 sub-agent runs)" in response.text
     assert "Roles: trigger=claude | orchestrator=claude | planner=claude | executor=codex | reviewer=claude" in response.text
     assert "Return Target: claude" in response.text
-    assert "Planning Backend: echo" in response.text
-    assert "Sub-agent Runs: 3" in response.text
+    assert "Orchestrator TMUX: claude" in response.text
+    assert "[background]" in response.text
+    assert "Worker TMUX [isolated-implementation]: codex" in response.text
+    assert "- Backend: echo" in response.text
+    assert "- Sub-agent Runs: 3" in response.text
     handoff_types = [row["handoff_type"] for row in handoffs]
     assert "execution_packet" in handoff_types
     assert handoff_types.count("subagent_packet") == 3
@@ -981,6 +994,7 @@ def test_codex_backed_workspace_uses_codex_as_driver_and_claude_as_planner(tmp_p
     assert any("Worker Phase: planning" in prompt and "Assigned Agent: claude" in prompt for prompt in executor.prompts)
     assert "Roles: trigger=codex | orchestrator=claude | planner=claude | executor=codex | reviewer=claude" in write_response.text
     assert "Return Target: claude" in execute_response.text
+    assert "Orchestrator TMUX: claude" in execute_response.text
     assert "Coordination:" in execute_response.text
     assert write_response.task_id is not None
 
@@ -995,12 +1009,25 @@ def test_large_task_execute_launches_codex_worker_panes(tmp_path, monkeypatch) -
             return super().run(prompt)
 
     launched = []
+    cleaned = []
 
     def fake_ensure_orchestrator_pane(*, project_id: str, workspace_path: str, provider: str = "claude"):
         launched.append((project_id, workspace_path, provider))
-        return {"status": "launched", "provider": provider, "pane_id": f"%{len(launched)}"}
+        return {
+            "status": "launched",
+            "launch_kind": "session",
+            "provider": provider,
+            "pane_id": f"%{len(launched)}",
+            "session_name": f"ash-{provider}-{len(launched)}",
+            "window_index": "0",
+        }
+
+    def fake_cleanup_tmux_launch(launch):
+        cleaned.append(dict(launch))
+        return {"status": "cleaned", "target": launch.get("session_name", "")}
 
     monkeypatch.setattr("agent_swarm_hub.adapter.ensure_orchestrator_pane", fake_ensure_orchestrator_pane)
+    monkeypatch.setattr("agent_swarm_hub.adapter.cleanup_tmux_launch", fake_cleanup_tmux_launch)
     store = SessionStore(tmp_path / "sessions.sqlite3")
     executor = RecordingExecutor()
     adapter = CCConnectAdapter(executor=executor, store=store)
@@ -1029,10 +1056,139 @@ def test_large_task_execute_launches_codex_worker_panes(tmp_path, monkeypatch) -
 
     assert launched[0][2] == "claude"
     assert all(item[2] == "codex" for item in launched[1:])
+    assert len(cleaned) == 3
     assert len(subagent_packets) == 3
     assert len(subagent_results) == 3
     assert all('"worker_launch"' in row["content_json"] for row in subagent_packets)
     assert all('"worker_launch"' in row["content_json"] for row in subagent_results)
+    assert all('"worker_cleanup"' in row["content_json"] for row in subagent_results)
+    assert all('"strategy"' in row["content_json"] for row in subagent_results)
+
+
+def test_large_task_execute_records_cleanup_when_worker_times_out(tmp_path, monkeypatch) -> None:
+    class RecordingExecutor(EchoExecutor):
+        def __init__(self):
+            self.prompts = []
+
+        def run(self, prompt: str):
+            self.prompts.append(prompt)
+            return super().run(prompt)
+
+    launched = []
+    cleaned = []
+
+    def fake_ensure_orchestrator_pane(*, project_id: str, workspace_path: str, provider: str = "claude"):
+        launched.append((project_id, workspace_path, provider))
+        return {
+            "status": "launched",
+            "launch_kind": "session",
+            "provider": provider,
+            "pane_id": f"%{len(launched)}",
+            "session_name": f"ash-{provider}-{len(launched)}",
+            "window_index": "0",
+        }
+
+    def fake_cleanup_tmux_launch(launch):
+        cleaned.append(dict(launch))
+        return {"status": "cleaned", "target": launch.get("session_name", "")}
+
+    monkeypatch.setattr("agent_swarm_hub.adapter.ensure_orchestrator_pane", fake_ensure_orchestrator_pane)
+    monkeypatch.setattr("agent_swarm_hub.adapter.cleanup_tmux_launch", fake_cleanup_tmux_launch)
+
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+    executor = RecordingExecutor()
+    adapter = CCConnectAdapter(executor=executor, store=store)
+    workspace_id = _bind_workspace(adapter)
+
+    original_run = adapter.worker_pool.run
+
+    def fake_run(**kwargs):
+        if kwargs.get("mode") == "codex" and kwargs.get("executor_session_id", "").startswith("isolated-implementation-"):
+            raise TimeoutError("simulated timeout")
+        return original_run(**kwargs)
+
+    monkeypatch.setattr(adapter.worker_pool, "run", fake_run)
+
+    adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/write Design a multi-agent swarm architecture for a large refactor with tests and docs",
+        )
+    )
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/execute Plan the architecture, decide whether sub-agents are needed, then implement safely",
+        )
+    )
+
+    handoffs = store.list_task_handoffs("telegram:chat-1:root", workspace_id, response.task_id or "")
+    subagent_results = [row for row in handoffs if row["handoff_type"] == "subagent_result"]
+
+    assert cleaned
+    assert subagent_results
+    assert all('"worker_cleanup"' in row["content_json"] for row in subagent_results)
+    assert any("simulated timeout" in row["content_json"] for row in subagent_results)
+    assert "Planning:" in response.text
+    assert "- Planned Sub-agents:" in response.text
+    assert "Subtasks:" in response.text
+    assert "- Sub-agent Runs:" in response.text
+    assert "Worker TMUX [isolated-implementation]" in response.text
+    assert "Worker Cleanup [isolated-implementation]" in response.text
+
+
+def test_build_executor_skips_codex_session_reuse_when_pane_is_dead(tmp_path, monkeypatch) -> None:
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+
+    monkeypatch.setenv("ASH_ASK_BIN", "/Users/sunxiangrong/.local/bin/ask")
+    monkeypatch.setattr("agent_swarm_hub.executor._askd_available", lambda ask_command: True)
+    monkeypatch.setattr("agent_swarm_hub.executor._should_skip_codex_session_reuse", lambda wd: True)
+
+    executor = build_executor_for_config(
+        mode="codex",
+        transport="auto",
+        work_dir=str(work_dir),
+    )
+
+    assert isinstance(executor, SkipPrimaryExecutor)
+
+
+def test_should_skip_codex_session_reuse_caches_recent_dead_pane_result(tmp_path, monkeypatch) -> None:
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = 0
+
+        def ensure_pane(self):
+            self.calls += 1
+            return False, "Session pane not available: Pane not alive and respawn failed"
+
+    fake_session = FakeSession()
+
+    monkeypatch.setattr("agent_swarm_hub.executor.ccb_lib_dir", lambda: work_dir)
+    monkeypatch.setattr("agent_swarm_hub.executor.Path.cwd", lambda: work_dir)
+
+    import agent_swarm_hub.executor as executor_mod
+
+    executor_mod._CODEX_SESSION_REUSE_SKIP_CACHE.clear()
+
+    import types
+
+    monkeypatch.setitem(__import__("sys").modules, "caskd_session", types.SimpleNamespace(load_project_session=lambda _: fake_session))
+
+    first = executor_mod._should_skip_codex_session_reuse(str(work_dir))
+    second = executor_mod._should_skip_codex_session_reuse(str(work_dir))
+
+    assert first is True
+    assert second is True
+    assert fake_session.calls == 1
 
 
 def test_codex_prompt_loads_execution_guidance_docs(tmp_path) -> None:

@@ -25,11 +25,17 @@ def build_dashboard_snapshot(
     swarm_by_workspace = _load_swarm_activity(session_store)
     tmux_by_workspace = load_tmux_project_panes()
     ccb_by_workspace = _load_ccb_provider_activity()
-    for project in _iter_dashboard_projects(project_store, session_store):
+    for project in _iter_dashboard_projects(
+        project_store,
+        session_store,
+        runtime_by_workspace=runtime_by_workspace,
+        tmux_by_workspace=tmux_by_workspace,
+        ccb_by_workspace=ccb_by_workspace,
+    ):
         memory = project_store.get_project_memory(project["project_id"])
         brief = project_store.derive_session_brief(
             focus=memory.get("focus", "") or project_store._summary_field(project["summary"], "Current focus:"),
-            recent_context=memory.get("recent_context", "") or project_store._summary_field(project["summary"], "Recent context:"),
+            recent_context=memory.get("recent_context", "") or project_store._summary_state(project["summary"]),
             memory=memory.get("memory", "") or project_store._summary_compact_text(project["summary"]),
             hints=memory.get("recent_hints", []),
         )
@@ -53,6 +59,28 @@ def build_dashboard_snapshot(
             has_binding=bool(current_sessions),
             has_focus=bool(brief["focus"]),
         )
+        project_summary_text = _project_summary_text(
+            focus=brief["focus"],
+            state=brief["recent_context"],
+            next_step=brief["next_step"],
+            memory=brief["memory"],
+            live_summary=live_summary,
+        )
+        memory_source_text = _memory_source_text(
+            has_stored_memory=bool(memory.get("focus") or memory.get("recent_context") or memory.get("memory") or memory.get("recent_hints")),
+            has_project_summary=bool(project["summary"]),
+            has_live_summary=bool(live_summary),
+        )
+        session_policy_text = _session_policy_text(
+            current_sessions=current_sessions,
+            recorded_sessions=recorded_sessions,
+            active_sessions=active_sessions,
+        )
+        session_overview_text = _session_overview_text(
+            current_session_line=current_session_line,
+            active_sessions=active_sessions,
+            recorded_sessions=recorded_sessions,
+        )
         project_payloads.append(
             {
                 "project_id": project["project_id"],
@@ -62,7 +90,11 @@ def build_dashboard_snapshot(
                 "state": brief["recent_context"],
                 "next_step": brief["next_step"],
                 "memory": brief["memory"],
+                "project_summary_text": project_summary_text,
+                "memory_source_text": memory_source_text,
                 "current_sessions": current_session_line,
+                "session_overview_text": session_overview_text,
+                "session_policy_text": session_policy_text,
                 "live_phase": live_phase,
                 "live_summary": live_summary,
                 "swarm_roles": roles,
@@ -82,10 +114,14 @@ def build_dashboard_snapshot(
                 "swarm_session_key": str(swarm.get("session_key") or ""),
                 "swarm_task_id": str(swarm.get("task_id") or ""),
                 "swarm_summary": str(swarm.get("summary") or ""),
+                "swarm_planner_summary": str(swarm.get("planner_summary") or ""),
+                "swarm_planned_subagents": list(swarm.get("planned_subagents") or []),
                 "swarm_orchestrator_launch": dict(swarm.get("orchestrator_launch") or {}),
                 "swarm_handoff_count": int(swarm.get("handoff_count") or 0),
                 "swarm_agent_count": int(swarm.get("agent_count") or 0),
                 "swarm_agents": list(swarm.get("agents") or []),
+                "swarm_worker_agents": [item for item in list(swarm.get("agents") or []) if item.get("name") != "verification"],
+                "swarm_verification_agents": [item for item in list(swarm.get("agents") or []) if item.get("name") == "verification"],
                 "ccb_live_providers": ccb_live,
                 "ccb_live_count": len(ccb_live),
                 "tmux_panes": tmux_panes,
@@ -111,10 +147,27 @@ def build_dashboard_snapshot(
     }
 
 
-def _iter_dashboard_projects(project_store: ProjectContextStore, session_store: SessionStore) -> list[dict[str, str]]:
+def _iter_dashboard_projects(
+    project_store: ProjectContextStore,
+    session_store: SessionStore,
+    *,
+    runtime_by_workspace: dict[str, list[dict[str, Any]]],
+    tmux_by_workspace: dict[str, list[dict[str, Any]]],
+    ccb_by_workspace: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, str]]:
     payload: list[dict[str, str]] = []
     known: set[str] = set()
     for project in project_store.list_projects():
+        if not _should_include_dashboard_project(
+            project_id=project.project_id,
+            workspace_path=project.workspace_path,
+            project_store=project_store,
+            session_store=session_store,
+            runtime_by_workspace=runtime_by_workspace,
+            tmux_by_workspace=tmux_by_workspace,
+            ccb_by_workspace=ccb_by_workspace,
+        ):
+            continue
         payload.append(
             {
                 "project_id": project.project_id,
@@ -128,6 +181,16 @@ def _iter_dashboard_projects(project_store: ProjectContextStore, session_store: 
     for workspace in session_store.list_workspaces():
         if workspace.workspace_id in known:
             continue
+        if not _should_include_dashboard_project(
+            project_id=workspace.workspace_id,
+            workspace_path=workspace.path,
+            project_store=project_store,
+            session_store=session_store,
+            runtime_by_workspace=runtime_by_workspace,
+            tmux_by_workspace=tmux_by_workspace,
+            ccb_by_workspace=ccb_by_workspace,
+        ):
+            continue
         payload.append(
             {
                 "project_id": workspace.workspace_id,
@@ -138,6 +201,30 @@ def _iter_dashboard_projects(project_store: ProjectContextStore, session_store: 
             }
         )
     return payload
+
+
+def _should_include_dashboard_project(
+    *,
+    project_id: str,
+    workspace_path: str,
+    project_store: ProjectContextStore,
+    session_store: SessionStore,
+    runtime_by_workspace: dict[str, list[dict[str, Any]]],
+    tmux_by_workspace: dict[str, list[dict[str, Any]]],
+    ccb_by_workspace: dict[str, list[dict[str, Any]]],
+) -> bool:
+    _ = (project_id, project_store, session_store, runtime_by_workspace, tmux_by_workspace, ccb_by_workspace)
+    return _workspace_path_exists(workspace_path)
+
+
+def _workspace_path_exists(path: str) -> bool:
+    raw = str(path or "").strip()
+    if not raw:
+        return False
+    try:
+        return Path(raw).expanduser().exists()
+    except OSError:
+        return False
 
 
 def _load_runtime_sessions(session_store: SessionStore) -> dict[str, list[dict[str, Any]]]:
@@ -174,6 +261,66 @@ def _load_runtime_sessions(session_store: SessionStore) -> dict[str, list[dict[s
     return grouped
 
 
+def _project_summary_text(*, focus: str, state: str, next_step: str, memory: str, live_summary: str) -> str:
+    parts: list[str] = []
+    if focus:
+        parts.append(f"Focus: {focus}")
+    if state:
+        parts.append(f"State: {state}")
+    if next_step:
+        parts.append(f"Next: {next_step}")
+    if memory:
+        parts.append(f"Memory: {memory}")
+    if not parts and live_summary:
+        parts.append(f"Live: {live_summary}")
+    return " | ".join(parts[:4])
+
+
+def _memory_source_text(*, has_stored_memory: bool, has_project_summary: bool, has_live_summary: bool) -> str:
+    if has_stored_memory:
+        return "Primary source: stored project memory. Synced into projects.summary and PROJECT_MEMORY.md."
+    if has_project_summary:
+        return "Primary source: structured project summary. Sync memory to make it durable."
+    if has_live_summary:
+        return "Primary source: live runtime summary. Sync memory to promote it into durable project memory."
+    return "No durable project memory yet."
+
+
+def _session_policy_text(
+    *,
+    current_sessions: dict[str, str],
+    recorded_sessions: list[dict[str, Any]],
+    active_sessions: list[dict[str, Any]],
+) -> str:
+    active_count = len(active_sessions)
+    archived_count = max(len(recorded_sessions) - active_count, 0)
+    if current_sessions:
+        return (
+            f"Default resume uses current provider bindings ({len(current_sessions)} bound). "
+            f"Recorded sessions: {active_count} active / {archived_count} archived. "
+            "Switching a provider binding archives older same-provider sessions."
+        )
+    if recorded_sessions:
+        return (
+            f"No current binding. Recorded sessions: {active_count} active / {archived_count} archived. "
+            "The next bind will choose the default resume session per provider."
+        )
+    return "No recorded provider sessions yet."
+
+
+def _session_overview_text(
+    *,
+    current_session_line: str,
+    active_sessions: list[dict[str, Any]],
+    recorded_sessions: list[dict[str, Any]],
+) -> str:
+    active_count = len(active_sessions)
+    archived_count = max(len(recorded_sessions) - active_count, 0)
+    if current_session_line:
+        return f"Current bindings: {current_session_line}. Recorded: {active_count} active / {archived_count} archived."
+    return f"Recorded sessions: {active_count} active / {archived_count} archived."
+
+
 def _load_swarm_activity(session_store: SessionStore) -> dict[str, dict[str, Any]]:
     db_path = session_store.db_path
     if not db_path.exists():
@@ -207,11 +354,14 @@ def _load_swarm_activity(session_store: SessionStore) -> dict[str, dict[str, Any
                 """,
                 (session_key, workspace_id, task_id),
             ).fetchall() if task_id else []
+            planner_summary, planned_subagents = _extract_execution_plan(handoffs)
             payload[workspace_id] = {
                 "active": True,
                 "session_key": session_key,
                 "task_id": task_id,
                 "summary": _compact_text(str(row["conversation_summary"] or "").strip(), 180),
+                "planner_summary": planner_summary,
+                "planned_subagents": planned_subagents,
                 "orchestrator_launch": _extract_orchestrator_launch(str(row["conversation_summary"] or "").strip()),
                 "handoff_count": len(handoffs),
                 "agent_count": 0,
@@ -321,9 +471,12 @@ def _summarize_swarm_agents(handoffs: list[sqlite3.Row]) -> list[dict[str, Any]]
                     "name": target_agent,
                     "status": "pending",
                     "backend": "",
+                    "strategy": "",
                     "summary": "",
                     "launch_status": "",
                     "launch_pane_id": "",
+                    "cleanup_status": "",
+                    "cleanup_target": "",
                 },
             )
             item["summary"] = _compact_text(str(content.get("task") or content.get("instructions") or item["summary"]), 120)
@@ -333,6 +486,7 @@ def _summarize_swarm_agents(handoffs: list[sqlite3.Row]) -> list[dict[str, Any]]
                 item["launch_pane_id"] = str(worker_launch.get("pane_id") or item.get("launch_pane_id") or "")
         elif handoff_type == "subagent_result" and source_agent:
             backend = str(content.get("backend") or "").strip()
+            strategy = str(content.get("strategy") or "").strip()
             output = _compact_text(str(content.get("output") or "").strip(), 120)
             item = agents.setdefault(
                 source_agent,
@@ -340,18 +494,26 @@ def _summarize_swarm_agents(handoffs: list[sqlite3.Row]) -> list[dict[str, Any]]
                     "name": source_agent,
                     "status": "completed",
                     "backend": backend,
+                    "strategy": strategy,
                     "summary": output,
                     "launch_status": "",
                     "launch_pane_id": "",
+                    "cleanup_status": "",
+                    "cleanup_target": "",
                 },
             )
             item["backend"] = backend or item.get("backend", "")
+            item["strategy"] = strategy or item.get("strategy", "")
             item["summary"] = output or item.get("summary", "")
             item["status"] = "failed" if backend == "error" or output.lower().startswith("execution error") else "completed"
             worker_launch = content.get("worker_launch")
             if isinstance(worker_launch, dict):
                 item["launch_status"] = str(worker_launch.get("status") or item.get("launch_status") or "")
                 item["launch_pane_id"] = str(worker_launch.get("pane_id") or item.get("launch_pane_id") or "")
+            worker_cleanup = content.get("worker_cleanup")
+            if isinstance(worker_cleanup, dict):
+                item["cleanup_status"] = str(worker_cleanup.get("status") or item.get("cleanup_status") or "")
+                item["cleanup_target"] = str(worker_cleanup.get("target") or item.get("cleanup_target") or "")
         elif handoff_type == "verification_packet":
             item = agents.setdefault(
                 "verification",
@@ -359,7 +521,12 @@ def _summarize_swarm_agents(handoffs: list[sqlite3.Row]) -> list[dict[str, Any]]
                     "name": "verification",
                     "status": "running",
                     "backend": target_agent or "codex",
+                    "strategy": "",
                     "summary": "Verification requested.",
+                    "launch_status": "",
+                    "launch_pane_id": "",
+                    "cleanup_status": "",
+                    "cleanup_target": "",
                 },
             )
             item["backend"] = target_agent or item.get("backend", "")
@@ -372,13 +539,30 @@ def _summarize_swarm_agents(handoffs: list[sqlite3.Row]) -> list[dict[str, Any]]
                     "name": "verification",
                     "status": "completed",
                     "backend": backend or source_agent,
+                    "strategy": "",
                     "summary": output,
+                    "launch_status": "",
+                    "launch_pane_id": "",
+                    "cleanup_status": "",
+                    "cleanup_target": "",
                 },
             )
             item["backend"] = backend or source_agent or item.get("backend", "")
             item["summary"] = output or item.get("summary", "")
             item["status"] = "failed" if backend == "error" or output.lower().startswith("execution error") else "completed"
     return list(agents.values())
+
+
+def _extract_execution_plan(handoffs: list[sqlite3.Row]) -> tuple[str, list[str]]:
+    for row in handoffs:
+        if str(row["handoff_type"] or "").strip() != "execution_plan":
+            continue
+        content = _parse_content_json(str(row["content_json"] or ""))
+        planner_summary = _compact_text(str(content.get("planner_output") or "").strip(), 240)
+        raw_subagents = content.get("suggested_subagents") or []
+        planned_subagents = [str(item).strip() for item in raw_subagents if str(item).strip()]
+        return planner_summary, planned_subagents
+    return "", []
 
 
 def _extract_orchestrator_launch(summary: str) -> dict[str, Any]:

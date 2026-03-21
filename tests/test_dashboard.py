@@ -112,6 +112,10 @@ def test_build_dashboard_snapshot_includes_project_memory_and_runtime(tmp_path) 
     assert project["focus"] == "chrome会做的更好吗"
     assert project["next_step"] == "整理项目级长期记忆"
     assert project["current_sessions"] == "codex: codex-current"
+    assert "Focus: chrome会做的更好吗" in project["project_summary_text"]
+    assert "Current bindings: codex: codex-current" in project["session_overview_text"]
+    assert "stored project memory" in project["memory_source_text"]
+    assert "Switching a provider binding archives older same-provider sessions." in project["session_policy_text"]
     assert project["status"] == "discussion"
     assert project["live_phase"] == "discussion"
     assert "只读 dashboard" in project["live_summary"]
@@ -339,6 +343,21 @@ def test_build_dashboard_snapshot_includes_swarm_activity(tmp_path) -> None:
         session_key="local-cli",
         workspace_id="agent-browser",
         task_id="task-1",
+        handoff_type="execution_plan",
+        source_agent="claude",
+        target_agent="worker",
+        content_json=json.dumps(
+            {
+                "planner_output": "Plan visibility work, then delegate dashboard analysis and synthesis.",
+                "suggested_subagents": ["researcher", "verification"],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    session_store.append_task_handoff(
+        session_key="local-cli",
+        workspace_id="agent-browser",
+        task_id="task-1",
         handoff_type="subagent_packet",
         source_agent="worker",
         target_agent="researcher",
@@ -360,8 +379,10 @@ def test_build_dashboard_snapshot_includes_swarm_activity(tmp_path) -> None:
         content_json=json.dumps(
             {
                 "backend": "codex",
+                "strategy": "codex-direct-fallback",
                 "output": "Found missing swarm agent visibility in dashboard.",
                 "worker_launch": {"status": "existing", "pane_id": "%2"},
+                "worker_cleanup": {"status": "cleaned", "target": "ash-codex-2"},
             },
             ensure_ascii=False,
         ),
@@ -377,7 +398,9 @@ def test_build_dashboard_snapshot_includes_swarm_activity(tmp_path) -> None:
     assert project["swarm_session_key"] == "local-cli"
     assert project["swarm_task_id"] == "task-1"
     assert project["swarm_agent_count"] == 1
-    assert project["swarm_handoff_count"] == 2
+    assert project["swarm_handoff_count"] == 3
+    assert "Plan visibility work" in project["swarm_planner_summary"]
+    assert project["swarm_planned_subagents"] == ["researcher", "verification"]
     assert project["swarm_roles"]["trigger"] == "claude"
     assert project["swarm_roles"]["orchestrator"] == "claude"
     assert project["swarm_roles"]["executor"] == "codex"
@@ -385,8 +408,12 @@ def test_build_dashboard_snapshot_includes_swarm_activity(tmp_path) -> None:
     assert project["swarm_orchestrator_launch"]["status"] == "launched"
     assert project["swarm_agents"][0]["name"] == "researcher"
     assert project["swarm_agents"][0]["status"] == "completed"
+    assert project["swarm_agents"][0]["strategy"] == "codex-direct-fallback"
     assert project["swarm_agents"][0]["launch_status"] == "existing"
     assert project["swarm_agents"][0]["launch_pane_id"] == "%2"
+    assert project["swarm_agents"][0]["cleanup_status"] == "cleaned"
+    assert project["swarm_agents"][0]["cleanup_target"] == "ash-codex-2"
+    assert project["swarm_worker_agents"][0]["name"] == "researcher"
 
 
 def test_build_dashboard_snapshot_maps_driver_to_tmux_pane(monkeypatch, tmp_path) -> None:
@@ -483,6 +510,26 @@ def test_build_dashboard_snapshot_maps_driver_to_tmux_pane(monkeypatch, tmp_path
     assert project["driver_tmux_session_name"] == "ash"
     assert project["driver_tmux_window_index"] == "0"
     assert "claude" in project["driver_tmux_title"].lower()
+
+
+def test_build_dashboard_snapshot_hides_stale_missing_workspace_without_activity(tmp_path) -> None:
+    project_db = tmp_path / "projects.sqlite3"
+    session_db = tmp_path / "runtime.sqlite3"
+    session_store = SessionStore(session_db)
+    session_store.upsert_workspace(
+        workspace_id="deleted-project",
+        title="deleted-project",
+        path=str(tmp_path / "missing-project"),
+        backend="claude",
+        transport="direct",
+    )
+
+    payload = build_dashboard_snapshot(
+        project_store=ProjectContextStore(str(project_db)),
+        session_store=session_store,
+    )
+
+    assert all(project["project_id"] != "deleted-project" for project in payload["projects"])
 
 
 def test_build_dashboard_snapshot_includes_live_ccb_providers(monkeypatch, tmp_path) -> None:

@@ -126,10 +126,17 @@ Current native project flow:
 - after native CLI exits, it writes back project memory and refreshes project summary files
 - if a new session becomes the current binding, older sessions for the same project and provider are archived automatically
 
+Project memory model:
+
+- `project_memory` in the database is the only long-term memory source of truth
+- `workspace_sessions` is live runtime state, not durable memory
+- `provider_bindings` and `project_sessions` only manage session resume/switching
+- `projects.summary`, `PROJECT_MEMORY.md`, and `PROJECT_SKILL.md` are generated views
+
 Project memory files:
 
-- `<project>/PROJECT_MEMORY.md`: durable project memory snapshot
-- `<project>/PROJECT_SKILL.md`: startup and memory handling rules for the project
+- `<project>/PROJECT_MEMORY.md`: generated memory view exported from the database
+- `<project>/PROJECT_SKILL.md`: generated project rules/startup view
 
 Manual maintenance commands:
 
@@ -152,9 +159,9 @@ When to use them:
 What the startup summary means:
 
 - `Current Focus`: stable task direction
-- `Current State`: latest useful progress, not just the last utterance
+- `Current State`: latest useful progress; this is the current state view of project memory
 - `Next Step`: only shown when it adds information beyond focus and state
-- `Project Memory`: compact long-term reminder when that is more useful than repeating the last hint
+- `Project Memory`: compact long-term reminder exported from `project_memory`
 
 What you usually do not need:
 
@@ -183,13 +190,11 @@ What it shows:
 
 - active projects first
 - pinned projects override active-only ordering and stay in the `Watching Now` section
-- the smallest useful set per project:
-  - current focus
-  - current state
-  - next step
-  - live summary
-  - current bound sessions
-  - active vs archived session count
+- three top-level blocks per project:
+  - `Project Memory`
+  - `Current Run`
+  - `Sessions`
+- detailed session and swarm state remain below those blocks
 
 Current scope:
 

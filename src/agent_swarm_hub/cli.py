@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from hashlib import sha1
 from pathlib import Path
 
@@ -236,6 +237,11 @@ def _run_local_chat(*, provider: str, chat_id: str, user_id: str, project: str |
         ),
         store=store,
     )
+    local_session_key = _local_message(chat_id=chat_id, user_id=user_id, text="").session_key
+    checkpoint_interval = max(1, int((os.getenv("ASH_MEMORY_CHECKPOINT_INTERVAL") or "8").strip() or "8"))
+    checkpoint_interval_s = max(30, int((os.getenv("ASH_MEMORY_CHECKPOINT_SECONDS") or "600").strip() or "600"))
+    handled_messages = 0
+    last_checkpoint_at = time.monotonic()
     if project:
         response = adapter.handle_message(_local_message(chat_id=chat_id, user_id=user_id, text=f"/use {project}"))
         print(response.text)
@@ -253,8 +259,13 @@ def _run_local_chat(*, provider: str, chat_id: str, user_id: str, project: str |
     while True:
         try:
             line = input("> ")
+        except KeyboardInterrupt:
+            print()
+            _finalize_local_chat_memory(adapter=adapter, chat_id=chat_id, user_id=user_id, session_key=local_session_key)
+            return 130
         except EOFError:
             print()
+            _finalize_local_chat_memory(adapter=adapter, chat_id=chat_id, user_id=user_id, session_key=local_session_key)
             return 0
         text = line.strip()
         if not text:
@@ -265,6 +276,55 @@ def _run_local_chat(*, provider: str, chat_id: str, user_id: str, project: str |
             return 0
         response = adapter.handle_message(_local_message(chat_id=chat_id, user_id=user_id, text=text))
         print(response.text)
+        handled_messages += 1
+        now = time.monotonic()
+        if handled_messages % checkpoint_interval == 0 or (now - last_checkpoint_at) >= checkpoint_interval_s:
+            _checkpoint_local_chat_memory(adapter=adapter, chat_id=chat_id, user_id=user_id, session_key=local_session_key)
+            last_checkpoint_at = now
+
+
+def _checkpoint_local_chat_memory(*, adapter: CCConnectAdapter, chat_id: str, user_id: str, session_key: str) -> None:
+    workspace_id = adapter._get_bound_workspace(_local_message(chat_id=chat_id, user_id=user_id, text=""))  # type: ignore[attr-defined]
+    if not workspace_id:
+        return
+    try:
+        adapter._sync_project_memory(session_key=session_key, workspace_id=workspace_id)  # type: ignore[attr-defined]
+        _consolidate_bound_workspace_memory(adapter=adapter, session_key=session_key, workspace_id=workspace_id)
+    except Exception:
+        return
+    print(f"[agent-swarm-hub] memory checkpoint synced for `{workspace_id}`")
+
+
+def _finalize_local_chat_memory(*, adapter: CCConnectAdapter, chat_id: str, user_id: str, session_key: str) -> None:
+    workspace_id = adapter._get_bound_workspace(_local_message(chat_id=chat_id, user_id=user_id, text=""))  # type: ignore[attr-defined]
+    if not workspace_id:
+        return
+    try:
+        response = adapter.handle_message(_local_message(chat_id=chat_id, user_id=user_id, text="/quit"))
+        print(response.text)
+    except Exception:
+        try:
+            adapter._sync_project_memory(session_key=session_key, workspace_id=workspace_id)  # type: ignore[attr-defined]
+            _consolidate_bound_workspace_memory(adapter=adapter, session_key=session_key, workspace_id=workspace_id)
+            print(f"[agent-swarm-hub] finalized project memory for `{workspace_id}`")
+        except Exception:
+            return
+
+
+def _consolidate_bound_workspace_memory(*, adapter: CCConnectAdapter, session_key: str, workspace_id: str) -> None:
+    project_id = adapter._resolve_shared_project_id(workspace_id)  # type: ignore[attr-defined]
+    if not project_id:
+        return
+    memory_key = adapter._memory_key(session_key, workspace_id)  # type: ignore[attr-defined]
+    recent_rows = adapter.store.list_recent_messages(memory_key, limit=6)
+    recent_messages = [f"{row['role']}: {row['text']}" for row in recent_rows if (row["text"] or "").strip()]
+    workspace_session = adapter.store.get_workspace_session(session_key, workspace_id)
+    live_summary = workspace_session.conversation_summary if workspace_session and workspace_session.conversation_summary else ""
+    adapter.project_context_store.consolidate_project_memory(
+        project_id,
+        live_summary=live_summary,
+        recent_messages=recent_messages,
+    )
 
 
 def _resolve_workspace_record(*, store: SessionStore, workspace_id: str | None, provider: str) -> WorkspaceRecord | None:
@@ -424,7 +484,7 @@ def _build_memory_summary(*, snapshot: dict[str, str]) -> str:
     if snapshot.get("focus"):
         parts.append(f"focus={snapshot['focus']}")
     if snapshot.get("recent_context"):
-        parts.append(f"context={snapshot['recent_context']}")
+        parts.append(f"current_state={snapshot['recent_context']}")
     elif snapshot.get("memory"):
         parts.append(f"memory={snapshot['memory']}")
     hints = [item for item in snapshot.get("recent_hints", []) if item]
@@ -439,7 +499,7 @@ def _project_summary_field(summary: str, prefix: str) -> str:
 
 def _build_project_summary_prompt(*, workspace_id: str, work_dir: str, summary: str, snapshot: dict[str, str], driver_provider: str) -> str:
     focus = _project_summary_field(summary, "Current focus:") or snapshot.get("focus") or ""
-    recent_context = _project_summary_field(summary, "Recent context:") or snapshot.get("recent_context") or ""
+    recent_context = ProjectContextStore._summary_state(summary) or snapshot.get("recent_context") or ""
     provider_driver = driver_provider or "claude"
     brief = ProjectContextStore.derive_session_brief(
         focus=focus,
@@ -488,12 +548,12 @@ def _print_project_entry_view(
     print(f"[agent-swarm-hub] project={workspace_id}")
     print(f"[agent-swarm-hub] path={work_dir}")
     focus = _project_summary_field(project_summary, "Current focus:") or snapshot.get("focus") or ""
-    recent_context = _project_summary_field(project_summary, "Recent context:") or snapshot.get("recent_context") or ""
+    recent_context = ProjectContextStore._summary_state(project_summary) or snapshot.get("recent_context") or ""
     compact_summary = ProjectContextStore._summary_compact_text(project_summary) or snapshot.get("memory") or ""
     if focus:
         print(f"[agent-swarm-hub] focus={focus}")
     if recent_context:
-        print(f"[agent-swarm-hub] recent_context={recent_context}")
+        print(f"[agent-swarm-hub] current_state={recent_context}")
     elif compact_summary:
         print(f"[agent-swarm-hub] summary={compact_summary}")
     if resume_session_id:
@@ -503,6 +563,9 @@ def _print_project_entry_view(
 
 
 def _confirm_project_entry(*, provider: str) -> None:
+    if str(os.getenv("ASH_AUTO_ENTER_NATIVE") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        print(f"[agent-swarm-hub] auto-enter native {provider} CLI")
+        return
     print(f"Press Enter to enter native {provider} CLI...")
     input()
 
@@ -610,6 +673,7 @@ def _inject_project_memory_env(
     env["ASH_PROJECT_MEMORY_WORKSPACE"] = snapshot["workspace"]
     env["ASH_PROJECT_MEMORY_PROFILE"] = snapshot["profile"]
     env["ASH_PROJECT_MEMORY_FOCUS"] = snapshot["focus"]
+    env["ASH_PROJECT_MEMORY_CURRENT_STATE"] = snapshot["recent_context"]
     env["ASH_PROJECT_MEMORY_RECENT_CONTEXT"] = snapshot["recent_context"]
     env["ASH_PROJECT_MEMORY_SUMMARY"] = snapshot["memory"]
     env["ASH_PROJECT_MEMORY_HINTS"] = " || ".join(snapshot["recent_hints"])
@@ -860,7 +924,12 @@ def _record_provider_binding_and_memory(
         memory=memory,
         recent_hints=hints or fallback_snapshot.get("recent_hints", []),
     )
-    _sync_project_memory_artifacts(context_store, project_id)
+    _consolidate_project_memory_artifacts(
+        context_store,
+        project_id,
+        live_summary=" | ".join(messages[-3:]) if messages else "",
+        recent_messages=messages,
+    )
 
 
 def _sync_native_workspace_runtime(
@@ -1097,6 +1166,22 @@ def _sync_project_memory_artifacts(store: ProjectContextStore, project_id: str) 
     store.sync_project_skill_file(project_id)
 
 
+def _consolidate_project_memory_artifacts(
+    store: ProjectContextStore,
+    project_id: str,
+    *,
+    live_summary: str = "",
+    recent_messages: list[str] | None = None,
+) -> bool:
+    ok = store.consolidate_project_memory(
+        project_id,
+        live_summary=live_summary,
+        recent_messages=recent_messages,
+    )
+    _sync_project_memory_artifacts(store, project_id)
+    return ok
+
+
 def _project_sessions_sync_memory(project_id: str | None, *, sync_all: bool) -> int:
     store = ProjectContextStore()
     if sync_all:
@@ -1105,7 +1190,7 @@ def _project_sessions_sync_memory(project_id: str | None, *, sync_all: bool) -> 
             print("No projects recorded.")
             return 0
         for project in projects:
-            _sync_project_memory_artifacts(store, project.project_id)
+            _consolidate_project_memory_artifacts(store, project.project_id)
             print(f"Synced project memory for `{project.project_id}`.")
         return 0
     if not project_id:
@@ -1115,8 +1200,26 @@ def _project_sessions_sync_memory(project_id: str | None, *, sync_all: bool) -> 
     if project is None:
         print(f"Unknown project: {project_id}", file=sys.stderr)
         return 2
-    _sync_project_memory_artifacts(store, project_id)
+    _consolidate_project_memory_artifacts(store, project_id)
     print(f"Synced project memory for `{project_id}`.")
+    return 0
+
+
+def _project_sessions_remove_project(project_id: str) -> int:
+    project_id = (project_id or "").strip()
+    if not project_id:
+        print("Provide a project id.", file=sys.stderr)
+        return 2
+    project_store = ProjectContextStore()
+    session_store = SessionStore()
+    project_exists = project_store.get_project(project_id) is not None
+    workspace_exists = session_store.get_workspace(project_id) is not None
+    if not project_exists and not workspace_exists:
+        print(f"Unknown project/workspace: {project_id}", file=sys.stderr)
+        return 2
+    session_store.remove_workspace(project_id)
+    project_store.remove_project(project_id)
+    print(f"Removed stale project records for `{project_id}`.")
     return 0
 
 
@@ -1244,7 +1347,14 @@ def _run_local_native(*, provider: str, project: str | None) -> int:
         work_dir=work_dir,
         bootstrap_prompt=bootstrap_prompt,
     )
-    result = subprocess.run(argv, env=env, cwd=work_dir, check=False)
+    return_code = 0
+    try:
+        result = subprocess.run(argv, env=env, cwd=work_dir, check=False)
+        return_code = int(result.returncode)
+    except KeyboardInterrupt:
+        print()
+        print(f"[agent-swarm-hub] interrupt received; finalizing project memory for `{workspace.workspace_id}`..." if workspace is not None else "[agent-swarm-hub] interrupt received; exiting native session...")
+        return_code = 130
     if workspace is not None and context_store is not None:
         session_meta = _select_postrun_session(
             provider=provider,
@@ -1268,7 +1378,7 @@ def _run_local_native(*, provider: str, project: str | None) -> int:
             session_meta=session_meta,
             fallback_snapshot=fallback_snapshot,
         )
-    return int(result.returncode)
+    return return_code
 
 
 def _run_short_entry(*, mode: str) -> int:
@@ -1396,6 +1506,11 @@ def main() -> int:
     )
     project_sessions_sync.add_argument("project", nargs="?")
     project_sessions_sync.add_argument("--all", action="store_true")
+    project_sessions_remove = project_sessions_sub.add_parser(
+        "remove-project",
+        help="Remove a project/workspace and its stale runtime/session records",
+    )
+    project_sessions_remove.add_argument("project")
 
     args = parser.parse_args()
     if not args.command:
@@ -1487,6 +1602,8 @@ def main() -> int:
             return _project_sessions_use(args.project, args.provider.strip().lower(), args.session_id.strip())
         if args.project_sessions_command == "sync-memory":
             return _project_sessions_sync_memory(args.project, sync_all=args.all)
+        if args.project_sessions_command == "remove-project":
+            return _project_sessions_remove_project(args.project)
 
     return 1
 

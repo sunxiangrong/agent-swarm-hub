@@ -14,7 +14,7 @@ from .project_context import ProjectContextStore
 from .remote import RemoteMessage, parse_remote_command
 from .session_store import SessionStore
 from .swarm import SwarmCoordinator, SwarmState
-from .swarm_launch import ensure_orchestrator_pane
+from .swarm_launch import cleanup_tmux_launch, ensure_orchestrator_pane
 from .swarm_roles import SwarmRoles, resolve_swarm_roles
 from .worker_session import LocalExecutorSessionPool
 
@@ -46,6 +46,13 @@ CODEX_FIRST_HINTS = {
     "报错",
     "文件",
 }
+
+
+def _compact_text(value: str, limit: int) -> str:
+    text = " ".join((value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
 
 
 @dataclass(slots=True)
@@ -600,26 +607,19 @@ class CCConnectAdapter:
                     verification_result=verification_result.output if verification_result else "Verification skipped or failed to run.",
                 ),
             )
-            text = "".join(
-                [
-                    f"Task ID: {task_id}\n",
-                    f"Phase: {PHASE_REPORTED}\n",
-                    f"{self._roles_summary_text(roles)}\n",
-                    f"Return Target: {roles.orchestrator}\n",
-                    (
-                        f"Orchestrator: {roles.orchestrator} ({orchestrator_launch.get('status', 'unknown')})\n"
-                        if orchestrator_launch
-                        else ""
-                    ),
-                    f"Coordination: {self._coordination_label(complexity=complexity, subagent_runs=len(subagent_results))}\n",
-                    f"Complexity: {complexity}\n",
-                    f"Planning Backend: {planning_backend}\n" if planning_backend else "",
-                    f"Sub-agent Runs: {len(subagent_results)}\n" if subagent_results else "",
-                    f"Execution Backend: {codex_result.backend}\n",
-                    f"Verification Backend: {verification_result.backend}\n" if verification_result else "",
-                    f"Report Backend: {review_result.backend}\n",
-                    f"{review_result.output}",
-                ]
+            text = self._render_execution_status_sheet(
+                task_id=task_id,
+                phase=PHASE_REPORTED,
+                roles=roles,
+                complexity=complexity,
+                orchestrator_launch=orchestrator_launch,
+                subagent_results=subagent_results,
+                planning_backend=planning_backend,
+                execution_plan=execution_plan,
+                execution_backend=codex_result.backend,
+                verification_backend=verification_result.backend if verification_result else "",
+                report_backend=review_result.backend,
+                final_body=review_result.output,
             )
             self.store.append_message(
                 session_key=memory_key,
@@ -731,7 +731,21 @@ class CCConnectAdapter:
                 executor_session_id=executor_session_id,
                 phase=PHASE_READY,
             )
-            return AdapterResponse(text=f"Task ID: {task_id}\nPhase: {PHASE_READY}\nExecution error: {exc}", task_id=task_id)
+            text = self._render_execution_status_sheet(
+                task_id=task_id,
+                phase=PHASE_READY,
+                roles=roles,
+                complexity=complexity,
+                orchestrator_launch=orchestrator_launch,
+                subagent_results=locals().get("subagent_results", []),
+                planning_backend=planning_backend,
+                execution_plan=execution_plan,
+                execution_backend="error",
+                verification_backend="",
+                report_backend="",
+                final_body=f"Execution error: {exc}",
+            )
+            return AdapterResponse(text=text, task_id=task_id)
 
     def _handle_new(self, message: RemoteMessage) -> AdapterResponse:
         workspace_id = self._require_bound_workspace(message)
@@ -810,6 +824,10 @@ class CCConnectAdapter:
             lines.append("Latest Handoffs:")
             for row in handoffs[-5:]:
                 lines.append(f"- {row['handoff_type']} {row['source_agent']} -> {row['target_agent']}")
+        worker_launch_lines = self._recent_worker_tmux_lines(handoffs)
+        if worker_launch_lines:
+            lines.append("Recent Worker TMUX:")
+            lines.extend(worker_launch_lines)
         pending = self._get_pending_confirmation(message.session_key, workspace_id)
         if pending is not None:
             lines.append("Confirmation Pending:")
@@ -1545,6 +1563,164 @@ class CCConnectAdapter:
             return "structured execution flow active"
         return "single-agent chat"
 
+    def _render_execution_status_sheet(
+        self,
+        *,
+        task_id: str,
+        phase: str,
+        roles: SwarmRoles,
+        complexity: str,
+        orchestrator_launch: dict[str, Any] | None,
+        subagent_results: list[dict[str, Any]],
+        planning_backend: str | None,
+        execution_plan: dict[str, Any] | None,
+        execution_backend: str,
+        verification_backend: str,
+        report_backend: str,
+        final_body: str,
+    ) -> str:
+        planner_output = ""
+        if isinstance(execution_plan, dict):
+            planner_output = str(execution_plan.get("planner_output") or "").strip()
+        lines = [
+            f"Task ID: {task_id}",
+            f"Phase: {phase}",
+            self._roles_summary_text(roles).rstrip(),
+            f"Return Target: {roles.orchestrator}",
+        ]
+        planning_lines = [
+            "Planning:",
+            f"- Coordination: {self._coordination_label(complexity=complexity, subagent_runs=len(subagent_results))}",
+            f"- Complexity: {complexity}",
+        ]
+        if planning_backend:
+            planning_lines.append(f"- Backend: {planning_backend}")
+        if planner_output:
+            planning_lines.append(f"- Summary: {_compact_text(planner_output, 240)}")
+        if execution_plan:
+            suggested = execution_plan.get("suggested_subagents") or []
+            if suggested:
+                planning_lines.append(f"- Planned Sub-agents: {', '.join(str(item) for item in suggested)}")
+
+        tmux_lines = ["TMUX:"]
+        orchestrator_line = self._format_tmux_launch_line("Orchestrator TMUX", orchestrator_launch).rstrip()
+        tmux_lines.append(orchestrator_line or "- Orchestrator TMUX: unavailable")
+
+        subtask_lines = ["Subtasks:"]
+        if subagent_results:
+            subtask_lines.append(f"- Sub-agent Runs: {len(subagent_results)}")
+            for item in subagent_results:
+                role = str(item.get('role') or 'worker')
+                backend = str(item.get('backend') or 'unknown')
+                strategy = str(item.get('strategy') or '').strip()
+                summary = _compact_text(str(item.get('output') or '').strip(), 180)
+                launch_line = self._format_tmux_launch_line(f"Worker TMUX [{role}]", item.get("worker_launch")).rstrip()
+                cleanup = item.get("worker_cleanup")
+                cleanup_line = ""
+                if isinstance(cleanup, dict) and cleanup:
+                    cleanup_status = str(cleanup.get("status") or "").strip()
+                    cleanup_target = str(cleanup.get("target") or "").strip()
+                    cleanup_line = f"Worker Cleanup [{role}]: {cleanup_status or 'unknown'}"
+                    if cleanup_target:
+                        cleanup_line += f" -> {cleanup_target}"
+                sub_line = f"- {role}: {backend}"
+                if strategy:
+                    sub_line += f" [{strategy}]"
+                if summary:
+                    sub_line += f" | {summary}"
+                subtask_lines.append(sub_line)
+                if launch_line:
+                    tmux_lines.append(launch_line)
+                if cleanup_line:
+                    tmux_lines.append(cleanup_line)
+        else:
+            subtask_lines.append("- Sub-agent Runs: 0")
+            subtask_lines.append("- No sub-task results recorded.")
+
+        result_lines = ["Result:"]
+        if execution_backend:
+            result_lines.append(f"- Execution Backend: {execution_backend}")
+        if verification_backend:
+            result_lines.append(f"- Verification Backend: {verification_backend}")
+        if report_backend:
+            result_lines.append(f"- Report Backend: {report_backend}")
+        result_lines.append(final_body)
+
+        lines.extend(planning_lines)
+        lines.extend(subtask_lines)
+        lines.extend(tmux_lines)
+        lines.extend(result_lines)
+        return "\n".join(line for line in lines if line)
+
+    @staticmethod
+    def _format_tmux_target(launch: dict[str, Any] | None) -> str:
+        if not isinstance(launch, dict):
+            return ""
+        session_name = str(launch.get("session_name") or "").strip()
+        window_index = str(launch.get("window_index") or "").strip()
+        pane_id = str(launch.get("pane_id") or "").strip()
+        parts: list[str] = []
+        if session_name and window_index:
+            parts.append(f"{session_name}:{window_index}")
+        elif session_name:
+            parts.append(session_name)
+        if pane_id:
+            parts.append(pane_id)
+        return " ".join(parts).strip()
+
+    def _format_tmux_launch_line(self, label: str, launch: dict[str, Any] | None) -> str:
+        if not isinstance(launch, dict) or not launch:
+            return ""
+        status = str(launch.get("status") or "unknown").strip()
+        provider = str(launch.get("provider") or "").strip()
+        launch_mode = str(launch.get("launch_mode") or "").strip()
+        target = self._format_tmux_target(launch)
+        summary = f"{label}: {provider or 'provider'} ({status})"
+        if launch_mode:
+            summary += f" [{launch_mode}]"
+        if target:
+            summary += f" -> {target}"
+        return summary + "\n"
+
+    def _format_worker_tmux_lines(self, subagent_results: list[dict[str, Any]]) -> str:
+        if not subagent_results:
+            return ""
+        lines: list[str] = []
+        for item in subagent_results:
+            role = str(item.get("role") or "worker").strip()
+            launch_line = self._format_tmux_launch_line(f"Worker TMUX [{role}]", item.get("worker_launch")).rstrip()
+            if launch_line:
+                lines.append(launch_line)
+            cleanup = item.get("worker_cleanup")
+            if isinstance(cleanup, dict) and cleanup:
+                cleanup_status = str(cleanup.get("status") or "").strip()
+                cleanup_target = str(cleanup.get("target") or "").strip()
+                cleanup_line = f"Worker Cleanup [{role}]: {cleanup_status or 'unknown'}"
+                if cleanup_target:
+                    cleanup_line += f" -> {cleanup_target}"
+                lines.append(cleanup_line)
+        return "".join(f"{line}\n" for line in lines)
+
+    def _recent_worker_tmux_lines(self, handoffs: list[Any]) -> list[str]:
+        lines: list[str] = []
+        for row in handoffs:
+            if row["handoff_type"] != "subagent_result":
+                continue
+            content = SessionStore.loads_json(row["content_json"])
+            role = str(content.get("role") or row["source_agent"] or "worker").strip()
+            launch_line = self._format_tmux_launch_line(f"- {role}", content.get("worker_launch")).rstrip()
+            if launch_line:
+                lines.append(launch_line)
+            cleanup = content.get("worker_cleanup")
+            if isinstance(cleanup, dict) and cleanup:
+                cleanup_status = str(cleanup.get("status") or "").strip()
+                cleanup_target = str(cleanup.get("target") or "").strip()
+                cleanup_line = f"  cleanup {cleanup_status or 'unknown'}"
+                if cleanup_target:
+                    cleanup_line += f" -> {cleanup_target}"
+                lines.append(cleanup_line)
+        return lines
+
     def _build_execution_packet(
         self,
         *,
@@ -1688,6 +1864,9 @@ class CCConnectAdapter:
                 target_agent=role,
                 content_json=SessionStore.dumps_json(packet),
             )
+            backend = ""
+            strategy = ""
+            output = ""
             try:
                 prompt = self._wrap_agent_prompt(
                     workspace_id=workspace_id,
@@ -1712,41 +1891,33 @@ class CCConnectAdapter:
                         work_dir=self.store.get_workspace(workspace_id).path if self.store.get_workspace(workspace_id) else None,
                     ),
                 )
-                item = {
-                    "role": role,
-                    "mode": backend_mode,
-                    "worker_launch": worker_launch,
-                    "backend": result.backend,
-                    "output": result.output,
-                }
-                results.append(item)
-                self.store.append_task_handoff(
-                    session_key=session_key,
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    handoff_type="subagent_result",
-                    source_agent=role,
-                    target_agent="worker",
-                    content_json=SessionStore.dumps_json(item),
-                )
-            except ExecutorError as exc:
-                item = {
-                    "role": role,
-                    "mode": backend_mode,
-                    "worker_launch": worker_launch,
-                    "backend": "error",
-                    "output": f"Execution error: {exc}",
-                }
-                results.append(item)
-                self.store.append_task_handoff(
-                    session_key=session_key,
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    handoff_type="subagent_result",
-                    source_agent=role,
-                    target_agent="worker",
-                    content_json=SessionStore.dumps_json(item),
-                )
+                backend = result.backend
+                strategy = getattr(result, "strategy", "")
+                output = result.output
+            except Exception as exc:
+                backend = "error"
+                strategy = str(getattr(exc, "strategy", "") or "")
+                output = f"Execution error: {exc}"
+            worker_cleanup = cleanup_tmux_launch(worker_launch)
+            item = {
+                "role": role,
+                "mode": backend_mode,
+                "worker_launch": worker_launch,
+                "worker_cleanup": worker_cleanup,
+                "backend": backend,
+                "strategy": strategy,
+                "output": output,
+            }
+            results.append(item)
+            self.store.append_task_handoff(
+                session_key=session_key,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                handoff_type="subagent_result",
+                source_agent=role,
+                target_agent="worker",
+                content_json=SessionStore.dumps_json(item),
+            )
         return results
 
     def _run_verification(

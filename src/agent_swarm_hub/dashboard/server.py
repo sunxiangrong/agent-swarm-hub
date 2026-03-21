@@ -529,13 +529,23 @@ def _dashboard_html() -> str:
       const currentSessions = project.current_sessions ? `<span>${escapeHtml(project.current_sessions)}</span>` : '<span>no current binding</span>';
       const tmuxPreview = project.tmux_preview ? escapeHtml(project.tmux_preview) : 'No tmux pane attached.';
       const updatedAt = project.updated_at ? `<div class="timestamp">updated ${escapeHtml(project.updated_at)}</div>` : '';
-      const swarmAgents = (project.swarm_agents || []).map((agent) => `
+      const workerAgents = (project.swarm_worker_agents || []).map((agent) => `
         <div class="runtime-item">
           <strong>${escapeHtml(agent.name || 'agent')}</strong>
           <span class="status-badge" data-tone="${statusTone(agent.status)}">${escapeHtml(agent.status || 'idle')}</span>
           <div class="timestamp">${escapeHtml(agent.backend || 'native cli')}</div>
+          ${agent.strategy ? `<div class="timestamp">strategy ${escapeHtml(agent.strategy)}</div>` : ''}
           ${agent.launch_status ? `<div class="timestamp">launch ${escapeHtml(agent.launch_status)} ${escapeHtml(agent.launch_pane_id || '')}</div>` : ''}
+          ${agent.cleanup_status ? `<div class="timestamp">cleanup ${escapeHtml(agent.cleanup_status)} ${escapeHtml(agent.cleanup_target || '')}</div>` : ''}
           <div>${escapeHtml(agent.summary || 'No result summary yet.')}</div>
+        </div>
+      `).join('');
+      const verificationAgents = (project.swarm_verification_agents || []).map((agent) => `
+        <div class="runtime-item">
+          <strong>${escapeHtml(agent.name || 'verification')}</strong>
+          <span class="status-badge" data-tone="${statusTone(agent.status)}">${escapeHtml(agent.status || 'idle')}</span>
+          <div class="timestamp">${escapeHtml(agent.backend || 'native cli')}</div>
+          <div>${escapeHtml(agent.summary || 'No verification summary yet.')}</div>
         </div>
       `).join('');
       const ccbProviders = (project.ccb_live_providers || []).map((item) => `
@@ -543,27 +553,49 @@ def _dashboard_html() -> str:
           <strong>${escapeHtml(item.provider || 'provider')}</strong>
           <span class="status-badge" data-tone="active">live</span>
           <div class="timestamp">pane ${escapeHtml(item.pane_id || item.pane_title_marker || 'unknown')}</div>
+          ${item.pane_title ? `<div class="timestamp">${escapeHtml(item.pane_title)}</div>` : ''}
           <div>${escapeHtml(item.session_id || item.ccb_session_id || 'ccb session active')}</div>
         </div>
       `).join('');
       const fallbackSwarmOverview = `
+              <div class="runtime-item"><strong>Planning</strong></div>
               <div class="runtime-item">No live swarm capture yet.</div>
               <div class="runtime-item">Current phase: ${escapeHtml(project.live_phase || 'discussion')}</div>
               <div class="runtime-item">${escapeHtml(project.live_summary || project.memory || 'The current native/ccb run has not written runtime swarm state yet.')}</div>
-              ${ccbProviders || ''}
+              <div class="runtime-item">Trigger Terminal: ${escapeHtml(project.current_trigger || 'claude')}</div>
+              <div class="runtime-item">Swarm Orchestrator: ${escapeHtml(project.current_driver || 'claude')}</div>
+              <div class="runtime-item"><strong>Subtasks</strong></div>
+              <div class="runtime-item">No sub-task runs recorded.</div>
+              <div class="runtime-item"><strong>TMUX</strong></div>
+              ${
+                project.driver_tmux_pane_id
+                  ? `<div class="runtime-item">Orchestrator Pane: ${escapeHtml(project.driver_tmux_pane_id)} ${escapeHtml(project.driver_tmux_title || '')}</div>`
+                  : '<div class="runtime-item">Orchestrator Pane: not attached yet.</div>'
+              }
+              ${ccbProviders || '<div class="runtime-item">No live tmux/ccb providers recorded.</div>'}
+              <div class="runtime-item"><strong>Result</strong></div>
+              <div class="runtime-item">No final swarm result captured yet.</div>
             `;
       const swarmOverview = project.swarm_active
         ? `
+              <div class="runtime-item"><strong>Planning</strong></div>
               <div class="runtime-item">Task: ${escapeHtml(project.swarm_task_id || 'none')}</div>
               <div class="runtime-item">Session: ${escapeHtml(project.swarm_session_key || 'none')}</div>
+              <div class="runtime-item">Agents: ${escapeHtml(String(project.swarm_agent_count || 0))} | Handoffs: ${escapeHtml(String(project.swarm_handoff_count || 0))}</div>
+              <div class="runtime-item">Planner Summary: ${escapeHtml(project.swarm_planner_summary || project.swarm_summary || 'Swarm execution is active.')}</div>
+              <div class="runtime-item">Planned Sub-agents: ${escapeHtml((project.swarm_planned_subagents || []).join(', ') || 'none')}</div>
+              <div class="runtime-item"><strong>Subtasks</strong></div>
+              ${workerAgents || '<div class="runtime-item">No active worker runs recorded.</div>'}
+              ${verificationAgents ? `<div class="runtime-item"><strong>Verification</strong></div>${verificationAgents}` : ''}
+              <div class="runtime-item"><strong>TMUX</strong></div>
               ${
                 project.swarm_orchestrator_launch && project.swarm_orchestrator_launch.status
-                  ? `<div class="runtime-item">Orchestrator Launch: ${escapeHtml(project.swarm_orchestrator_launch.provider || 'claude')} (${escapeHtml(project.swarm_orchestrator_launch.status || '')})</div>`
-                  : ''
+                  ? `<div class="runtime-item">Orchestrator Launch: ${escapeHtml(project.swarm_orchestrator_launch.provider || 'claude')} (${escapeHtml(project.swarm_orchestrator_launch.status || '')}) ${escapeHtml(project.swarm_orchestrator_launch.pane_id || '')}</div>`
+                  : '<div class="runtime-item">Orchestrator Launch: unavailable</div>'
               }
-              <div class="runtime-item">Agents: ${escapeHtml(String(project.swarm_agent_count || 0))} | Handoffs: ${escapeHtml(String(project.swarm_handoff_count || 0))}</div>
+              ${ccbProviders || '<div class="runtime-item">No live tmux/ccb providers recorded.</div>'}
+              <div class="runtime-item"><strong>Result</strong></div>
               <div class="runtime-item">${escapeHtml(project.swarm_summary || 'Swarm execution is active.')}</div>
-              ${swarmAgents || '<div class="runtime-item">No active sub-agent runs recorded.</div>'}
             `
         : fallbackSwarmOverview;
       const driverLine = project.driver_session_id || project.driver_tmux_pane_id
@@ -592,17 +624,26 @@ def _dashboard_html() -> str:
             ${updatedAt}
           </div>
           <dl class="summary-grid">
-            <div class="summary-item"><dt>Current Focus</dt><dd>${escapeHtml(project.focus || 'No focus recorded.')}</dd></div>
-            <div class="summary-item"><dt>Current State</dt><dd>${escapeHtml(project.state || 'No current state recorded.')}</dd></div>
-            <div class="summary-item"><dt>Next Step</dt><dd>${escapeHtml(project.next_step || 'No explicit next step.')}</dd></div>
-            <div class="summary-item"><dt>Current Sessions</dt><dd><div class="kv">${currentSessions}</div></dd></div>
-            <div class="summary-item wide"><dt>Live Summary</dt><dd>${escapeHtml(project.live_summary || project.memory || 'No live summary yet.')}</dd></div>
+            <div class="summary-item wide">
+              <dt>Project Memory</dt>
+              <dd>${escapeHtml(project.project_summary_text || 'No durable project memory yet.')}</dd>
+            </div>
+            <div class="summary-item">
+              <dt>Current Run</dt>
+              <dd>${escapeHtml(project.live_summary || project.state || 'No live runtime summary yet.')}</dd>
+            </div>
+            <div class="summary-item wide">
+              <dt>Sessions</dt>
+              <dd>${escapeHtml(project.session_overview_text || 'No session overview available.')}</dd>
+            </div>
           </dl>
           <div class="sessions">
-            <dt>Signal</dt>
+            <dt>Session Detail</dt>
             <div class="stack">
+              <div class="runtime-item">${escapeHtml(project.memory_source_text || 'No memory source available.')}</div>
+              <div class="runtime-item">${escapeHtml(project.session_policy_text || 'No session policy available.')}</div>
+              <div class="runtime-item">Current Sessions: <span class="kv">${currentSessions}</span></div>
               <div class="runtime-item">Phase: ${escapeHtml(project.live_phase || 'n/a')}</div>
-              <div class="runtime-item">Inventory: ${escapeHtml(project.session_count_text || 'active 0 / archived 0')}</div>
             </div>
           </div>
           <div class="runtime">

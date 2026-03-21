@@ -395,6 +395,47 @@ class SessionStore:
             escalations_json="[]",
         )
 
+    def remove_workspace(self, workspace_id: str) -> None:
+        if not workspace_id:
+            return
+        with self._connect() as conn:
+            task_ids = [
+                str(row["task_id"])
+                for row in conn.execute(
+                    "SELECT task_id FROM tasks WHERE workspace_id = ?",
+                    (workspace_id,),
+                ).fetchall()
+                if (row["task_id"] or "")
+            ]
+            session_keys = [
+                str(row["session_key"])
+                for row in conn.execute(
+                    "SELECT DISTINCT session_key FROM workspace_sessions WHERE workspace_id = ?",
+                    (workspace_id,),
+                ).fetchall()
+                if (row["session_key"] or "")
+            ]
+            conn.execute("DELETE FROM task_handoffs WHERE workspace_id = ?", (workspace_id,))
+            conn.execute("DELETE FROM agent_messages WHERE workspace_id = ?", (workspace_id,))
+            conn.execute("DELETE FROM ephemeral_messages WHERE workspace_id = ?", (workspace_id,))
+            conn.execute("DELETE FROM workspace_sessions WHERE workspace_id = ?", (workspace_id,))
+            conn.execute("DELETE FROM tasks WHERE workspace_id = ?", (workspace_id,))
+            conn.execute("DELETE FROM workspaces WHERE workspace_id = ?", (workspace_id,))
+            conn.execute("DELETE FROM chat_bindings WHERE workspace_id = ?", (workspace_id,))
+            if task_ids:
+                placeholders = ",".join("?" for _ in task_ids)
+                conn.execute(f"DELETE FROM messages WHERE task_id IN ({placeholders})", task_ids)
+            if session_keys:
+                placeholders = ",".join("?" for _ in session_keys)
+                conn.execute(
+                    f"""
+                    DELETE FROM chat_sessions
+                    WHERE session_key IN ({placeholders})
+                      AND session_key NOT IN (SELECT session_key FROM chat_bindings)
+                    """,
+                    session_keys,
+                )
+
     def get_session(self, session_key: str) -> ChatSessionRecord | None:
         with self._connect() as conn:
             row = conn.execute(

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from agent_swarm_hub.cli import ash_chat_main, ash_swarm_main, main
 from agent_swarm_hub.paths import ccb_lib_dir, project_session_db_path, provider_command
+from agent_swarm_hub.session_store import SessionStore
 
 
 def _write_codex_session(home: Path, session_id: str, cwd: str) -> Path:
@@ -538,6 +539,112 @@ def test_cli_local_chat_reprompts_for_invalid_project_selection(monkeypatch, cap
     assert "Current workspace switched to `agent-swarm-hub`." in output
     assert "Chat naturally." in output
     assert "Complex tasks will automatically enter planning / coordinated swarm execution when needed." in output
+
+
+def test_cli_local_chat_ctrl_c_finalizes_memory(monkeypatch, capsys) -> None:
+    calls: list[str] = []
+
+    def fake_handle(self, message):
+        calls.append(message.text)
+        return SimpleNamespace(text="ok", task_id=None)
+
+    monkeypatch.setenv("ASH_EXECUTOR", "echo")
+    monkeypatch.setattr("agent_swarm_hub.cli.CCConnectAdapter.handle_message", fake_handle)
+    monkeypatch.setattr("agent_swarm_hub.cli.CCConnectAdapter._get_bound_workspace", lambda self, _message: "agent-swarm-hub")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": (_ for _ in ()).throw(KeyboardInterrupt()))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-swarm-hub", "local-chat", "--provider", "echo", "--project", "agent-swarm-hub"],
+    )
+
+    exit_code = main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 130
+    assert "/use agent-swarm-hub" in calls
+    assert "/quit" in calls
+    assert "ok" in output
+
+
+def test_cli_local_chat_runs_memory_checkpoint(monkeypatch, capsys) -> None:
+    inputs = iter(["one", "two", "three", "four", "/quit"])
+    checkpoint_calls: list[tuple[str, str]] = []
+    consolidate_calls: list[str] = []
+
+    def fake_handle(self, message):
+        return SimpleNamespace(text=f"handled {message.text}", task_id=None)
+
+    def fake_sync(self, *, session_key: str, workspace_id: str, **_kwargs):
+        checkpoint_calls.append((session_key, workspace_id))
+
+    def fake_consolidate(self, project_id: str, **_kwargs):
+        consolidate_calls.append(project_id)
+        return True
+
+    monkeypatch.setenv("ASH_EXECUTOR", "echo")
+    monkeypatch.setenv("ASH_MEMORY_CHECKPOINT_INTERVAL", "4")
+    monkeypatch.setattr("agent_swarm_hub.cli.CCConnectAdapter.handle_message", fake_handle)
+    monkeypatch.setattr("agent_swarm_hub.cli.CCConnectAdapter._get_bound_workspace", lambda self, _message: "agent-swarm-hub")
+    monkeypatch.setattr("agent_swarm_hub.cli.CCConnectAdapter._resolve_shared_project_id", lambda self, workspace_id: workspace_id)
+    monkeypatch.setattr("agent_swarm_hub.cli.CCConnectAdapter._memory_key", lambda self, session_key, workspace_id: session_key)
+    monkeypatch.setattr("agent_swarm_hub.cli.CCConnectAdapter._sync_project_memory", fake_sync)
+    monkeypatch.setattr("agent_swarm_hub.project_context.ProjectContextStore.consolidate_project_memory", fake_consolidate)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-swarm-hub", "local-chat", "--provider", "echo", "--project", "agent-swarm-hub"],
+    )
+
+    exit_code = main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert checkpoint_calls
+    assert checkpoint_calls[0][1] == "agent-swarm-hub"
+    assert "agent-swarm-hub" in consolidate_calls
+    assert "memory checkpoint synced for `agent-swarm-hub`" in output
+
+
+def test_cli_local_chat_runs_time_based_memory_checkpoint(monkeypatch, capsys) -> None:
+    inputs = iter(["one", "two", "/quit"])
+    checkpoint_calls: list[tuple[str, str]] = []
+
+    def fake_handle(self, message):
+        return SimpleNamespace(text=f"handled {message.text}", task_id=None)
+
+    def fake_sync(self, *, session_key: str, workspace_id: str, **_kwargs):
+        checkpoint_calls.append((session_key, workspace_id))
+
+    class FakeMonotonic:
+        def __init__(self):
+            self.values = iter([0.0, 700.0, 701.0])
+
+        def __call__(self):
+            return next(self.values)
+
+    monkeypatch.setenv("ASH_EXECUTOR", "echo")
+    monkeypatch.setenv("ASH_MEMORY_CHECKPOINT_INTERVAL", "8")
+    monkeypatch.setenv("ASH_MEMORY_CHECKPOINT_SECONDS", "600")
+    monkeypatch.setattr("agent_swarm_hub.cli.time.monotonic", FakeMonotonic())
+    monkeypatch.setattr("agent_swarm_hub.cli.CCConnectAdapter.handle_message", fake_handle)
+    monkeypatch.setattr("agent_swarm_hub.cli.CCConnectAdapter._get_bound_workspace", lambda self, _message: "agent-swarm-hub")
+    monkeypatch.setattr("agent_swarm_hub.cli.CCConnectAdapter._resolve_shared_project_id", lambda self, workspace_id: workspace_id)
+    monkeypatch.setattr("agent_swarm_hub.cli.CCConnectAdapter._memory_key", lambda self, session_key, workspace_id: session_key)
+    monkeypatch.setattr("agent_swarm_hub.cli.CCConnectAdapter._sync_project_memory", fake_sync)
+    monkeypatch.setattr("agent_swarm_hub.project_context.ProjectContextStore.consolidate_project_memory", lambda *args, **kwargs: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-swarm-hub", "local-chat", "--provider", "echo", "--project", "agent-swarm-hub"],
+    )
+
+    exit_code = main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert checkpoint_calls
+    assert checkpoint_calls[0][1] == "agent-swarm-hub"
+    assert "memory checkpoint synced for `agent-swarm-hub`" in output
 
 
 def test_cli_local_native_launches_provider_in_workspace(monkeypatch, tmp_path) -> None:
@@ -2092,7 +2199,7 @@ def test_project_context_sync_updates_structured_project_summary(tmp_path) -> No
         ).fetchone()[0]
 
     assert "Current focus: chrome会做的更好吗" in summary
-    assert "Recent context: 已经确认当前问题是项目级上下文摘要过度退化" in summary
+    assert "Current state: 已经确认当前问题是项目级上下文摘要过度退化" in summary
     assert "Next step: 整理项目级长期记忆" in summary
     assert "Long-term memory: Compare whether Chrome-native tooling would produce a more reliable browser workflow." in summary
 
@@ -2225,6 +2332,21 @@ def test_cli_project_sessions_sync_memory(monkeypatch, tmp_path, capsys) -> None
         )
 
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    class FakeMemoryExecutor:
+        def run(self, prompt: str):
+            return SimpleNamespace(
+                output=json.dumps(
+                    {
+                        "focus": "chrome会做的更好吗",
+                        "current_state": "已经确认当前问题是项目级上下文摘要过度退化",
+                        "next_step": "整理项目级长期记忆",
+                        "long_term_memory": "Compare whether Chrome-native tooling would produce a more reliable browser workflow.",
+                        "key_points": ["整理项目级长期记忆"],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+    monkeypatch.setattr("agent_swarm_hub.project_context.build_executor_for_config", lambda **_: FakeMemoryExecutor())
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "sync-memory", "agent-browser"])
     exit_code = main()
     output = capsys.readouterr().out
@@ -2236,6 +2358,7 @@ def test_cli_project_sessions_sync_memory(monkeypatch, tmp_path, capsys) -> None
     with sqlite3.connect(shared_db_path) as conn:
         summary = conn.execute("SELECT summary FROM projects WHERE project_id = ?", ("agent-browser",)).fetchone()[0]
     assert "Current focus: chrome会做的更好吗" in summary
+    assert "Current state: 已经确认当前问题是项目级上下文摘要过度退化" in summary
 
 
 def test_cli_project_sessions_sync_memory_all(monkeypatch, tmp_path, capsys) -> None:
@@ -2282,6 +2405,22 @@ def test_cli_project_sessions_sync_memory_all(monkeypatch, tmp_path, capsys) -> 
         )
 
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    class FakeMemoryExecutor:
+        def run(self, prompt: str):
+            target = "alpha" if "Project: alpha" in prompt else "beta"
+            return SimpleNamespace(
+                output=json.dumps(
+                    {
+                        "focus": f"Focus {target}",
+                        "current_state": f"State {target}",
+                        "next_step": f"Next {target}",
+                        "long_term_memory": f"Memory {target}",
+                        "key_points": [f"Next {target}"],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+    monkeypatch.setattr("agent_swarm_hub.project_context.build_executor_for_config", lambda **_: FakeMemoryExecutor())
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "sync-memory", "--all"])
     exit_code = main()
     output = capsys.readouterr().out
@@ -2367,3 +2506,175 @@ def test_cli_project_sessions_use_switches_binding(monkeypatch, tmp_path, capsys
     assert statuses == [("codex-new", "active"), ("codex-old", "archived")]
     assert "Current sessions: codex=codex-new" in summary
     assert (workspace_path / "PROJECT_MEMORY.md").exists()
+
+
+def test_cli_project_sessions_remove_project(monkeypatch, tmp_path, capsys) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    runtime_db_path = tmp_path / "runtime.sqlite3"
+    workspace_path = tmp_path / "deleted-project"
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            CREATE TABLE dashboard_project_pins (
+                project_id TEXT PRIMARY KEY,
+                pinned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)",
+            ("deleted-project", "deleted-project", str(workspace_path)),
+        )
+        conn.execute(
+            "INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)",
+            ("deleted-project", "codex", "codex-session"),
+        )
+        conn.execute(
+            "INSERT INTO project_memory (project_id, focus, recent_context, memory, recent_hints_json) VALUES (?, ?, ?, ?, ?)",
+            ("deleted-project", "Focus", "State", "Memory", "[]"),
+        )
+        conn.execute(
+            "INSERT INTO provider_sessions (provider, raw_session_id, project_id) VALUES (?, ?, ?)",
+            ("codex", "codex-session", "deleted-project"),
+        )
+        conn.execute(
+            "INSERT INTO project_sessions (project_id, provider, session_id) VALUES (?, ?, ?)",
+            ("deleted-project", "codex", "codex-session"),
+        )
+        conn.execute(
+            "INSERT INTO dashboard_project_pins (project_id) VALUES (?)",
+            ("deleted-project",),
+        )
+
+    runtime_store = SessionStore(runtime_db_path)
+    runtime_store.upsert_workspace(
+        workspace_id="deleted-project",
+        title="deleted-project",
+        path=str(workspace_path),
+        backend="codex",
+        transport="direct",
+    )
+    runtime_store.upsert_task(
+        task_id="task-1",
+        session_key="local-cli",
+        workspace_id="deleted-project",
+        title="Task",
+        status="open",
+    )
+    runtime_store.upsert_session(
+        session_key="local-cli",
+        platform="local",
+        chat_id="local-user",
+        thread_id=None,
+        active_task_id="task-1",
+        executor_session_id="exec-1",
+        conversation_summary="summary",
+        swarm_state_json="",
+        escalations_json="[]",
+    )
+    runtime_store.append_message(
+        session_key="local-cli",
+        role="user",
+        text="hello",
+        task_id="task-1",
+    )
+    runtime_store.upsert_workspace_session(
+        session_key="local-cli",
+        workspace_id="deleted-project",
+        active_task_id="task-1",
+        executor_session_id="exec-1",
+        claude_session_id="",
+        codex_session_id="codex-session",
+        phase="discussion",
+        conversation_summary="summary",
+        swarm_state_json="",
+        escalations_json="[]",
+    )
+    runtime_store.append_task_handoff(
+        session_key="local-cli",
+        workspace_id="deleted-project",
+        task_id="task-1",
+        handoff_type="execution_plan",
+        source_agent="claude",
+        target_agent="codex",
+        content_json=json.dumps({"planner_output": "plan"}, ensure_ascii=False),
+    )
+    runtime_store.bind_chat(
+        session_key="local-cli",
+        platform="local",
+        chat_id="local-user",
+        thread_id=None,
+        workspace_id="deleted-project",
+    )
+
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setenv("ASH_SESSION_DB", str(runtime_db_path))
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "remove-project", "deleted-project"])
+    exit_code = main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Removed stale project records for `deleted-project`." in output
+
+    with sqlite3.connect(shared_db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM projects WHERE project_id = ?", ("deleted-project",)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM provider_bindings WHERE project_id = ?", ("deleted-project",)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM project_memory WHERE project_id = ?", ("deleted-project",)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM provider_sessions WHERE project_id = ?", ("deleted-project",)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM project_sessions WHERE project_id = ?", ("deleted-project",)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM dashboard_project_pins WHERE project_id = ?", ("deleted-project",)).fetchone()[0] == 0
+
+    with sqlite3.connect(runtime_db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM workspaces WHERE workspace_id = ?", ("deleted-project",)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM workspace_sessions WHERE workspace_id = ?", ("deleted-project",)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE workspace_id = ?", ("deleted-project",)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_handoffs WHERE workspace_id = ?", ("deleted-project",)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM chat_bindings WHERE workspace_id = ?", ("deleted-project",)).fetchone()[0] == 0

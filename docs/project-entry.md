@@ -19,8 +19,10 @@
 ## Current Model
 
 - `project` is the primary container
-- `project memory` is compact and independent from any single raw session
+- `project_memory` is the only durable long-term memory source
+- `workspace_sessions` is live runtime state only
 - `session` is only a resumable window, not the primary memory carrier
+- `projects.summary`, `PROJECT_MEMORY.md`, and `PROJECT_SKILL.md` are generated views from the stored project state
 - main agent and sub-agents both receive the same compact project memory snapshot
 
 ## Practical Rule

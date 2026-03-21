@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .executor import Executor, build_executor_for_config
 from .paths import project_session_db_path
 
 
@@ -70,6 +71,7 @@ class ProjectContextStore:
                 CREATE TABLE IF NOT EXISTS project_memory (
                     project_id TEXT PRIMARY KEY,
                     focus TEXT NOT NULL DEFAULT '',
+                    current_state TEXT NOT NULL DEFAULT '',
                     recent_context TEXT NOT NULL DEFAULT '',
                     memory TEXT NOT NULL DEFAULT '',
                     recent_hints_json TEXT NOT NULL DEFAULT '[]',
@@ -108,6 +110,34 @@ class ProjectContextStore:
                 );
                 """
             )
+            self._migrate_project_memory_schema(conn)
+
+    def _migrate_project_memory_schema(self, conn: sqlite3.Connection) -> None:
+        try:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(project_memory)").fetchall()}
+        except sqlite3.Error:
+            return
+        try:
+            if "current_state" not in columns:
+                conn.execute("ALTER TABLE project_memory ADD COLUMN current_state TEXT NOT NULL DEFAULT ''")
+                conn.execute(
+                    """
+                    UPDATE project_memory
+                    SET current_state = COALESCE(NULLIF(recent_context, ''), current_state, '')
+                    WHERE COALESCE(current_state, '') = ''
+                    """
+                )
+            if "recent_context" not in columns:
+                conn.execute("ALTER TABLE project_memory ADD COLUMN recent_context TEXT NOT NULL DEFAULT ''")
+                conn.execute(
+                    """
+                    UPDATE project_memory
+                    SET recent_context = COALESCE(NULLIF(current_state, ''), recent_context, '')
+                    WHERE COALESCE(recent_context, '') = ''
+                    """
+                )
+        except sqlite3.Error:
+            return
 
     def list_projects(self) -> list[ProjectContext]:
         if not self.db_path.exists():
@@ -181,6 +211,20 @@ class ProjectContextStore:
         except sqlite3.Error:
             return
 
+    def remove_project(self, project_id: str) -> None:
+        if not project_id:
+            return
+        try:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM provider_bindings WHERE project_id = ?", (project_id,))
+                conn.execute("DELETE FROM project_memory WHERE project_id = ?", (project_id,))
+                conn.execute("DELETE FROM project_sessions WHERE project_id = ?", (project_id,))
+                conn.execute("DELETE FROM provider_sessions WHERE project_id = ?", (project_id,))
+                conn.execute("DELETE FROM dashboard_project_pins WHERE project_id = ?", (project_id,))
+                conn.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
+        except sqlite3.Error:
+            return
+
     def get_for_workspace_path(self, workspace_path: str | None) -> ProjectContext | None:
         if not workspace_path or not self.db_path.exists():
             return None
@@ -244,7 +288,7 @@ class ProjectContextStore:
         if snapshot["focus"]:
             lines.append(f"Focus: {snapshot['focus']}")
         if snapshot["recent_context"]:
-            lines.append(f"Recent Context: {snapshot['recent_context']}")
+            lines.append(f"Current State: {snapshot['recent_context']}")
         elif snapshot["memory"]:
             lines.append(f"Project Memory: {snapshot['memory']}")
         if snapshot["recent_hints"]:
@@ -260,6 +304,7 @@ class ProjectContextStore:
                 "workspace": "",
                 "profile": "",
                 "focus": "",
+                "current_state": "",
                 "recent_context": "",
                 "memory": "",
                 "recent_hints": [],
@@ -271,7 +316,7 @@ class ProjectContextStore:
             if (message or "").strip()
         ]
         focus = stored_memory["focus"] or self._summary_field(project.summary, "Current focus:")
-        recent_context = stored_memory["recent_context"] or self._summary_field(project.summary, "Recent context:")
+        recent_context = stored_memory["recent_context"] or self._summary_state(project.summary)
         memory = stored_memory["memory"] or (
             self._compact(self._summary_compact_text(project.summary), _PROMPT_FIELD_LIMIT) if project.summary else ""
         )
@@ -280,6 +325,7 @@ class ProjectContextStore:
             "workspace": self._compact(project.workspace_path, _PROMPT_FIELD_LIMIT),
             "profile": self._compact(project.profile, _PROMPT_PROFILE_LIMIT),
             "focus": self._compact(focus, _PROMPT_FIELD_LIMIT) if focus else "",
+            "current_state": self._compact(recent_context, _PROMPT_FIELD_LIMIT) if recent_context else "",
             "recent_context": self._compact(recent_context, _PROMPT_FIELD_LIMIT) if recent_context else "",
             "memory": self._compact(memory, _PROMPT_FIELD_LIMIT) if memory else "",
             "recent_hints": recent_messages,
@@ -319,21 +365,27 @@ class ProjectContextStore:
 
     def get_project_memory(self, project_id: str) -> dict[str, Any]:
         if not project_id or not self.db_path.exists():
-            return {"focus": "", "recent_context": "", "memory": "", "recent_hints": []}
+            return {"focus": "", "current_state": "", "recent_context": "", "memory": "", "recent_hints": []}
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT focus, recent_context, memory, recent_hints_json
+                SELECT focus,
+                       COALESCE(NULLIF(current_state, ''), recent_context, '') AS current_state,
+                       COALESCE(NULLIF(current_state, ''), recent_context, '') AS recent_context,
+                       memory,
+                       recent_hints_json
                 FROM project_memory
                 WHERE project_id = ?
                 """,
                 (project_id,),
             ).fetchone()
         if row is None:
-            return {"focus": "", "recent_context": "", "memory": "", "recent_hints": []}
+            return {"focus": "", "current_state": "", "recent_context": "", "memory": "", "recent_hints": []}
+        current_state = self._compact(row["current_state"], _PROMPT_FIELD_LIMIT) if row["current_state"] else ""
         return {
             "focus": self._compact(row["focus"], _PROMPT_FIELD_LIMIT) if row["focus"] else "",
-            "recent_context": self._compact(row["recent_context"], _PROMPT_FIELD_LIMIT) if row["recent_context"] else "",
+            "current_state": current_state,
+            "recent_context": current_state,
             "memory": self._compact(row["memory"], _PROMPT_FIELD_LIMIT) if row["memory"] else "",
             "recent_hints": self._parse_hints_json(row["recent_hints_json"]),
         }
@@ -407,27 +459,30 @@ class ProjectContextStore:
         project_id: str,
         *,
         focus: str = "",
+        current_state: str = "",
         recent_context: str = "",
         memory: str = "",
         recent_hints: list[str] | None = None,
     ) -> None:
         if not project_id:
             return
+        normalized_state = (current_state or recent_context).strip()
         hints = [self._compact(item, _PROMPT_MESSAGE_LIMIT) for item in (recent_hints or []) if (item or '').strip()][:_PROMPT_RECENT_MESSAGE_COUNT]
         try:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO project_memory (project_id, focus, recent_context, memory, recent_hints_json, updated_at)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    INSERT INTO project_memory (project_id, focus, current_state, recent_context, memory, recent_hints_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(project_id) DO UPDATE SET
                         focus = CASE WHEN excluded.focus != '' THEN excluded.focus ELSE project_memory.focus END,
+                        current_state = CASE WHEN excluded.current_state != '' THEN excluded.current_state ELSE project_memory.current_state END,
                         recent_context = CASE WHEN excluded.recent_context != '' THEN excluded.recent_context ELSE project_memory.recent_context END,
                         memory = CASE WHEN excluded.memory != '' THEN excluded.memory ELSE project_memory.memory END,
                         recent_hints_json = CASE WHEN excluded.recent_hints_json != '[]' THEN excluded.recent_hints_json ELSE project_memory.recent_hints_json END,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    (project_id, focus.strip(), recent_context.strip(), memory.strip(), json.dumps(hints, ensure_ascii=False)),
+                    (project_id, focus.strip(), normalized_state, normalized_state, memory.strip(), json.dumps(hints, ensure_ascii=False)),
                 )
         except sqlite3.Error:
             return
@@ -543,7 +598,7 @@ class ProjectContextStore:
         bindings = self.get_current_project_sessions(project_id)
         sessions = self.list_project_sessions(project_id, include_archived=False)
         focus = stored_memory.get("focus", "") or self._summary_field(project.summary, "Current focus:")
-        current_state = stored_memory.get("recent_context", "") or self._summary_field(project.summary, "Recent context:")
+        current_state = stored_memory.get("recent_context", "") or self._summary_state(project.summary)
         brief = self.derive_session_brief(
             focus=focus,
             recent_context=current_state,
@@ -650,7 +705,7 @@ class ProjectContextStore:
         sessions = self.list_project_sessions(project_id, include_archived=False)
         brief = self.derive_session_brief(
             focus=stored_memory.get("focus", "") or self._summary_field(project.summary, "Current focus:"),
-            recent_context=stored_memory.get("recent_context", "") or self._summary_field(project.summary, "Recent context:"),
+            recent_context=stored_memory.get("recent_context", "") or self._summary_state(project.summary),
             memory=stored_memory.get("memory", "") or self._summary_compact_text(project.summary),
             hints=stored_memory.get("recent_hints", []),
         )
@@ -661,7 +716,7 @@ class ProjectContextStore:
         if brief["focus"]:
             lines.append(f"Current focus: {brief['focus']}")
         if brief["recent_context"]:
-            lines.append(f"Recent context: {brief['recent_context']}")
+            lines.append(f"Current state: {brief['recent_context']}")
         if brief["next_step"]:
             lines.append(f"Next step: {brief['next_step']}")
         if brief["memory"]:
@@ -685,7 +740,7 @@ class ProjectContextStore:
             return ""
         stored_memory = self.get_project_memory(project_id)
         focus = stored_memory.get("focus", "") or self._summary_field(project.summary, "Current focus:")
-        recent_context = stored_memory.get("recent_context", "") or self._summary_field(project.summary, "Recent context:")
+        recent_context = stored_memory.get("recent_context", "") or self._summary_state(project.summary)
         lines = [
             "# PROJECT_SKILL",
             "",
@@ -792,6 +847,65 @@ class ProjectContextStore:
             return False
         return True
 
+    def consolidate_project_memory(
+        self,
+        project_id: str,
+        *,
+        live_summary: str = "",
+        recent_messages: list[str] | None = None,
+        executor: Executor | None = None,
+    ) -> bool:
+        project = self.get_project(project_id)
+        if project is None:
+            return False
+        stored_memory = self.get_project_memory(project_id)
+        bindings = self.get_current_project_sessions(project_id)
+        sessions = self.list_project_sessions(project_id, include_archived=False)
+        prompt = self._build_memory_consolidation_prompt(
+            project_id=project.project_id,
+            workspace_path=project.workspace_path,
+            profile=project.profile,
+            current_summary=project.summary,
+            stored_memory=stored_memory,
+            current_sessions=bindings,
+            active_sessions=sessions[:6],
+            live_summary=live_summary,
+            recent_messages=recent_messages or [],
+        )
+        try:
+            runner = executor or build_executor_for_config(
+                mode="claude",
+                transport="auto",
+                work_dir=project.workspace_path or None,
+                timeout_s=45,
+            )
+            result = runner.run(prompt)
+            payload = self._parse_memory_consolidation_output(result.output)
+        except Exception:
+            return False
+        focus = self._compact(str(payload.get("focus") or ""), _PROMPT_FIELD_LIMIT)
+        current_state = self._compact(str(payload.get("current_state") or ""), _PROMPT_FIELD_LIMIT)
+        next_step = self._compact(str(payload.get("next_step") or ""), _PROMPT_FIELD_LIMIT)
+        long_term_memory = self._compact(str(payload.get("long_term_memory") or ""), _PROMPT_FIELD_LIMIT)
+        key_points = [
+            self._compact(str(item or ""), _PROMPT_MESSAGE_LIMIT)
+            for item in list(payload.get("key_points") or [])
+            if str(item or "").strip()
+        ][:3]
+        if next_step and next_step not in key_points:
+            key_points = (key_points + [next_step])[:3]
+        if not any((focus, current_state, long_term_memory, key_points)):
+            return False
+        self.upsert_project_memory(
+            project_id,
+            focus=focus,
+            recent_context=current_state,
+            memory=long_term_memory,
+            recent_hints=key_points,
+        )
+        self.sync_project_summary(project_id)
+        return True
+
     @staticmethod
     def _compact(text: str | None, limit: int) -> str:
         value = " ".join((text or "").split())
@@ -808,6 +922,10 @@ class ProjectContextStore:
         return ""
 
     @classmethod
+    def _summary_state(cls, summary: str | None) -> str:
+        return cls._summary_field(summary, "Current state:") or cls._summary_field(summary, "Recent context:")
+
+    @classmethod
     def _summary_compact_text(cls, summary: str | None) -> str:
         parts: list[str] = []
         for line in (summary or "").splitlines():
@@ -821,6 +939,88 @@ class ProjectContextStore:
                 stripped = value.strip() or stripped
             parts.append(stripped)
         return " | ".join(parts[:2])
+
+    def _build_memory_consolidation_prompt(
+        self,
+        *,
+        project_id: str,
+        workspace_path: str,
+        profile: str,
+        current_summary: str,
+        stored_memory: dict[str, Any],
+        current_sessions: dict[str, str],
+        active_sessions: list[dict[str, Any]],
+        live_summary: str,
+        recent_messages: list[str],
+    ) -> str:
+        session_lines = [
+            f"- {provider}: {session_id}"
+            for provider, session_id in sorted(current_sessions.items())
+            if provider and session_id
+        ] or ["- none"]
+        active_session_lines = [
+            f"- {session.get('provider', '')}: {session.get('title') or session.get('summary') or session.get('session_id') or ''}"
+            for session in active_sessions
+        ] or ["- none"]
+        message_lines = [f"- {self._compact(item, 180)}" for item in recent_messages if (item or "").strip()] or ["- none"]
+        return "\n".join(
+            [
+                "You are consolidating project memory for a coding workspace.",
+                "Return JSON only. No markdown fences.",
+                'Schema: {"focus":"...","current_state":"...","next_step":"...","long_term_memory":"...","key_points":["..."]}',
+                "Rules:",
+                "- Focus on durable project understanding, not chat meta.",
+                "- current_state should describe the latest meaningful situation in 1 sentence.",
+                "- next_step should be the single most important next action.",
+                "- long_term_memory should capture stable constraints, decisions, or strategy.",
+                "- key_points should contain at most 3 short bullets worth remembering.",
+                "",
+                f"Project: {project_id}",
+                f"Workspace: {workspace_path}",
+                f"Profile: {profile or 'none'}",
+                "",
+                "Current structured summary:",
+                current_summary or "none",
+                "",
+                "Stored memory:",
+                f"- focus: {stored_memory.get('focus') or 'none'}",
+                f"- current_state: {stored_memory.get('recent_context') or 'none'}",
+                f"- long_term_memory: {stored_memory.get('memory') or 'none'}",
+                f"- key_points: {', '.join(stored_memory.get('recent_hints') or []) or 'none'}",
+                "",
+                "Current provider bindings:",
+                *session_lines,
+                "",
+                "Active session inventory:",
+                *active_session_lines,
+                "",
+                "Live runtime summary:",
+                live_summary or "none",
+                "",
+                "Recent meaningful messages:",
+                *message_lines,
+            ]
+        )
+
+    @staticmethod
+    def _parse_memory_consolidation_output(raw: str) -> dict[str, Any]:
+        text = (raw or "").strip()
+        if not text:
+            return {}
+        try:
+            payload = json.loads(text)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            pass
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                payload = json.loads(text[start : end + 1])
+                return payload if isinstance(payload, dict) else {}
+            except Exception:
+                return {}
+        return {}
 
     @classmethod
     def _parse_hints_json(cls, raw: str | None) -> list[str]:
