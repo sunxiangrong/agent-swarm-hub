@@ -19,10 +19,11 @@
 ## Current Model
 
 - `project` is the primary container
-- `project_memory` is the only durable long-term memory source
+- `project_memory` is the local memory cache and compatibility layer
 - `workspace_sessions` is live runtime state only
 - `session` is only a resumable window, not the primary memory carrier
-- `projects.summary`, `PROJECT_MEMORY.md`, and `PROJECT_SKILL.md` are generated views from the stored project state
+- `viking://resources/projects/<project-id>/` is the project-scoped OpenViking context store when OV is enabled
+- `projects.summary`, `PROJECT_MEMORY.md`, and `PROJECT_SKILL.md` are generated local views from the stored project state
 - main agent and sub-agents both receive the same compact project memory snapshot
 
 ## Practical Rule

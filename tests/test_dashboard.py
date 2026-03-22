@@ -109,6 +109,7 @@ def test_build_dashboard_snapshot_includes_project_memory_and_runtime(tmp_path) 
     assert payload["active_project_count"] == 1
     project = payload["projects"][0]
     assert project["project_id"] == "agent-browser"
+    assert project["ov_resource_uri"] == "viking://resources/projects/agent-browser"
     assert project["focus"] == "chrome会做的更好吗"
     assert project["next_step"] == "整理项目级长期记忆"
     assert project["current_sessions"] == "codex: codex-current"
@@ -124,6 +125,57 @@ def test_build_dashboard_snapshot_includes_project_memory_and_runtime(tmp_path) 
     assert project["review_return_target"] == "claude"
     assert project["driver_session_id"] == "claude-1"
     assert payload["active_projects"][0]["project_id"] == "agent-browser"
+
+
+def test_build_dashboard_snapshot_prefers_openviking_overview(monkeypatch, tmp_path) -> None:
+    project_db = tmp_path / "projects.sqlite3"
+    session_db = tmp_path / "runtime.sqlite3"
+    workspace_path = tmp_path / "demo"
+    workspace_path.mkdir()
+
+    with sqlite3.connect(project_db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path, profile, summary) VALUES (?, ?, ?, '', '')",
+            ("demo", "demo", str(workspace_path)),
+        )
+    monkeypatch.setattr(dashboard_snapshot, "read_openviking_overview", lambda uri: "OV says this project is about session orchestration.")
+
+    payload = build_dashboard_snapshot(
+        project_store=ProjectContextStore(str(project_db)),
+        session_store=SessionStore(session_db),
+    )
+    project = payload["projects"][0]
+    assert project["ov_overview"] == "OV says this project is about session orchestration."
+    assert "OV: OV says this project is about session orchestration." in project["project_summary_text"]
+    assert "OpenViking live project context" in project["memory_source_text"]
+
+
+def test_dashboard_html_mentions_openviking_sections() -> None:
+    html = dashboard_server._dashboard_html()
+    assert "OpenViking Context" in html
+    assert "Cache Summary" in html
+    assert "Resource Path:" in html
 
 
 def test_build_dashboard_snapshot_includes_workspace_only_project(tmp_path) -> None:

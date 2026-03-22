@@ -128,15 +128,17 @@ Current native project flow:
 
 Project memory model:
 
-- `project_memory` in the database is the only long-term memory source of truth
+- `project_memory` in the database is the local project memory cache and compatibility layer
 - `workspace_sessions` is live runtime state, not durable memory
 - `provider_bindings` and `project_sessions` only manage session resume/switching
-- `projects.summary`, `PROJECT_MEMORY.md`, and `PROJECT_SKILL.md` are generated views
+- `viking://resources/projects/<project-id>/` is the project-scoped OpenViking context store when OV is enabled
+- `projects.summary`, `PROJECT_MEMORY.md`, and `PROJECT_SKILL.md` are generated local views
 
 Project memory files:
 
-- `<project>/PROJECT_MEMORY.md`: generated memory view exported from the database
-- `<project>/PROJECT_SKILL.md`: generated project rules/startup view
+- `viking://resources/projects/<project-id>/`: project-scoped OpenViking context store when OV is enabled
+- `<project>/PROJECT_MEMORY.md`: generated local memory view exported from the stored project state
+- `<project>/PROJECT_SKILL.md`: generated local rules/startup view exported from the stored project state
 
 Manual maintenance commands:
 
@@ -161,7 +163,7 @@ What the startup summary means:
 - `Current Focus`: stable task direction
 - `Current State`: latest useful progress; this is the current state view of project memory
 - `Next Step`: only shown when it adds information beyond focus and state
-- `Project Memory`: compact long-term reminder exported from `project_memory`
+- `Cache Summary`: compact local reminder exported from `project_memory`
 
 What you usually do not need:
 

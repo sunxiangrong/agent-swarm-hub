@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .executor import Executor, build_executor_for_config
+from .openviking_support import read_openviking_overview
 from .paths import project_session_db_path
 
 
@@ -15,6 +16,10 @@ _PROMPT_PROFILE_LIMIT = 160
 _PROMPT_FIELD_LIMIT = 180
 _PROMPT_MESSAGE_LIMIT = 120
 _PROMPT_RECENT_MESSAGE_COUNT = 2
+
+
+def project_ov_resource_uri(project_id: str) -> str:
+    return f"viking://resources/projects/{project_id}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,7 +295,7 @@ class ProjectContextStore:
         if snapshot["recent_context"]:
             lines.append(f"Current State: {snapshot['recent_context']}")
         elif snapshot["memory"]:
-            lines.append(f"Project Memory: {snapshot['memory']}")
+            lines.append(f"Cache Summary: {snapshot['memory']}")
         if snapshot["recent_hints"]:
             lines.append("Recent Memory Hints:")
             lines.extend(f"- {message}" for message in snapshot["recent_hints"])
@@ -358,6 +363,7 @@ class ProjectContextStore:
                 memory_brief = ""
         return {
             "focus": normalized_focus,
+            "current_state": normalized_state,
             "recent_context": normalized_state,
             "next_step": next_step,
             "memory": memory_brief,
@@ -609,6 +615,10 @@ class ProjectContextStore:
         lines = [
             "# PROJECT_MEMORY",
             "",
+            "## Role",
+            "This file is a generated local memory view exported from the project state database.",
+            f"The project-scoped OpenViking context store lives at `{project_ov_resource_uri(project.project_id)}`.",
+            "",
             "## Project",
             project.project_id,
             "",
@@ -620,6 +630,13 @@ class ProjectContextStore:
             "",
             "## Current Focus",
         ]
+        ov_overview = read_openviking_overview(project_ov_resource_uri(project.project_id))
+        if ov_overview:
+            lines[6:6] = [
+                "## OpenViking Overview",
+                ov_overview,
+                "",
+            ]
         if focus:
             lines.append(focus)
         else:
@@ -715,12 +732,12 @@ class ProjectContextStore:
         ]
         if brief["focus"]:
             lines.append(f"Current focus: {brief['focus']}")
-        if brief["recent_context"]:
-            lines.append(f"Current state: {brief['recent_context']}")
+        if brief["current_state"]:
+            lines.append(f"Current state: {brief['current_state']}")
         if brief["next_step"]:
             lines.append(f"Next step: {brief['next_step']}")
         if brief["memory"]:
-            lines.append(f"Long-term memory: {brief['memory']}")
+            lines.append(f"Cache summary: {brief['memory']}")
         if bindings:
             providers = ", ".join(f"{provider}={bindings[provider]}" for provider in sorted(bindings))
             lines.append(f"Current sessions: {providers}")
@@ -732,6 +749,12 @@ class ProjectContextStore:
             )
             if providers:
                 lines.append(f"Current sessions: {providers}")
+        ov_overview = self._compact(
+            read_openviking_overview(project_ov_resource_uri(project.project_id)),
+            220,
+        )
+        if ov_overview:
+            lines.append(f"OpenViking overview: {ov_overview}")
         return "\n".join(lines)
 
     def render_project_skill_markdown(self, project_id: str) -> str:
@@ -741,16 +764,36 @@ class ProjectContextStore:
         stored_memory = self.get_project_memory(project_id)
         focus = stored_memory.get("focus", "") or self._summary_field(project.summary, "Current focus:")
         recent_context = stored_memory.get("recent_context", "") or self._summary_state(project.summary)
+        ov_overview = self._compact(
+            read_openviking_overview(project_ov_resource_uri(project.project_id)),
+            420,
+        )
         lines = [
             "# PROJECT_SKILL",
             "",
+            "## Role",
+            "This file is a generated local rules/startup view exported from the project state and OV project context.",
+            "",
             "## Startup",
-            f"- First read `PROJECT_MEMORY.md` in `{project.workspace_path}`.",
+            f"- Treat `{project_ov_resource_uri(project.project_id)}` as the project-scoped context store when OpenViking is available.",
+            f"- Use `PROJECT_MEMORY.md` in `{project.workspace_path}` as the local exported startup view.",
             "- Treat `Current Focus` as the default priority unless the user changes direction.",
             "- Treat `Current State` as the latest known status, not as a full history replay.",
             "",
-            "## Work Rules",
         ]
+        if ov_overview:
+            lines.extend(
+                [
+                    "## OpenViking Context Notes",
+                    ov_overview,
+                    "",
+                ]
+            )
+        lines.extend(
+            [
+            "## Work Rules",
+            ]
+        )
         work_rules = [
             "Prefer continuing the current project thread over starting a new framing from scratch.",
             "Keep outputs, notes, and temporary artifacts inside the project workspace when possible.",
@@ -764,13 +807,16 @@ class ProjectContextStore:
             [
                 "",
                 "## Memory Rules",
+                "- Project-scoped context belongs in OpenViking under the project resource directory when OV is enabled.",
+                "- Local project files are generated exported views; refresh them through the shared sync flow instead of treating them as the primary source of truth.",
                 "- Do not overwrite project memory with meta chat such as asking whether memory exists.",
                 "- When the task meaningfully changes, update project memory through the shared sync flow.",
                 "",
                 "## Files",
                 f"- Workspace: `{project.workspace_path}`",
-                "- Durable state file: `PROJECT_MEMORY.md`",
-                "- Instruction file: `PROJECT_SKILL.md`",
+                f"- OpenViking project context: `{project_ov_resource_uri(project.project_id)}`",
+                "- Local exported memory view: `PROJECT_MEMORY.md`",
+                "- Local exported rules view: `PROJECT_SKILL.md`",
                 "",
             ]
         )

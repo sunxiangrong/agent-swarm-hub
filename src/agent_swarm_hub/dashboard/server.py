@@ -347,6 +347,26 @@ def _dashboard_html() -> str:
       padding-top: 14px;
       border-top: 1px dashed rgba(146, 166, 184, 0.18);
     }
+    .detail-block {
+      margin-top: 14px;
+      border-top: 1px dashed rgba(146, 166, 184, 0.18);
+      padding-top: 12px;
+    }
+    .detail-block summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      list-style: none;
+    }
+    .detail-block summary::-webkit-details-marker {
+      display: none;
+    }
+    .detail-block[open] summary {
+      color: var(--accent-strong);
+      margin-bottom: 8px;
+    }
     .stack {
       display: grid;
       gap: 10px;
@@ -606,6 +626,43 @@ def _dashboard_html() -> str:
         : `
               <div class="runtime-item">Orchestrator is ${escapeHtml(project.current_driver || 'claude')}, but no live session/pane is attached right now.</div>
             `;
+      const detailsBlock = `
+          <details class="detail-block">
+            <summary>Details</summary>
+            <div class="sessions">
+              <dt>OpenViking</dt>
+              <div class="stack">
+                <div class="runtime-item">Resource Path: ${escapeHtml(project.ov_resource_uri || 'n/a')}</div>
+                <div class="runtime-item">${escapeHtml(project.memory_source_text || 'No memory source available.')}</div>
+                <div class="runtime-item">Cache Summary: ${escapeHtml(project.memory || project.current_state || 'No local cache summary yet.')}</div>
+              </div>
+            </div>
+            <div class="sessions">
+              <dt>Session Detail</dt>
+              <div class="stack">
+                <div class="runtime-item">${escapeHtml(project.session_policy_text || 'No session policy available.')}</div>
+                <div class="runtime-item">Current Sessions: <span class="kv">${currentSessions}</span></div>
+                <div class="runtime-item">Phase: ${escapeHtml(project.live_phase || 'n/a')}</div>
+              </div>
+            </div>
+            <div class="runtime">
+              <dt>tmux Preview</dt>
+              <div class="terminal">${tmuxPreview}</div>
+            </div>
+            <div class="runtime">
+              <dt>Swarm</dt>
+              <div class="stack">
+                <div class="runtime-item">Trigger Terminal: ${escapeHtml(project.current_trigger || 'claude')}</div>
+                <div class="runtime-item">Swarm Orchestrator: ${escapeHtml(project.current_driver || 'claude')}</div>
+                <div class="runtime-item">Review Return Target: ${escapeHtml(project.review_return_target || project.current_driver || 'claude')}</div>
+                <div class="runtime-item">Flow: ${escapeHtml(project.swarm_roles_text || 'trigger=claude | orchestrator=claude | planner=claude | executor=codex | reviewer=claude')}</div>
+                <div class="runtime-item">Live CCB Providers: ${escapeHtml(String(project.ccb_live_count || 0))}</div>
+                ${driverLine}
+                ${swarmOverview}
+              </div>
+            </div>
+          </details>
+      `;
       return `
         <section class="card ${project.active ? 'active' : ''}">
           <div class="title">
@@ -625,43 +682,23 @@ def _dashboard_html() -> str:
           </div>
           <dl class="summary-grid">
             <div class="summary-item wide">
-              <dt>Project Memory</dt>
-              <dd>${escapeHtml(project.project_summary_text || 'No durable project memory yet.')}</dd>
+              <dt>OpenViking Context</dt>
+              <dd>${escapeHtml(project.ov_overview || project.project_summary_text || 'No OpenViking project overview yet.')}</dd>
             </div>
             <div class="summary-item">
               <dt>Current Run</dt>
-              <dd>${escapeHtml(project.live_summary || project.state || 'No live runtime summary yet.')}</dd>
+              <dd>${escapeHtml(project.live_summary || project.current_state || 'No live runtime summary yet.')}</dd>
             </div>
-            <div class="summary-item wide">
+            <div class="summary-item">
               <dt>Sessions</dt>
               <dd>${escapeHtml(project.session_overview_text || 'No session overview available.')}</dd>
             </div>
+            <div class="summary-item">
+              <dt>OpenViking Path</dt>
+              <dd>${escapeHtml(project.ov_resource_uri || 'n/a')}</dd>
+            </div>
           </dl>
-          <div class="sessions">
-            <dt>Session Detail</dt>
-            <div class="stack">
-              <div class="runtime-item">${escapeHtml(project.memory_source_text || 'No memory source available.')}</div>
-              <div class="runtime-item">${escapeHtml(project.session_policy_text || 'No session policy available.')}</div>
-              <div class="runtime-item">Current Sessions: <span class="kv">${currentSessions}</span></div>
-              <div class="runtime-item">Phase: ${escapeHtml(project.live_phase || 'n/a')}</div>
-            </div>
-          </div>
-          <div class="runtime">
-            <dt>tmux Preview</dt>
-            <div class="terminal">${tmuxPreview}</div>
-          </div>
-          <div class="runtime">
-            <dt>Swarm</dt>
-            <div class="stack">
-              <div class="runtime-item">Trigger Terminal: ${escapeHtml(project.current_trigger || 'claude')}</div>
-              <div class="runtime-item">Swarm Orchestrator: ${escapeHtml(project.current_driver || 'claude')}</div>
-              <div class="runtime-item">Review Return Target: ${escapeHtml(project.review_return_target || project.current_driver || 'claude')}</div>
-              <div class="runtime-item">Flow: ${escapeHtml(project.swarm_roles_text || 'trigger=claude | orchestrator=claude | planner=claude | executor=codex | reviewer=claude')}</div>
-              <div class="runtime-item">Live CCB Providers: ${escapeHtml(String(project.ccb_live_count || 0))}</div>
-              ${driverLine}
-              ${swarmOverview}
-            </div>
-          </div>
+          ${detailsBlock}
           <div class="action-row">
             <button class="action focus" data-action="focus-driver" data-project="${project.project_id}">Focus Driver</button>
             <button class="action sync" data-action="sync" data-project="${project.project_id}">Sync Memory</button>

@@ -6,7 +6,8 @@ import json
 import time
 from typing import Any
 
-from ..project_context import ProjectContextStore
+from ..openviking_support import read_openviking_overview
+from ..project_context import ProjectContextStore, project_ov_resource_uri
 from ..session_store import SessionStore
 from ..swarm_roles import resolve_swarm_roles
 from .tmux_bridge import load_tmux_project_panes
@@ -32,6 +33,8 @@ def build_dashboard_snapshot(
         tmux_by_workspace=tmux_by_workspace,
         ccb_by_workspace=ccb_by_workspace,
     ):
+        ov_resource_uri = project_ov_resource_uri(project["project_id"])
+        ov_overview = _compact_text(read_openviking_overview(ov_resource_uri), 420)
         memory = project_store.get_project_memory(project["project_id"])
         brief = project_store.derive_session_brief(
             focus=memory.get("focus", "") or project_store._summary_field(project["summary"], "Current focus:"),
@@ -60,13 +63,15 @@ def build_dashboard_snapshot(
             has_focus=bool(brief["focus"]),
         )
         project_summary_text = _project_summary_text(
+            ov_overview=ov_overview,
             focus=brief["focus"],
-            state=brief["recent_context"],
+            state=brief["current_state"],
             next_step=brief["next_step"],
             memory=brief["memory"],
             live_summary=live_summary,
         )
         memory_source_text = _memory_source_text(
+            has_ov_overview=bool(ov_overview),
             has_stored_memory=bool(memory.get("focus") or memory.get("recent_context") or memory.get("memory") or memory.get("recent_hints")),
             has_project_summary=bool(project["summary"]),
             has_live_summary=bool(live_summary),
@@ -87,9 +92,12 @@ def build_dashboard_snapshot(
                 "workspace_path": project["workspace_path"],
                 "pinned": project["project_id"] in pinned_projects,
                 "focus": brief["focus"],
-                "state": brief["recent_context"],
+                "current_state": brief["current_state"],
+                "state": brief["current_state"],
                 "next_step": brief["next_step"],
                 "memory": brief["memory"],
+                "ov_resource_uri": ov_resource_uri,
+                "ov_overview": ov_overview,
                 "project_summary_text": project_summary_text,
                 "memory_source_text": memory_source_text,
                 "current_sessions": current_session_line,
@@ -261,8 +269,10 @@ def _load_runtime_sessions(session_store: SessionStore) -> dict[str, list[dict[s
     return grouped
 
 
-def _project_summary_text(*, focus: str, state: str, next_step: str, memory: str, live_summary: str) -> str:
+def _project_summary_text(*, ov_overview: str, focus: str, state: str, next_step: str, memory: str, live_summary: str) -> str:
     parts: list[str] = []
+    if ov_overview:
+        parts.append(f"OV: {ov_overview}")
     if focus:
         parts.append(f"Focus: {focus}")
     if state:
@@ -270,15 +280,17 @@ def _project_summary_text(*, focus: str, state: str, next_step: str, memory: str
     if next_step:
         parts.append(f"Next: {next_step}")
     if memory:
-        parts.append(f"Memory: {memory}")
+        parts.append(f"Cache: {memory}")
     if not parts and live_summary:
         parts.append(f"Live: {live_summary}")
     return " | ".join(parts[:4])
 
 
-def _memory_source_text(*, has_stored_memory: bool, has_project_summary: bool, has_live_summary: bool) -> str:
+def _memory_source_text(*, has_ov_overview: bool, has_stored_memory: bool, has_project_summary: bool, has_live_summary: bool) -> str:
+    if has_ov_overview:
+        return "Primary source: OpenViking live project context under viking://resources/projects/<project-id>. Local cache and exported views follow this overview."
     if has_stored_memory:
-        return "Primary source: stored project memory. Synced into projects.summary and PROJECT_MEMORY.md."
+        return "Primary source: stored project memory cache. Exported into local views such as projects.summary and PROJECT_MEMORY.md."
     if has_project_summary:
         return "Primary source: structured project summary. Sync memory to make it durable."
     if has_live_summary:

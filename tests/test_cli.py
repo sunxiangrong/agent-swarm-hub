@@ -258,6 +258,268 @@ def test_cli_runs_dashboard_and_opens_browser(monkeypatch) -> None:
     assert opened == {"host": "127.0.0.1", "port": 8765}
 
 
+def test_cli_openviking_write_only_writes_config_from_env(monkeypatch, tmp_path, capsys) -> None:
+    written = {}
+
+    def fake_build():
+        return {"storage": {"workspace": "/tmp/ov-data"}}
+
+    def fake_validate(config):
+        written["validated"] = config
+
+    def fake_write(config, output_path):
+        output = Path(output_path)
+        written["config"] = config
+        written["output"] = output
+        return output
+
+    monkeypatch.setattr("agent_swarm_hub.cli.build_openviking_config_from_env", fake_build)
+    monkeypatch.setattr("agent_swarm_hub.cli.validate_openviking_config", fake_validate)
+    monkeypatch.setattr("agent_swarm_hub.cli.write_openviking_config", fake_write)
+    monkeypatch.setattr("agent_swarm_hub.cli.load_env_file", lambda _path: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.apply_runtime_env", lambda: None)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "openviking", "--config-out", str(tmp_path / "ov.conf"), "--write-only"])
+
+    exit_code = main()
+    output = capsys.readouterr().out.strip()
+
+    assert exit_code == 0
+    assert written["config"] == {"storage": {"workspace": "/tmp/ov-data"}}
+    assert written["validated"] == {"storage": {"workspace": "/tmp/ov-data"}}
+    assert written["output"] == tmp_path / "ov.conf"
+    assert output.endswith("ov.conf")
+
+
+def test_cli_openviking_reuses_existing_config_without_env(monkeypatch, tmp_path, capsys) -> None:
+    config_path = tmp_path / "ov.conf"
+    config_path.write_text('{"storage":{"workspace":"/tmp/ov-data"}}\n', encoding="utf-8")
+    called = {}
+
+    def fail_build():
+        raise AssertionError("should not rebuild config")
+
+    def fake_read(path):
+        called["read"] = Path(path)
+        return {"storage": {"workspace": "/tmp/ov-data"}}
+
+    def fake_validate(config):
+        called["validated"] = config
+
+    def fake_run(argv, env=None, check=False):
+        called["argv"] = argv
+        called["config_file"] = (env or {}).get("OPENVIKING_CONFIG_FILE")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("agent_swarm_hub.cli.build_openviking_config_from_env", fail_build)
+    monkeypatch.setattr("agent_swarm_hub.cli.read_openviking_config", fake_read)
+    monkeypatch.setattr("agent_swarm_hub.cli.validate_openviking_config", fake_validate)
+    monkeypatch.setattr("agent_swarm_hub.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_swarm_hub.cli.load_env_file", lambda _path: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.apply_runtime_env", lambda: None)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "ov", "--config-out", str(config_path)])
+
+    exit_code = main()
+    output = capsys.readouterr().out.strip()
+
+    assert exit_code == 0
+    assert called["read"] == config_path
+    assert called["validated"] == {"storage": {"workspace": "/tmp/ov-data"}}
+    assert called["argv"] == ["openviking-server"]
+    assert called["config_file"] == str(config_path)
+    assert output.endswith("ov.conf")
+
+
+def test_cli_openviking_status_checks_health(monkeypatch, tmp_path, capsys) -> None:
+    config_path = tmp_path / "ov.conf"
+    config_path.write_text('{"server":{"host":"127.0.0.1","port":1933}}\n', encoding="utf-8")
+
+    monkeypatch.setattr("agent_swarm_hub.cli._ensure_openviking_config", lambda config_out=None: config_path)
+    monkeypatch.setattr("agent_swarm_hub.cli.read_openviking_config", lambda path: {"server": {"host": "127.0.0.1", "port": 1933}})
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"status":"ok"}'
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda url, timeout=0: FakeResponse())
+    monkeypatch.setattr("agent_swarm_hub.cli.load_env_file", lambda _path: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.apply_runtime_env", lambda: None)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "ov", "status", "--config-out", str(config_path)])
+
+    exit_code = main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Config:" in output
+    assert "Server: http://127.0.0.1:1933" in output
+    assert "Health: ok" in output
+
+
+def test_cli_openviking_sync_invokes_sync_script(monkeypatch) -> None:
+    called = {}
+
+    def fake_run(argv, env=None, check=False):
+        called["argv"] = argv
+        called["env"] = env or {}
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("agent_swarm_hub.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_swarm_hub.cli.load_env_file", lambda _path: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.apply_runtime_env", lambda: None)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "ov", "sync", "knowledge-system", "--push-live"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert "--project" in called["argv"]
+    assert "knowledge-system" in called["argv"]
+    assert "--push-live" in called["argv"]
+    assert called["env"]["NO_PROXY"] == "*"
+    assert called["env"]["no_proxy"] == "*"
+
+
+def test_cli_openviking_sync_can_request_rebuild_tree(monkeypatch) -> None:
+    called = {}
+
+    def fake_run(argv, env=None, check=False):
+        called["argv"] = argv
+        called["env"] = env or {}
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("agent_swarm_hub.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_swarm_hub.cli.load_env_file", lambda _path: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.apply_runtime_env", lambda: None)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "ov", "sync", "knowledge-system", "--push-live", "--rebuild-tree"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert "--rebuild-tree" in called["argv"]
+
+
+def test_cli_openviking_tui_opens_project_uri(monkeypatch) -> None:
+    called = {}
+
+    def fake_run(argv, check=False):
+        called["argv"] = argv
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("agent_swarm_hub.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_swarm_hub.cli.load_env_file", lambda _path: None)
+    monkeypatch.setattr("agent_swarm_hub.cli.apply_runtime_env", lambda: None)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "ov", "tui", "knowledge-system"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert called["argv"] == ["ov", "tui", "viking://resources/projects/knowledge-system"]
+
+
+def test_sync_openviking_project_artifacts_pushes_live_project(monkeypatch) -> None:
+    called = {"builds": [], "pushes": []}
+
+    def fake_run(argv, cwd=None, check=False):
+        called["builds"].append(argv)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("agent_swarm_hub.cli.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "agent_swarm_hub.cli._push_openviking_project_live",
+        lambda project_id, rebuild_tree=False: called["pushes"].append(project_id) or True,
+    )
+
+    from agent_swarm_hub.cli import _sync_openviking_project_artifacts
+
+    _sync_openviking_project_artifacts("knowledge-system")
+
+    assert len(called["builds"]) == 2
+    assert called["pushes"] == ["knowledge-system"]
+
+
+def test_sync_openviking_project_artifacts_rebuilds_tree_when_requested(monkeypatch) -> None:
+    called = {"builds": [], "pushes": []}
+
+    def fake_run(argv, cwd=None, check=False):
+        called["builds"].append(argv)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("agent_swarm_hub.cli.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "agent_swarm_hub.cli._push_openviking_project_live",
+        lambda project_id, rebuild_tree=False: called["pushes"].append((project_id, rebuild_tree)) or True,
+    )
+
+    from agent_swarm_hub.cli import _sync_openviking_project_artifacts
+
+    _sync_openviking_project_artifacts("knowledge-system", rebuild_tree=True)
+
+    assert any("--rebuild" in argv for argv in called["builds"])
+    assert called["pushes"] == [("knowledge-system", True)]
+
+
+def test_cli_local_chat_auto_prepares_openviking_project(monkeypatch, capsys) -> None:
+    called: list[str] = []
+    inputs = iter(["/quit"])
+
+    monkeypatch.setenv("ASH_EXECUTOR", "echo")
+    monkeypatch.setattr("agent_swarm_hub.cli._auto_prepare_openviking_project", lambda project_id: called.append(project_id))
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-swarm-hub", "local-chat", "--provider", "echo", "--project", "knowledge-system"],
+    )
+
+    exit_code = main()
+    _ = capsys.readouterr()
+
+    assert exit_code == 0
+    assert called == ["knowledge-system"]
+
+
+def test_cli_local_native_auto_prepares_openviking_project(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    workspace_path = tmp_path / "project"
+    workspace_path.mkdir()
+    called: list[str] = []
+
+    store = SessionStore(db_path)
+    store.upsert_workspace(
+        workspace_id="knowledge-system",
+        title="knowledge-system",
+        path=str(workspace_path),
+        backend="codex",
+        transport="direct",
+    )
+
+    captured = {}
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setattr("agent_swarm_hub.cli.read_openviking_overview", lambda *args, **kwargs: "OV project overview")
+    monkeypatch.setattr("agent_swarm_hub.cli._sync_openviking_project_artifacts", lambda project_id: None)
+    monkeypatch.setattr("agent_swarm_hub.cli._auto_prepare_openviking_project", lambda project_id: called.append(project_id))
+    _patch_native_run(monkeypatch, captured)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "knowledge-system"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert called == ["knowledge-system"]
+
+
+def test_push_openviking_project_live_respects_disabled_auto(monkeypatch) -> None:
+    monkeypatch.setenv("ASH_OPENVIKING_AUTO", "0")
+    monkeypatch.setattr("agent_swarm_hub.cli._ensure_openviking_service_running", lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not start OV")))
+    monkeypatch.setattr("agent_swarm_hub.cli.import_project_tree_to_openviking", lambda project_id: (_ for _ in ()).throw(AssertionError("should not push live")))
+
+    from agent_swarm_hub.cli import _push_openviking_project_live
+
+    assert _push_openviking_project_live("knowledge-system") is False
+
+
 def test_cli_without_command_prints_main_menu(monkeypatch, capsys) -> None:
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub"])
 
@@ -666,6 +928,8 @@ def test_cli_local_native_launches_provider_in_workspace(monkeypatch, tmp_path) 
     captured = {}
 
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setattr("agent_swarm_hub.cli.read_openviking_overview", lambda *args, **kwargs: "OV project overview")
+    monkeypatch.setattr("agent_swarm_hub.cli._sync_openviking_project_artifacts", lambda project_id: None)
     _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
 
@@ -685,9 +949,11 @@ def test_cli_local_native_launches_provider_in_workspace(monkeypatch, tmp_path) 
     assert "Project summary for this session:" in captured["argv"][-1]
     assert f"- Project: project-alpha" in captured["argv"][-1]
     assert f"- Path: {workspace_path}" in captured["argv"][-1]
-    assert f"- Read first: {workspace_path}/PROJECT_MEMORY.md" in captured["argv"][-1]
-    assert f"- Rules file: {workspace_path}/PROJECT_SKILL.md" in captured["argv"][-1]
-    assert "Use these project files plus this summary as the project context for the session." in captured["argv"][-1]
+    assert "- OpenViking Overview: OV project overview" in captured["argv"][-1]
+    assert "- OpenViking Project Context: viking://resources/projects/project-alpha" in captured["argv"][-1]
+    assert f"- Local Memory View: {workspace_path}/PROJECT_MEMORY.md" in captured["argv"][-1]
+    assert f"- Local Rules View: {workspace_path}/PROJECT_SKILL.md" in captured["argv"][-1]
+    assert "Use the OpenViking project context as the project-scoped source when available; use the local files as exported startup views." in captured["argv"][-1]
 
 
 def test_cli_local_native_resumes_shared_project_session(monkeypatch, tmp_path) -> None:
@@ -760,6 +1026,8 @@ def test_cli_local_native_resumes_shared_project_session(monkeypatch, tmp_path) 
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr("agent_swarm_hub.cli.read_openviking_overview", lambda *args, **kwargs: "OV project overview")
+    monkeypatch.setattr("agent_swarm_hub.cli._sync_openviking_project_artifacts", lambda project_id: None)
     _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
 
@@ -1263,6 +1531,7 @@ def test_cli_local_native_exports_both_project_provider_sessions(monkeypatch, tm
     assert captured["env"]["ASH_CLAUDE_SESSION_ID"] == "claude-session-abc"
     assert captured["env"]["ASH_CODEX_SESSION_ID"] == "codex-session-123"
     assert captured["env"]["ASH_PROJECT_MEMORY_HINTS"] == ""
+    assert captured["env"]["ASH_PROJECT_MEMORY_OVERVIEW"] == "OV project overview"
 
 
 def test_cli_local_native_rejects_explicit_shared_project_without_path(monkeypatch, tmp_path, capsys) -> None:
@@ -2105,7 +2374,7 @@ def test_cli_local_native_project_summary_prompt_avoids_repeating_last_hint(monk
     assert "- Current Focus: chrome会做的更好吗" in captured["argv"][-1]
     assert "- Current State: chrome会做的更好吗" in captured["argv"][-1]
     assert "- Next Step:" not in captured["argv"][-1]
-    assert "- Project Memory: Compare whether Chrome-native tooling would produce a more reliable browser workflow." in captured["argv"][-1]
+    assert "- Cache Summary: Compare whether Chrome-native tooling would produce a more reliable browser workflow." in captured["argv"][-1]
 
 
 def test_project_context_sync_updates_structured_project_summary(tmp_path) -> None:
@@ -2201,7 +2470,7 @@ def test_project_context_sync_updates_structured_project_summary(tmp_path) -> No
     assert "Current focus: chrome会做的更好吗" in summary
     assert "Current state: 已经确认当前问题是项目级上下文摘要过度退化" in summary
     assert "Next step: 整理项目级长期记忆" in summary
-    assert "Long-term memory: Compare whether Chrome-native tooling would produce a more reliable browser workflow." in summary
+    assert "Cache summary: Compare whether Chrome-native tooling would produce a more reliable browser workflow." in summary
 
 
 def test_cli_local_native_rejects_workspace_without_path(monkeypatch, tmp_path, capsys) -> None:
@@ -2332,6 +2601,8 @@ def test_cli_project_sessions_sync_memory(monkeypatch, tmp_path, capsys) -> None
         )
 
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    ov_sync = {}
+    imports_root = tmp_path / "ov-imports"
     class FakeMemoryExecutor:
         def run(self, prompt: str):
             return SimpleNamespace(
@@ -2347,14 +2618,29 @@ def test_cli_project_sessions_sync_memory(monkeypatch, tmp_path, capsys) -> None
                 )
             )
     monkeypatch.setattr("agent_swarm_hub.project_context.build_executor_for_config", lambda **_: FakeMemoryExecutor())
+
+    def fake_ov_sync(project_id: str) -> None:
+        ov_sync["project_id"] = project_id
+        project_root = imports_root / project_id
+        (project_root / "runtime").mkdir(parents=True, exist_ok=True)
+        (project_root / "README.md").write_text("# agent-browser\n\nOV project tree.\n", encoding="utf-8")
+        (project_root / "runtime" / "memory_bundle.md").write_text("OV says this project memory just synced.\n", encoding="utf-8")
+
+    monkeypatch.setattr("agent_swarm_hub.cli._sync_openviking_project_artifacts", fake_ov_sync)
+    monkeypatch.setattr("agent_swarm_hub.openviking_support.DEFAULT_IMPORT_TREE_ROOT", imports_root)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "sync-memory", "agent-browser"])
     exit_code = main()
     output = capsys.readouterr().out
 
     assert exit_code == 0
     assert "Synced project memory for `agent-browser`." in output
+    assert ov_sync["project_id"] == "agent-browser"
     assert (workspace_path / "PROJECT_MEMORY.md").exists()
     assert (workspace_path / "PROJECT_SKILL.md").exists()
+    assert "## OpenViking Overview" in (workspace_path / "PROJECT_MEMORY.md").read_text(encoding="utf-8")
+    assert "OV says this project memory just synced." in (workspace_path / "PROJECT_MEMORY.md").read_text(encoding="utf-8")
+    assert "## OpenViking Context Notes" in (workspace_path / "PROJECT_SKILL.md").read_text(encoding="utf-8")
+    assert "OV says this project memory just synced." in (workspace_path / "PROJECT_SKILL.md").read_text(encoding="utf-8")
     with sqlite3.connect(shared_db_path) as conn:
         summary = conn.execute("SELECT summary FROM projects WHERE project_id = ?", ("agent-browser",)).fetchone()[0]
     assert "Current focus: chrome会做的更好吗" in summary

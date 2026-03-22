@@ -15,7 +15,18 @@ from .config import RuntimeConfig, apply_runtime_env, load_env_file
 from .dashboard import serve_dashboard
 from .executor import build_executor_for_config
 from .lark_ws_runner import LarkWebSocketRunner
-from .project_context import ProjectContextStore
+from .openviking_support import (
+    build_openviking_config_from_env,
+    import_project_tree_to_openviking,
+    openviking_server_url,
+    read_openviking_overview,
+    read_openviking_config,
+    resolve_openviking_config_path,
+    sync_project_tree_to_openviking,
+    validate_openviking_config,
+    write_openviking_config,
+)
+from .project_context import ProjectContextStore, project_ov_resource_uri
 from .paths import project_session_db_path, projects_root, provider_command
 from .remote import RemoteMessage, RemotePlatform
 from .session_store import SessionStore, WorkspaceRecord
@@ -245,12 +256,14 @@ def _run_local_chat(*, provider: str, chat_id: str, user_id: str, project: str |
     if project:
         response = adapter.handle_message(_local_message(chat_id=chat_id, user_id=user_id, text=f"/use {project}"))
         print(response.text)
+        _auto_prepare_openviking_project(project)
     elif sys.stdin.isatty():
         print(adapter.handle_message(_local_message(chat_id=chat_id, user_id=user_id, text="/projects")).text)
         selected_workspace = _pick_startup_workspace(store=store)
         if selected_workspace:
             response = adapter.handle_message(_local_message(chat_id=chat_id, user_id=user_id, text=f"/use {selected_workspace}"))
             print(response.text)
+            _auto_prepare_openviking_project(selected_workspace)
         else:
             print("Temporary local chat is ready. Just start chatting.")
         print("Chat naturally. Use /help for advanced commands or /quit to exit the current project/chat.")
@@ -325,6 +338,7 @@ def _consolidate_bound_workspace_memory(*, adapter: CCConnectAdapter, session_ke
         live_summary=live_summary,
         recent_messages=recent_messages,
     )
+    _sync_project_memory_artifacts(adapter.project_context_store, project_id)
 
 
 def _resolve_workspace_record(*, store: SessionStore, workspace_id: str | None, provider: str) -> WorkspaceRecord | None:
@@ -514,12 +528,15 @@ def _build_project_summary_prompt(*, workspace_id: str, work_dir: str, summary: 
     ]
     if brief["focus"]:
         lines.append(f"- Current Focus: {brief['focus']}")
-    if brief["recent_context"]:
-        lines.append(f"- Current State: {brief['recent_context']}")
+    if brief["current_state"]:
+        lines.append(f"- Current State: {brief['current_state']}")
     if brief["next_step"]:
         lines.append(f"- Next Step: {brief['next_step']}")
     if brief["memory"]:
-        lines.append(f"- Project Memory: {brief['memory']}")
+        lines.append(f"- Cache Summary: {brief['memory']}")
+    ov_overview = read_openviking_overview(project_ov_resource_uri(workspace_id)).replace("\n", " ").strip()
+    if ov_overview:
+        lines.append(f"- OpenViking Overview: {ov_overview}")
     lines.extend(
         [
             "- Swarm Mode: complex tasks may automatically enter coordinated multi-agent execution",
@@ -529,9 +546,10 @@ def _build_project_summary_prompt(*, workspace_id: str, work_dir: str, summary: 
             "- Return Target: claude",
         ]
     )
-    lines.append(f"- Read first: {work_dir}/PROJECT_MEMORY.md")
-    lines.append(f"- Rules file: {work_dir}/PROJECT_SKILL.md")
-    lines.append("Use these project files plus this summary as the project context for the session.")
+    lines.append(f"- OpenViking Project Context: {project_ov_resource_uri(workspace_id)}")
+    lines.append(f"- Local Memory View: {work_dir}/PROJECT_MEMORY.md")
+    lines.append(f"- Local Rules View: {work_dir}/PROJECT_SKILL.md")
+    lines.append("Use the OpenViking project context as the project-scoped source when available; use the local files as exported startup views.")
     return "\n".join(lines)
 
 
@@ -626,6 +644,7 @@ def _clear_project_runtime_env(env: dict[str, str]) -> None:
         "ASH_PROJECT_MEMORY_RECENT_CONTEXT",
         "ASH_PROJECT_MEMORY_SUMMARY",
         "ASH_PROJECT_MEMORY_HINTS",
+        "ASH_PROJECT_MEMORY_OVERVIEW",
         "ASH_PROVIDER_SESSION_ID",
         "ASH_CLAUDE_SESSION_ID",
         "ASH_CODEX_SESSION_ID",
@@ -677,6 +696,9 @@ def _inject_project_memory_env(
     env["ASH_PROJECT_MEMORY_RECENT_CONTEXT"] = snapshot["recent_context"]
     env["ASH_PROJECT_MEMORY_SUMMARY"] = snapshot["memory"]
     env["ASH_PROJECT_MEMORY_HINTS"] = " || ".join(snapshot["recent_hints"])
+    env["ASH_PROJECT_MEMORY_OVERVIEW"] = read_openviking_overview(
+        project_ov_resource_uri(snapshot["project_id"])
+    )
     return True
 
 
@@ -1162,8 +1184,93 @@ def _project_sessions_use(project_id: str, provider: str, session_id: str) -> in
 
 def _sync_project_memory_artifacts(store: ProjectContextStore, project_id: str) -> None:
     store.sync_project_summary(project_id)
+    _sync_openviking_project_artifacts(project_id)
     store.sync_project_memory_file(project_id)
     store.sync_project_skill_file(project_id)
+
+
+def _openviking_auto_manage_enabled() -> bool:
+    raw = (os.getenv("ASH_OPENVIKING_AUTO") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _openviking_health_ok(config_path: Path) -> bool:
+    import urllib.error
+    import urllib.request
+
+    try:
+        config = read_openviking_config(config_path)
+        with urllib.request.urlopen(f"{openviking_server_url(config)}/api/v1/health", timeout=1.0):
+            return True
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError):
+        return False
+
+
+def _ensure_openviking_service_running(*, config_out: str | None = None) -> bool:
+    if not _openviking_auto_manage_enabled():
+        return False
+    config_path = resolve_openviking_config_path(config_out)
+    if config_path is None:
+        try:
+            config_path = _ensure_openviking_config(config_out=config_out)
+        except Exception:
+            return False
+    if _openviking_health_ok(config_path):
+        return True
+    env = os.environ.copy()
+    env["OPENVIKING_CONFIG_FILE"] = str(config_path)
+    try:
+        subprocess.Popen(
+            ["openviking-server"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return False
+    time.sleep(0.6)
+    return _openviking_health_ok(config_path)
+
+
+def _push_openviking_project_live(project_id: str, *, rebuild_tree: bool = False) -> bool:
+    if not project_id or not _openviking_auto_manage_enabled():
+        return False
+    if not _ensure_openviking_service_running():
+        return False
+    try:
+        if rebuild_tree:
+            return import_project_tree_to_openviking(project_id)
+        return sync_project_tree_to_openviking(project_id)
+    except Exception:
+        return False
+
+
+def _auto_prepare_openviking_project(project_id: str | None) -> None:
+    if not project_id:
+        return
+    _push_openviking_project_live(project_id)
+
+
+def _sync_openviking_project_artifacts(project_id: str, *, rebuild_tree: bool = False) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    scripts_dir = repo_root / "scripts"
+    commands = [
+        [
+            sys.executable,
+            str(scripts_dir / "build-openviking-project-tree.py"),
+            "--project",
+            project_id,
+            *(["--rebuild"] if rebuild_tree else []),
+        ],
+        [sys.executable, str(scripts_dir / "build-openviking-memory-bundle.py"), "--project", project_id],
+    ]
+    for argv in commands:
+        try:
+            subprocess.run(argv, cwd=str(repo_root), check=False)
+        except OSError:
+            return
+    _push_openviking_project_live(project_id, rebuild_tree=rebuild_tree)
 
 
 def _consolidate_project_memory_artifacts(
@@ -1261,6 +1368,7 @@ def _run_local_native(*, provider: str, project: str | None) -> int:
         context_store = ProjectContextStore()
         project = context_store.get_project(workspace.workspace_id)
         project_summary = project.summary if project is not None else ""
+        _auto_prepare_openviking_project(workspace.workspace_id)
         env["ASH_ACTIVE_WORKSPACE"] = workspace.workspace_id
         env["ASH_PROJECT_PATH"] = work_dir
         env["CCB_WORK_DIR"] = work_dir
@@ -1436,6 +1544,84 @@ def _open_dashboard_url(*, host: str, port: int) -> None:
     subprocess.Popen(["open", f"http://{host}:{port}"])
 
 
+def _default_openviking_config_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "var" / "openviking" / "ov.conf"
+
+
+def _ensure_openviking_config(*, config_out: str | None) -> Path:
+    config_path = Path(config_out).expanduser().resolve() if config_out else _default_openviking_config_path()
+    has_openviking_env = any(
+        os.environ.get(name)
+        for name in (
+            "OPENVIKING_ARK_API_KEY",
+            "OPENVIKING_VLM_API_KEY",
+            "OPENVIKING_EMBEDDING_API_KEY",
+            "OPENVIKING_VLM_MODEL",
+            "OPENVIKING_EMBEDDING_MODEL",
+            "OPENVIKING_STORAGE_WORKSPACE",
+        )
+    )
+    if has_openviking_env or not config_path.exists():
+        config = build_openviking_config_from_env()
+        validate_openviking_config(config)
+        write_openviking_config(config, config_path)
+    else:
+        validate_openviking_config(read_openviking_config(config_path))
+    return config_path
+
+
+def _run_openviking_server(*, config_out: str | None, write_only: bool) -> int:
+    config_path = _ensure_openviking_config(config_out=config_out)
+    print(config_path)
+    if write_only:
+        return 0
+    env = os.environ.copy()
+    env["OPENVIKING_CONFIG_FILE"] = str(config_path)
+    return subprocess.run(["openviking-server"], env=env, check=False).returncode
+
+
+def _openviking_status(*, config_out: str | None) -> int:
+    import urllib.error
+    import urllib.request
+
+    config_path = _ensure_openviking_config(config_out=config_out)
+    config = read_openviking_config(config_path)
+    url = openviking_server_url(config)
+    print(f"Config: {config_path}")
+    print(f"Server: {url}")
+    try:
+        with urllib.request.urlopen(f"{url}/api/v1/health", timeout=2.0) as response:
+            body = response.read().decode("utf-8", errors="ignore").strip()
+        print(f"Health: ok {body or ''}".strip())
+        return 0
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        print(f"Health: unreachable ({exc})")
+        return 1
+
+
+def _openviking_sync(*, project: str | None, sync_all: bool, push_live: bool, rebuild_tree: bool) -> int:
+    scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
+    argv = [sys.executable, str(scripts_dir / "sync-openviking-projects.py")]
+    if project and not sync_all:
+        argv.extend(["--project", project])
+    if push_live:
+        argv.append("--push-live")
+    if rebuild_tree:
+        argv.append("--rebuild-tree")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1]) + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    env["NO_PROXY"] = "*"
+    env["no_proxy"] = "*"
+    return subprocess.run(argv, env=env, check=False).returncode
+
+
+def _openviking_tui(*, project: str | None) -> int:
+    target = project_ov_resource_uri(project) if project else "viking://resources/projects"
+    return subprocess.run(["ov", "tui", target], check=False).returncode
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="agent-swarm-hub local runners")
     parser.add_argument(
@@ -1489,6 +1675,22 @@ def main() -> int:
     dash_short.add_argument("--host", default="127.0.0.1")
     dash_short.add_argument("--port", type=int, default=8765)
     dash_short.add_argument("--open", action="store_true", help="Open the dashboard URL in the local browser")
+    openviking = subparsers.add_parser("openviking", help="Manage OpenViking config, server, sync, and TUI")
+    openviking.add_argument("action", nargs="?", choices=("start", "status", "sync", "tui"), default="start")
+    openviking.add_argument("project", nargs="?", default=None, help="Optional project id for sync/tui")
+    openviking.add_argument("--config-out", default=None, help="Optional path for generated ov.conf")
+    openviking.add_argument("--write-only", action="store_true", help="Only write ov.conf and exit")
+    openviking.add_argument("--push-live", action="store_true", help="When syncing, also push the project tree into live OV resources")
+    openviking.add_argument("--all", action="store_true", help="When syncing, process all projects")
+    openviking.add_argument("--rebuild-tree", action="store_true", help="When syncing, rebuild the whole project tree instead of updating current files in place")
+    ov_short = subparsers.add_parser("ov", help="Shortcut for openviking")
+    ov_short.add_argument("action", nargs="?", choices=("start", "status", "sync", "tui"), default="start")
+    ov_short.add_argument("project", nargs="?", default=None, help="Optional project id for sync/tui")
+    ov_short.add_argument("--config-out", default=None, help="Optional path for generated ov.conf")
+    ov_short.add_argument("--write-only", action="store_true", help="Only write ov.conf and exit")
+    ov_short.add_argument("--push-live", action="store_true", help="When syncing, also push the project tree into live OV resources")
+    ov_short.add_argument("--all", action="store_true", help="When syncing, process all projects")
+    ov_short.add_argument("--rebuild-tree", action="store_true", help="When syncing, rebuild the whole project tree instead of updating current files in place")
     project_sessions = subparsers.add_parser("project-sessions", help="Manage project-mapped native sessions")
     project_sessions_sub = project_sessions.add_subparsers(dest="project_sessions_command", required=True)
     project_sessions_current = project_sessions_sub.add_parser("current", help="Show current bound sessions for a project")
@@ -1593,6 +1795,16 @@ def main() -> int:
             _open_dashboard_url(host=args.host, port=args.port)
         serve_dashboard(host=args.host, port=args.port)
         return 0
+    if args.command in {"openviking", "ov"}:
+        if args.action == "start":
+            return _run_openviking_server(config_out=args.config_out, write_only=args.write_only)
+        if args.action == "status":
+            return _openviking_status(config_out=args.config_out)
+        if args.action == "sync":
+            return _openviking_sync(project=args.project, sync_all=args.all, push_live=args.push_live, rebuild_tree=args.rebuild_tree)
+        if args.action == "tui":
+            return _openviking_tui(project=args.project)
+        return 1
     if args.command == "project-sessions":
         if args.project_sessions_command == "current":
             return _project_sessions_current(args.project)
