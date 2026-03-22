@@ -14,7 +14,7 @@ payload = {
     "session_id": os.getenv("ASH_PROJECT_SESSION_ID", ""),
     "memory_project_id": os.getenv("ASH_PROJECT_MEMORY_PROJECT_ID", ""),
     "focus": os.getenv("ASH_PROJECT_MEMORY_FOCUS", ""),
-    "recent_context": os.getenv("ASH_PROJECT_MEMORY_RECENT_CONTEXT", ""),
+    "current_state": os.getenv("ASH_PROJECT_MEMORY_CURRENT_STATE", os.getenv("ASH_PROJECT_MEMORY_RECENT_CONTEXT", "")),
 }
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 JSON
@@ -31,6 +31,7 @@ fi
 if [[ -n "${ASH_PROJECT_MEMORY_FOCUS:-}" ]]; then
   echo "Focus: ${ASH_PROJECT_MEMORY_FOCUS}"
 fi
-if [[ -n "${ASH_PROJECT_MEMORY_RECENT_CONTEXT:-}" ]]; then
-  echo "Recent Context: ${ASH_PROJECT_MEMORY_RECENT_CONTEXT}"
+CURRENT_STATE="${ASH_PROJECT_MEMORY_CURRENT_STATE:-${ASH_PROJECT_MEMORY_RECENT_CONTEXT:-}}"
+if [[ -n "${CURRENT_STATE}" ]]; then
+  echo "Current State: ${CURRENT_STATE}"
 fi

@@ -40,6 +40,11 @@ def sync_project(project_id: str, *, push_live: bool = False, rebuild_tree: bool
         cwd=str(REPO_ROOT),
         check=True,
     )
+    subprocess.run(
+        [python, str(REPO_ROOT / "scripts" / "build-openviking-project-brain.py"), "--project", project_id],
+        cwd=str(REPO_ROOT),
+        check=True,
+    )
     if not push_live:
         return False
     if rebuild_tree:

@@ -176,6 +176,7 @@ def test_sync_project_tree_to_openviking_updates_files_in_place(monkeypatch, tmp
     (project_root / "README.md").write_text("# demo\n", encoding="utf-8")
     (project_root / "memory" / "PROJECT_MEMORY.md").write_text("focus\n", encoding="utf-8")
     (project_root / "runtime" / "memory_bundle.md").write_text("bundle\n", encoding="utf-8")
+    (project_root / "runtime" / "project_brain.md").write_text("brain\n", encoding="utf-8")
     monkeypatch.setattr("agent_swarm_hub.openviking_support.DEFAULT_IMPORT_TREE_ROOT", project_root.parent)
     monkeypatch.setitem(__import__("sys").modules, "openviking", object())
     calls = []
@@ -207,6 +208,7 @@ def test_sync_project_tree_to_openviking_updates_files_in_place(monkeypatch, tmp
     assert ("add_resource", "README.md", "viking://resources/projects/demo", True) in calls
     assert ("add_resource", "PROJECT_MEMORY.md", "viking://resources/projects/demo/memory", True) in calls
     assert ("add_resource", "memory_bundle.md", "viking://resources/projects/demo/runtime", True) in calls
+    assert ("add_resource", "project_brain.md", "viking://resources/projects/demo/runtime", True) in calls
 
 
 def test_memory_bundle_prefers_current_agent_cli_dialogue_and_bound_sessions(monkeypatch, tmp_path):
@@ -258,3 +260,146 @@ def test_memory_bundle_prefers_current_agent_cli_dialogue_and_bound_sessions(mon
     assert "Use current CLI dialogue first." in bundle
     assert "## Bound Session Snapshots" in bundle
     assert "codex session codex-session-1" in bundle
+
+
+def test_build_project_brain_prefers_focus_state_and_recent_decisions(tmp_path):
+    script_path = Path("/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/scripts/build-openviking-project-brain.py")
+    spec = importlib.util.spec_from_file_location("build_openviking_project_brain", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+
+    project_root = tmp_path / "imports" / "projects" / "demo"
+    (project_root / "memory").mkdir(parents=True, exist_ok=True)
+    (project_root / "skills").mkdir(parents=True, exist_ok=True)
+    (project_root / "runtime").mkdir(parents=True, exist_ok=True)
+    (project_root / "memory" / "PROJECT_MEMORY.md").write_text(
+        "# PROJECT_MEMORY\n\n## Current Focus\nShip OV-first project context.\n\n## Current State\nOV is now the primary project context for restart injection.\n\n## Next Step\nGenerate a higher-density project brain summary.\n\n## Key Rules\n- Prefer OV before local cache.\n",
+        encoding="utf-8",
+    )
+    (project_root / "skills" / "PROJECT_SKILL.md").write_text(
+        "# PROJECT_SKILL\n\n## Work Rules\n- Keep project trees stable.\n\n## Memory Rules\n- Sync exported views after OV updates.\n",
+        encoding="utf-8",
+    )
+    (project_root / "runtime" / "memory_bundle.md").write_text(
+        "# demo Project Memory Bundle\n\n## Current Run\n- Runtime summary: OV project tree is already live.\n- Codex session: codex-a\n\n## Key Decisions From Recent Dialogue\n- [2026-03-22] user: Keep the OV project tree stable and update only the md files.\n\n## Bound Session Snapshots\n- codex session codex-a | summary=Working on OV-backed memory lifecycle.\n",
+        encoding="utf-8",
+    )
+
+    brain = module.build_project_brain("demo", project_root.parent)
+
+    assert "# PROJECT_BRAIN" in brain
+    assert "Ship OV-first project context." in brain
+    assert "OV is now the primary project context for restart injection." in brain
+    assert "Generate a higher-density project brain summary." in brain
+    assert "Keep the OV project tree stable and update only the md files." in brain
+
+
+def test_build_project_brain_filters_old_process_noise(tmp_path):
+    script_path = Path("/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/scripts/build-openviking-project-brain.py")
+    spec = importlib.util.spec_from_file_location("build_openviking_project_brain", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+
+    project_root = tmp_path / "imports" / "projects" / "demo"
+    (project_root / "memory").mkdir(parents=True, exist_ok=True)
+    (project_root / "skills").mkdir(parents=True, exist_ok=True)
+    (project_root / "runtime").mkdir(parents=True, exist_ok=True)
+    (project_root / "memory" / "PROJECT_MEMORY.md").write_text(
+        "# PROJECT_MEMORY\n\n## Current Focus\nMake OV the primary project context.\n\n## Current State\nOV project tree is live and dashboard already reads OV first.\n\n## Next Step\nFilter stale dialogue noise from project brain generation.\n",
+        encoding="utf-8",
+    )
+    (project_root / "runtime" / "memory_bundle.md").write_text(
+        "# demo Project Memory Bundle\n\n## Current Run\n- Runtime summary: OV project tree is live and dashboard already reads OV first.\n\n## Key Decisions From Recent Dialogue\n- [2026-03-22] assistant: 你可以直接在聊天框里描述你的任务。\n- [2026-03-22] assistant: 如果你想遵循这套特定开发流程，可以使用以下斜杠命令。\n- [2026-03-22] user: 把 OV 作为主项目上下文，并让 dashboard 直接读 OV。\n",
+        encoding="utf-8",
+    )
+
+    brain = module.build_project_brain("demo", project_root.parent)
+
+    assert "把 OV 作为主项目上下文，并让 dashboard 直接读 OV。" in brain
+    assert "斜杠命令" not in brain
+    assert "聊天框里描述你的任务" not in brain
+
+
+def test_build_project_brain_latest_progress_prefers_bound_summary_over_stale_cache(tmp_path):
+    script_path = Path("/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/scripts/build-openviking-project-brain.py")
+    spec = importlib.util.spec_from_file_location("build_openviking_project_brain", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+
+    project_root = tmp_path / "imports" / "projects" / "demo"
+    (project_root / "memory").mkdir(parents=True, exist_ok=True)
+    (project_root / "skills").mkdir(parents=True, exist_ok=True)
+    (project_root / "runtime").mkdir(parents=True, exist_ok=True)
+    (project_root / "memory" / "PROJECT_MEMORY.md").write_text(
+        "# PROJECT_MEMORY\n\n## Current Focus\nMake OV the primary project context.\n\n## Current State\nDashboard already reads OV first.\n\n## Next Step\nTighten project brain summary generation.\n",
+        encoding="utf-8",
+    )
+    (project_root / "runtime" / "memory_bundle.md").write_text(
+        "# demo Project Memory Bundle\n\n## Current Run\n- Runtime summary: No active task yet. Send a normal message to start.\n- Active task: fb1f545252e3\n\n## Bound Session Snapshots\n- codex session codex-a | title=Resume current project | summary=Finishing OV-first dashboard context cleanup.\n",
+        encoding="utf-8",
+    )
+
+    brain = module.build_project_brain("demo", project_root.parent)
+
+    assert "Finishing OV-first dashboard context cleanup." in brain
+    assert "No active task yet. Send a normal message to start." not in brain
+    assert "Cache summary:" not in brain
+
+
+def test_build_project_brain_extracts_runtime_recent_and_filters_task_style_rules(tmp_path):
+    script_path = Path("/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/scripts/build-openviking-project-brain.py")
+    spec = importlib.util.spec_from_file_location("build_openviking_project_brain", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+
+    project_root = tmp_path / "imports" / "projects" / "demo"
+    (project_root / "memory").mkdir(parents=True, exist_ok=True)
+    (project_root / "skills").mkdir(parents=True, exist_ok=True)
+    (project_root / "runtime").mkdir(parents=True, exist_ok=True)
+    (project_root / "memory" / "PROJECT_MEMORY.md").write_text(
+        "# PROJECT_MEMORY\n\n## Current Focus\nTighten OV brain summary generation.\n\n## Current State\nOV project tree already works.\n\n## Next Step\nPrefer current runtime recent state.\n\n## Key Rules\n- Task: old style cache line that should be ignored.\n- Prefer OV before local cache.\n",
+        encoding="utf-8",
+    )
+    (project_root / "skills" / "PROJECT_SKILL.md").write_text(
+        "# PROJECT_SKILL\n\n## Work Rules\n- Keep project trees stable.\n",
+        encoding="utf-8",
+    )
+    (project_root / "runtime" / "memory_bundle.md").write_text(
+        "# demo Project Memory Bundle\n\n## Current Run\n- Runtime summary: Task: tighten OV summary Recent: user: 当前网页已经优先读取 OV Cache summary: old cache line\n",
+        encoding="utf-8",
+    )
+
+    brain = module.build_project_brain("demo", project_root.parent)
+
+    assert "user: 当前网页已经优先读取 OV" in brain
+    assert "Task: old style cache line that should be ignored." not in brain
+
+
+def test_build_project_brain_latest_progress_prefers_relevant_bound_summary(tmp_path):
+    script_path = Path("/Users/sunxiangrong/dev/cli/git/agent-swarm-hub/scripts/build-openviking-project-brain.py")
+    spec = importlib.util.spec_from_file_location("build_openviking_project_brain", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+
+    project_root = tmp_path / "imports" / "projects" / "demo"
+    (project_root / "memory").mkdir(parents=True, exist_ok=True)
+    (project_root / "skills").mkdir(parents=True, exist_ok=True)
+    (project_root / "runtime").mkdir(parents=True, exist_ok=True)
+    (project_root / "memory" / "PROJECT_MEMORY.md").write_text(
+        "# PROJECT_MEMORY\n\n## Current Focus\nMake dashboard read OV first.\n\n## Current State\nOV project tree already works.\n\n## Next Step\nUse session summary to show latest project progress.\n",
+        encoding="utf-8",
+    )
+    (project_root / "runtime" / "memory_bundle.md").write_text(
+        "# demo Project Memory Bundle\n\n## Current Run\n- Runtime summary: No active task yet. Send a normal message to start.\n\n## Bound Session Snapshots\n- claude session a | title=warning | summary=tls handshake eof while falling back from websockets.\n- codex session b | title=resume | summary=Finishing OV-first dashboard context cleanup and restart injection.\n",
+        encoding="utf-8",
+    )
+
+    brain = module.build_project_brain("demo", project_root.parent)
+
+    assert "Finishing OV-first dashboard context cleanup and restart injection." in brain
+    assert "tls handshake eof" not in brain

@@ -58,7 +58,7 @@ def build_project_tree(project_id: str, tree_root: Path, *, rebuild: bool = Fals
                 "## Layout",
                 "- `memory/`: exported local memory/cache views",
                 "- `skills/`: exported local startup/rules views",
-                "- `runtime/`: focused current-state bundle for retrieval",
+                "- `runtime/`: focused current-state bundle and project-brain summary for retrieval",
                 "- `dialogs/`: curated recent dialogue and decision bundle",
                 "",
                 "## Notes",

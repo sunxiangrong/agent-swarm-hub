@@ -269,6 +269,7 @@ def _fallback_openviking_overview(uri: str) -> str:
     snippets: list[str] = []
     for candidate in (
         project_root / "README.md",
+        project_root / "runtime" / "project_brain.md",
         project_root / "runtime" / "memory_bundle.md",
     ):
         if candidate.exists():

@@ -1264,6 +1264,7 @@ def _sync_openviking_project_artifacts(project_id: str, *, rebuild_tree: bool = 
             *(["--rebuild"] if rebuild_tree else []),
         ],
         [sys.executable, str(scripts_dir / "build-openviking-memory-bundle.py"), "--project", project_id],
+        [sys.executable, str(scripts_dir / "build-openviking-project-brain.py"), "--project", project_id],
     ]
     for argv in commands:
         try:

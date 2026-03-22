@@ -437,7 +437,8 @@ def test_sync_openviking_project_artifacts_pushes_live_project(monkeypatch) -> N
 
     _sync_openviking_project_artifacts("knowledge-system")
 
-    assert len(called["builds"]) == 2
+    assert len(called["builds"]) == 3
+    assert any("build-openviking-project-brain.py" in " ".join(argv) for argv in called["builds"])
     assert called["pushes"] == ["knowledge-system"]
 
 
