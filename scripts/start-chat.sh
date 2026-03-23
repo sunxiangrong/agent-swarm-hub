@@ -16,6 +16,18 @@ if [[ -f ".env.local" ]]; then
   set +a
 fi
 
+# Default OV auto behavior by runtime:
+# - local macOS laptop: disable continuous live sync by default
+# - server/non-Darwin: keep auto sync enabled
+# Users can always override by explicitly exporting ASH_OPENVIKING_AUTO.
+if [[ -z "${ASH_OPENVIKING_AUTO:-}" ]]; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    export ASH_OPENVIKING_AUTO=0
+  else
+    export ASH_OPENVIKING_AUTO=1
+  fi
+fi
+
 if [[ -n "${ASH_PROXY_URL:-}" ]]; then
   export http_proxy="$ASH_PROXY_URL"
   export https_proxy="$ASH_PROXY_URL"
@@ -44,6 +56,7 @@ set_tmux_pane_title "ash-chat | ${PANE_PROJECT} | ${PROVIDER}"
 
 echo "[agent-swarm-hub] starting native entry"
 echo "[agent-swarm-hub] provider=$PROVIDER"
+echo "[agent-swarm-hub] ov_auto=${ASH_OPENVIKING_AUTO}"
 if [[ -n "$PROJECT" ]]; then
   echo "[agent-swarm-hub] project=$PROJECT"
 fi

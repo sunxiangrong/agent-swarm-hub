@@ -124,6 +124,20 @@ ash-swarm claude
 
 When run inside `tmux`, the script sets the pane title to `ash-chat | <project> | <provider>` for dashboard pane detection.
 
+Core regression:
+
+```bash
+./scripts/test-core.sh
+```
+
+This covers the current core chain:
+- native entry via `ash-chat` / `local-native`
+- Codex/Claude session reuse and project memory injection
+- OpenViking support and overview fallback
+- runtime cleanup
+- tmux/swarm launch behavior
+- dashboard snapshot behavior
+
 ### 本地 swarm shell
 
 ```bash
@@ -230,6 +244,13 @@ Telegram / Lark
 - `project-sessions use <project> <provider> <session-id>`
 - `project-sessions sync-memory <project>`
 - `project-sessions sync-memory --all`
+- `project-sessions cleanup-runtime`（先 dry-run）
+- `project-sessions cleanup-runtime --apply`（执行清理）
+
+推荐清理口径（保留核心运行态，清历史残留）：
+
+- `project-sessions cleanup-runtime --tmux-grace-minutes 20 --stale-workspace-days 7 --pane-log-days 7 --ccb-registry-days 7`
+- 若要连 OpenViking 孤儿导入目录一起清理：追加 `--prune-openviking-imports --openviking-import-days 14`
 
 ## 数据层
 

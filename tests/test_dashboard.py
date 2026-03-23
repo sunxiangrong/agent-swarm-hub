@@ -167,15 +167,156 @@ def test_build_dashboard_snapshot_prefers_openviking_overview(monkeypatch, tmp_p
     )
     project = payload["projects"][0]
     assert project["ov_overview"] == "OV says this project is about session orchestration."
+    assert project["ov_context_text"] == "OV says this project is about session orchestration."
     assert "OV: OV says this project is about session orchestration." in project["project_summary_text"]
     assert "OpenViking live project context" in project["memory_source_text"]
 
 
 def test_dashboard_html_mentions_openviking_sections() -> None:
     html = dashboard_server._dashboard_html()
+    assert "Project Brain" in html
     assert "OpenViking Context" in html
-    assert "Cache Summary" in html
+    assert "Cache Summary:" not in html
     assert "Resource Path:" in html
+    assert "Open OV Memory" in html
+    assert "brain-map" in html
+
+
+def test_build_dashboard_snapshot_reads_project_brain(monkeypatch, tmp_path) -> None:
+    project_db = tmp_path / "projects.sqlite3"
+    session_db = tmp_path / "runtime.sqlite3"
+    workspace_path = tmp_path / "demo"
+    workspace_path.mkdir()
+    brain_root = tmp_path / "imports" / "projects" / "demo" / "runtime"
+    brain_root.mkdir(parents=True, exist_ok=True)
+    (brain_root / "project_brain.md").write_text(
+        "\n".join(
+            [
+                "# PROJECT_BRAIN",
+                "",
+                "## Current Mission",
+                "OV-first memory.",
+                "",
+                "## Latest Progress",
+                "Dashboard is now reading project_brain.md first.",
+                "",
+                "## Next Best Step",
+                "Map the brain into concise dashboard cards.",
+                "",
+                "## Key Recent Decisions",
+                "- Keep OV as primary source.",
+                "- Remove redundant cache lines from the card.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with sqlite3.connect(project_db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path, profile, summary) VALUES (?, ?, ?, '', '')",
+            ("demo", "demo", str(workspace_path)),
+        )
+
+    monkeypatch.setattr(dashboard_snapshot, "DEFAULT_IMPORT_TREE_ROOT", brain_root.parent.parent)
+    monkeypatch.setattr(dashboard_snapshot, "read_openviking_overview", lambda uri: "OV overview text.")
+
+    payload = build_dashboard_snapshot(
+        project_store=ProjectContextStore(str(project_db)),
+        session_store=SessionStore(session_db),
+    )
+    project = payload["projects"][0]
+    assert "OV-first memory." in project["ov_brain"]
+    assert "Brain:" in project["project_summary_text"]
+    assert project["ov_brain_map"]["mission"] == "OV-first memory."
+    assert "Dashboard is now reading project_brain.md first." in project["ov_brain_map"]["latest_progress"]
+    assert project["ov_brain_map"]["next_step"] == "Map the brain into concise dashboard cards."
+    assert project["ov_brain_map"]["key_decisions"] == [
+        "Keep OV as primary source.",
+        "Remove redundant cache lines from the card.",
+    ]
+
+
+def test_build_dashboard_snapshot_compacts_redundant_openviking_context(monkeypatch, tmp_path) -> None:
+    project_db = tmp_path / "projects.sqlite3"
+    session_db = tmp_path / "runtime.sqlite3"
+    workspace_path = tmp_path / "demo"
+    workspace_path.mkdir()
+    brain_root = tmp_path / "imports" / "projects" / "demo" / "runtime"
+    brain_root.mkdir(parents=True, exist_ok=True)
+    (brain_root / "project_brain.md").write_text(
+        "\n".join(
+            [
+                "# PROJECT_BRAIN",
+                "",
+                "## Current Mission",
+                "OV-first memory.",
+                "",
+                "## Latest Progress",
+                "OV says this project is about session orchestration.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with sqlite3.connect(project_db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path, profile, summary) VALUES (?, ?, ?, '', '')",
+            ("demo", "demo", str(workspace_path)),
+        )
+
+    monkeypatch.setattr(dashboard_snapshot, "DEFAULT_IMPORT_TREE_ROOT", brain_root.parent.parent)
+    monkeypatch.setattr(dashboard_snapshot, "read_openviking_overview", lambda uri: "OV says this project is about session orchestration.")
+
+    payload = build_dashboard_snapshot(
+        project_store=ProjectContextStore(str(project_db)),
+        session_store=SessionStore(session_db),
+    )
+    project = payload["projects"][0]
+    assert project["ov_context_text"] == "Covered by Project Brain. Open details for the raw OpenViking context."
 
 
 def test_build_dashboard_snapshot_includes_workspace_only_project(tmp_path) -> None:

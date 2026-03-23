@@ -30,11 +30,21 @@ def _write_codex_history(home: Path, session_id: str, *texts: str) -> Path:
 
 
 def _patch_native_run(monkeypatch, captured: dict, *, after_run=None) -> None:
-    def fake_run(argv, env=None, cwd=None, check=False):
-        captured["command"] = argv[0]
-        captured["argv"] = argv
-        captured["env"] = env or {}
-        captured["cwd"] = cwd
+    def fake_run(argv, env=None, cwd=None, check=False, capture_output=False, text=False):
+        if argv == ["ps", "-ax", "-o", "pid=,command="]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        call = {
+            "command": argv[0],
+            "argv": argv,
+            "env": env or {},
+            "cwd": cwd,
+        }
+        captured.setdefault("calls", []).append(call)
+        if "command" not in captured:
+            captured["command"] = call["command"]
+            captured["argv"] = call["argv"]
+            captured["env"] = call["env"]
+            captured["cwd"] = call["cwd"]
         if after_run is not None:
             after_run(argv, env or {}, cwd)
         return SimpleNamespace(returncode=0)
@@ -1456,6 +1466,180 @@ def test_cli_local_native_resumes_bound_codex_session_after_project_path_migrati
     assert "Project summary for this session:" in captured["argv"][-1]
 
 
+def test_cli_local_native_skips_duplicate_running_codex_resume(monkeypatch, tmp_path, capsys) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    workspace_path = tmp_path / "project"
+    workspace_path.mkdir()
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    fake_home = tmp_path / "home"
+
+    from agent_swarm_hub.session_store import SessionStore
+
+    store = SessionStore(db_path)
+    store.upsert_workspace(
+        workspace_id="project-alpha",
+        title="project-alpha",
+        path=str(workspace_path),
+        backend="codex",
+        transport="direct",
+    )
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "project-alpha",
+                "project-alpha",
+                str(workspace_path),
+                "Project alpha profile",
+                "Project: project-alpha\nCurrent focus: Avoid duplicate resume",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, notes, source_path, cwd, last_used_at)
+            VALUES (?, ?, ?, 'active', '', '', ?, '2026-03-17T10:00:00+00:00')
+            """,
+            ("codex", "codex-session-123", "project-alpha", str(workspace_path)),
+        )
+
+    _write_codex_session(fake_home, "codex-session-123", str(workspace_path))
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr("agent_swarm_hub.cli.read_openviking_overview", lambda *args, **kwargs: "OV project overview")
+
+    real_run = subprocess.run
+
+    def fake_run(argv, env=None, cwd=None, check=False, capture_output=False, text=False):
+        if argv == ["ps", "-ax", "-o", "pid=,command="]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"123 /opt/homebrew/Caskroom/codex/0.116.0/codex-aarch64-apple-darwin --no-alt-screen -C {workspace_path} resume codex-session-123\n",
+                stderr="",
+            )
+        return real_run(argv, env=env, cwd=cwd, check=check, capture_output=capture_output, text=text)
+
+    monkeypatch.setattr("agent_swarm_hub.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "detected existing codex process; skip duplicate launch (pid=123)" in output
+
+
+def test_cli_project_summary_prompt_compacts_openviking_overview(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    workspace_path = tmp_path / "project"
+    workspace_path.mkdir()
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    fake_home = tmp_path / "home"
+
+    from agent_swarm_hub.session_store import SessionStore
+
+    store = SessionStore(db_path)
+    store.upsert_workspace(
+        workspace_id="project-alpha",
+        title="project-alpha",
+        path=str(workspace_path),
+        backend="codex",
+        transport="direct",
+    )
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "project-alpha",
+                "project-alpha",
+                str(workspace_path),
+                "Project alpha profile",
+                "Project: project-alpha\nCurrent focus: Compact OV overview",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, notes, source_path, cwd, last_used_at)
+            VALUES (?, ?, ?, 'active', '', '', ?, '2026-03-17T10:00:00+00:00')
+            """,
+            ("codex", "codex-session-123", "project-alpha", str(workspace_path)),
+        )
+
+    captured = {}
+
+    _write_codex_session(fake_home, "codex-session-123", str(workspace_path))
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr("agent_swarm_hub.cli.read_openviking_overview", lambda *args, **kwargs: "Long OV " * 80)
+    _patch_native_run(monkeypatch, captured)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    prompt = captured["argv"][-1]
+    overview_line = next(line for line in prompt.splitlines() if line.startswith("- OpenViking Overview: "))
+    assert len(overview_line) < 280
+    assert overview_line.endswith("...")
+
+
 def test_cli_local_native_exports_both_project_provider_sessions(monkeypatch, tmp_path) -> None:
     db_path = tmp_path / "sessions.sqlite3"
     workspace_path = tmp_path / "project"
@@ -1522,6 +1706,7 @@ def test_cli_local_native_exports_both_project_provider_sessions(monkeypatch, tm
     monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
     monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr("agent_swarm_hub.cli.read_openviking_overview", lambda *args, **kwargs: "OV project overview")
     _patch_native_run(monkeypatch, captured)
     monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "claude", "--project", "project-alpha"])
     exit_code = main()

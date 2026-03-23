@@ -12,11 +12,16 @@ pane-logs/
 *.log
 *.last.json
 .runtime/
+PROJECT_MEMORY.md
+PROJECT_SKILL.md
 var/*
 !var/.gitkeep
 !var/db/
 !var/db/.gitkeep
+var/db/*.sqlite3
+var/db/*.sqlite3-*
 !var/log/
 !var/log/.gitkeep
 !var/panes/
 !var/panes/.gitkeep
+var/panes/pane-logs/

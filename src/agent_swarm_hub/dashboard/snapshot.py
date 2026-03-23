@@ -3,10 +3,11 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 import json
+import re
 import time
 from typing import Any
 
-from ..openviking_support import read_openviking_overview
+from ..openviking_support import DEFAULT_IMPORT_TREE_ROOT, read_openviking_overview
 from ..project_context import ProjectContextStore, project_ov_resource_uri
 from ..session_store import SessionStore
 from ..swarm_roles import resolve_swarm_roles
@@ -35,6 +36,8 @@ def build_dashboard_snapshot(
     ):
         ov_resource_uri = project_ov_resource_uri(project["project_id"])
         ov_overview = _compact_text(read_openviking_overview(ov_resource_uri), 420)
+        ov_brain_full = _read_project_brain(project["project_id"])
+        ov_brain = _compact_text(ov_brain_full, 420)
         memory = project_store.get_project_memory(project["project_id"])
         brief = project_store.derive_session_brief(
             focus=memory.get("focus", "") or project_store._summary_field(project["summary"], "Current focus:"),
@@ -52,6 +55,13 @@ def build_dashboard_snapshot(
         live_session = runtime[0] if runtime else None
         live_phase = str((live_session or {}).get("phase") or "").strip()
         live_summary = _compact_text(str((live_session or {}).get("conversation_summary") or "").strip(), 160)
+        ov_brain_map = _parse_project_brain_map(
+            ov_brain_full,
+            focus=brief["focus"],
+            state=brief["current_state"],
+            next_step=brief["next_step"],
+            live_summary=live_summary,
+        )
         current_session_line = ", ".join(f"{provider}: {session_id}" for provider, session_id in sorted(current_sessions.items()))
         roles = _workspace_swarm_roles(session_store, project["project_id"])
         driver_session_id = _driver_session_id(live_session, roles["orchestrator"])
@@ -63,12 +73,18 @@ def build_dashboard_snapshot(
             has_focus=bool(brief["focus"]),
         )
         project_summary_text = _project_summary_text(
+            ov_brain=ov_brain,
             ov_overview=ov_overview,
             focus=brief["focus"],
             state=brief["current_state"],
             next_step=brief["next_step"],
             memory=brief["memory"],
             live_summary=live_summary,
+        )
+        ov_context_text = _ov_context_text(
+            ov_overview=ov_overview,
+            ov_brain=ov_brain,
+            project_summary_text=project_summary_text,
         )
         memory_source_text = _memory_source_text(
             has_ov_overview=bool(ov_overview),
@@ -97,7 +113,10 @@ def build_dashboard_snapshot(
                 "next_step": brief["next_step"],
                 "memory": brief["memory"],
                 "ov_resource_uri": ov_resource_uri,
+                "ov_brain": ov_brain,
+                "ov_brain_map": ov_brain_map,
                 "ov_overview": ov_overview,
+                "ov_context_text": ov_context_text,
                 "project_summary_text": project_summary_text,
                 "memory_source_text": memory_source_text,
                 "current_sessions": current_session_line,
@@ -269,8 +288,10 @@ def _load_runtime_sessions(session_store: SessionStore) -> dict[str, list[dict[s
     return grouped
 
 
-def _project_summary_text(*, ov_overview: str, focus: str, state: str, next_step: str, memory: str, live_summary: str) -> str:
+def _project_summary_text(*, ov_brain: str, ov_overview: str, focus: str, state: str, next_step: str, memory: str, live_summary: str) -> str:
     parts: list[str] = []
+    if ov_brain:
+        parts.append(f"Brain: {ov_brain}")
     if ov_overview:
         parts.append(f"OV: {ov_overview}")
     if focus:
@@ -284,6 +305,75 @@ def _project_summary_text(*, ov_overview: str, focus: str, state: str, next_step
     if not parts and live_summary:
         parts.append(f"Live: {live_summary}")
     return " | ".join(parts[:4])
+
+
+def _read_project_brain(project_id: str) -> str:
+    path = DEFAULT_IMPORT_TREE_ROOT / project_id / "runtime" / "project_brain.md"
+    try:
+        return path.read_text(encoding="utf-8").strip() if path.exists() else ""
+    except OSError:
+        return ""
+
+
+def _parse_project_brain_map(
+    markdown: str,
+    *,
+    focus: str,
+    state: str,
+    next_step: str,
+    live_summary: str,
+) -> dict[str, Any]:
+    mission = _compact_text(_extract_markdown_section(markdown, "Current Mission"), 220)
+    latest_progress = _compact_text(_extract_markdown_section(markdown, "Latest Progress"), 260)
+    mapped_next_step = _compact_text(_extract_markdown_section(markdown, "Next Best Step"), 220)
+    key_decisions = _parse_markdown_bullets(
+        _extract_markdown_section(markdown, "Key Recent Decisions"),
+        limit=4,
+        item_limit=180,
+    )
+    key_decisions = [
+        item
+        for item in key_decisions
+        if "no substantive recent messages captured" not in item.lower()
+    ]
+    if not mission:
+        mission = _compact_text(focus, 220)
+    if not latest_progress:
+        latest_progress = _compact_text(state or live_summary, 260)
+    if not mapped_next_step:
+        mapped_next_step = _compact_text(next_step, 220)
+    return {
+        "mission": mission,
+        "latest_progress": latest_progress,
+        "next_step": mapped_next_step,
+        "key_decisions": key_decisions,
+    }
+
+
+def _extract_markdown_section(markdown: str, heading: str) -> str:
+    pattern = rf"^##\s+{re.escape(heading)}\s*\n(.*?)(?=^##\s+|\Z)"
+    match = re.search(pattern, markdown or "", flags=re.MULTILINE | re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+
+def _parse_markdown_bullets(section: str, *, limit: int, item_limit: int) -> list[str]:
+    items = [line[2:].strip() for line in (section or "").splitlines() if line.startswith("- ")]
+    return [_compact_text(item, item_limit) for item in items if item][:limit]
+
+
+def _normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).lower()
+
+
+def _ov_context_text(*, ov_overview: str, ov_brain: str, project_summary_text: str) -> str:
+    overview = _compact_text(ov_overview, 420)
+    if not overview:
+        return _compact_text(project_summary_text, 240)
+    overview_norm = _normalize_text(overview)
+    brain_norm = _normalize_text(_compact_text(ov_brain, 420))
+    if brain_norm and (overview_norm in brain_norm or brain_norm in overview_norm):
+        return "Covered by Project Brain. Open details for the raw OpenViking context."
+    return overview
 
 
 def _memory_source_text(*, has_ov_overview: bool, has_stored_memory: bool, has_project_summary: bool, has_live_summary: bool) -> str:

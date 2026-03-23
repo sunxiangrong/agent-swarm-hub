@@ -6,8 +6,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from ..openviking_support import DEFAULT_IMPORT_TREE_ROOT
 from ..project_context import ProjectContextStore
 from .snapshot import build_dashboard_snapshot
+
+
+def _send_bytes(handler: BaseHTTPRequestHandler, *, status: int, content_type: str, body: bytes) -> None:
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _send_json(handler: BaseHTTPRequestHandler, *, status: int, payload: dict) -> None:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    _send_bytes(handler, status=status, content_type="application/json; charset=utf-8", body=body)
+
+
+def _read_json_body(handler: BaseHTTPRequestHandler) -> dict:
+    raw_length = handler.headers.get("Content-Length", "0")
+    length = int(raw_length) if raw_length.isdigit() else 0
+    if length <= 0:
+        return {}
+    return json.loads(handler.rfile.read(length).decode("utf-8"))
 
 
 def serve_dashboard(*, host: str, port: int) -> None:
@@ -16,20 +38,11 @@ def serve_dashboard(*, host: str, port: int) -> None:
             parsed = urlparse(self.path)
             if parsed.path == "/api/projects":
                 payload = build_dashboard_snapshot()
-                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                _send_json(self, status=200, payload=payload)
                 return
             if parsed.path in {"/", "/index.html"}:
                 body = _dashboard_html().encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                _send_bytes(self, status=200, content_type="text/html; charset=utf-8", body=body)
                 return
             self.send_response(404)
             self.end_headers()
@@ -38,49 +51,30 @@ def serve_dashboard(*, host: str, port: int) -> None:
             parsed = urlparse(self.path)
             if parsed.path.startswith("/api/projects/") and parsed.path.endswith("/pin"):
                 project_id = parsed.path.removeprefix("/api/projects/").removesuffix("/pin").strip("/")
-                raw_length = self.headers.get("Content-Length", "0")
-                length = int(raw_length) if raw_length.isdigit() else 0
-                payload = {}
-                if length > 0:
-                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                payload = _read_json_body(self)
                 pinned = bool(payload.get("pinned"))
                 ProjectContextStore().set_project_pinned(project_id, pinned)
-                body = json.dumps({"ok": True, "project_id": project_id, "pinned": pinned}, ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                _send_json(self, status=200, payload={"ok": True, "project_id": project_id, "pinned": pinned})
                 return
             if parsed.path.startswith("/api/projects/") and parsed.path.endswith("/sync-memory"):
                 project_id = parsed.path.removeprefix("/api/projects/").removesuffix("/sync-memory").strip("/")
                 ok = _sync_project_memory(project_id)
-                body = json.dumps({"ok": ok, "project_id": project_id}, ensure_ascii=False).encode("utf-8")
-                self.send_response(200 if ok else 404)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                _send_json(self, status=200 if ok else 404, payload={"ok": ok, "project_id": project_id})
                 return
             if parsed.path.startswith("/api/projects/") and parsed.path.endswith("/open-path"):
                 project_id = parsed.path.removeprefix("/api/projects/").removesuffix("/open-path").strip("/")
                 ok = _open_project_path(project_id)
-                body = json.dumps({"ok": ok, "project_id": project_id}, ensure_ascii=False).encode("utf-8")
-                self.send_response(200 if ok else 404)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                _send_json(self, status=200 if ok else 404, payload={"ok": ok, "project_id": project_id})
+                return
+            if parsed.path.startswith("/api/projects/") and parsed.path.endswith("/open-ov-memory"):
+                project_id = parsed.path.removeprefix("/api/projects/").removesuffix("/open-ov-memory").strip("/")
+                ok = _open_ov_memory_path(project_id)
+                _send_json(self, status=200 if ok else 404, payload={"ok": ok, "project_id": project_id})
                 return
             if parsed.path.startswith("/api/projects/") and parsed.path.endswith("/focus-driver"):
                 project_id = parsed.path.removeprefix("/api/projects/").removesuffix("/focus-driver").strip("/")
                 ok = _focus_driver_pane(project_id)
-                body = json.dumps({"ok": ok, "project_id": project_id}, ensure_ascii=False).encode("utf-8")
-                self.send_response(200 if ok else 404)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                _send_json(self, status=200 if ok else 404, payload={"ok": ok, "project_id": project_id})
                 return
             self.send_response(404)
             self.end_headers()
@@ -342,6 +336,53 @@ def _dashboard_html() -> str:
       line-height: 1.52;
       color: var(--ink);
     }
+    .brain-map {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .brain-node {
+      border: 1px solid rgba(146, 166, 184, 0.15);
+      background: rgba(255, 255, 255, 0.02);
+      border-radius: 10px;
+      padding: 8px 9px;
+      min-height: 64px;
+    }
+    .brain-node p {
+      margin: 6px 0 0;
+      font-size: 13px;
+      line-height: 1.48;
+      color: #e4eef8;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .brain-node-wide {
+      grid-column: 1 / -1;
+    }
+    .brain-label {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      border: 1px solid rgba(112, 214, 182, 0.25);
+      background: rgba(112, 214, 182, 0.1);
+      color: var(--accent-strong);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      padding: 2px 8px;
+    }
+    .brain-list {
+      margin: 8px 0 0;
+      padding-left: 18px;
+    }
+    .brain-list li {
+      margin: 5px 0;
+      line-height: 1.45;
+    }
+    .brain-fallback {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
     .sessions, .runtime {
       margin-top: 16px;
       padding-top: 14px;
@@ -439,6 +480,10 @@ def _dashboard_html() -> str:
       border-color: var(--line-strong);
       background: rgba(255, 255, 255, 0.06);
     }
+    .action:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
     .action.sync {
       color: var(--accent-strong);
       border-color: rgba(112, 214, 182, 0.24);
@@ -484,6 +529,12 @@ def _dashboard_html() -> str:
         grid-template-columns: 1fr;
       }
       .summary-item.wide {
+        grid-column: auto;
+      }
+      .brain-map {
+        grid-template-columns: 1fr;
+      }
+      .brain-node-wide {
         grid-column: auto;
       }
     }
@@ -542,6 +593,45 @@ def _dashboard_html() -> str:
       return 'idle';
     }
 
+    function renderBrainMap(project) {
+      const map = project.ov_brain_map || {};
+      const mission = map.mission || project.focus || '';
+      const latestProgress = map.latest_progress || project.live_summary || project.current_state || '';
+      const nextStep = map.next_step || project.next_step || '';
+      const decisions = Array.isArray(map.key_decisions) ? map.key_decisions.filter(Boolean).slice(0, 4) : [];
+      const hasMap = Boolean(mission || latestProgress || nextStep || decisions.length);
+      if (!hasMap) {
+        return `<div class="brain-fallback">${escapeHtml(project.ov_brain || project.ov_overview || project.project_summary_text || 'No project brain summary yet.')}</div>`;
+      }
+      const decisionsHtml = decisions.length
+        ? `
+          <div class="brain-node brain-node-wide">
+            <span class="brain-label">Decisions</span>
+            <ul class="brain-list">
+              ${decisions.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}
+            </ul>
+          </div>
+        `
+        : '';
+      return `
+        <div class="brain-map">
+          <div class="brain-node">
+            <span class="brain-label">Mission</span>
+            <p>${escapeHtml(mission || 'No mission yet.')}</p>
+          </div>
+          <div class="brain-node">
+            <span class="brain-label">Progress</span>
+            <p>${escapeHtml(latestProgress || 'No progress summary yet.')}</p>
+          </div>
+          <div class="brain-node">
+            <span class="brain-label">Next Step</span>
+            <p>${escapeHtml(nextStep || 'No next step yet.')}</p>
+          </div>
+          ${decisionsHtml}
+        </div>
+      `;
+    }
+
     function renderCard(project) {
       const pinLabel = project.pinned ? 'Unpin' : 'Pin';
       const pinClass = project.pinned ? 'pin active' : 'pin';
@@ -549,6 +639,9 @@ def _dashboard_html() -> str:
       const currentSessions = project.current_sessions ? `<span>${escapeHtml(project.current_sessions)}</span>` : '<span>no current binding</span>';
       const tmuxPreview = project.tmux_preview ? escapeHtml(project.tmux_preview) : 'No tmux pane attached.';
       const updatedAt = project.updated_at ? `<div class="timestamp">updated ${escapeHtml(project.updated_at)}</div>` : '';
+      const projectBrainHtml = renderBrainMap(project);
+      const focusDisabledAttr = project.driver_tmux_pane_id ? '' : 'disabled';
+      const detailsOpenAttr = (project.swarm_active || (project.ccb_live_count || 0) > 0) ? ' open' : '';
       const workerAgents = (project.swarm_worker_agents || []).map((agent) => `
         <div class="runtime-item">
           <strong>${escapeHtml(agent.name || 'agent')}</strong>
@@ -627,14 +720,13 @@ def _dashboard_html() -> str:
               <div class="runtime-item">Orchestrator is ${escapeHtml(project.current_driver || 'claude')}, but no live session/pane is attached right now.</div>
             `;
       const detailsBlock = `
-          <details class="detail-block">
+          <details class="detail-block"${detailsOpenAttr}>
             <summary>Details</summary>
             <div class="sessions">
               <dt>OpenViking</dt>
               <div class="stack">
                 <div class="runtime-item">Resource Path: ${escapeHtml(project.ov_resource_uri || 'n/a')}</div>
                 <div class="runtime-item">${escapeHtml(project.memory_source_text || 'No memory source available.')}</div>
-                <div class="runtime-item">Cache Summary: ${escapeHtml(project.memory || project.current_state || 'No local cache summary yet.')}</div>
               </div>
             </div>
             <div class="sessions">
@@ -682,8 +774,12 @@ def _dashboard_html() -> str:
           </div>
           <dl class="summary-grid">
             <div class="summary-item wide">
+              <dt>Project Brain</dt>
+              <dd>${projectBrainHtml}</dd>
+            </div>
+            <div class="summary-item wide">
               <dt>OpenViking Context</dt>
-              <dd>${escapeHtml(project.ov_overview || project.project_summary_text || 'No OpenViking project overview yet.')}</dd>
+              <dd>${escapeHtml(project.ov_context_text || project.ov_overview || project.project_summary_text || 'No OpenViking project overview yet.')}</dd>
             </div>
             <div class="summary-item">
               <dt>Current Run</dt>
@@ -700,8 +796,9 @@ def _dashboard_html() -> str:
           </dl>
           ${detailsBlock}
           <div class="action-row">
-            <button class="action focus" data-action="focus-driver" data-project="${project.project_id}">Focus Driver</button>
+            <button class="action focus" data-action="focus-driver" data-project="${project.project_id}" ${focusDisabledAttr}>Focus Driver</button>
             <button class="action sync" data-action="sync" data-project="${project.project_id}">Sync Memory</button>
+            <button class="action open" data-action="open-ov-memory" data-project="${project.project_id}">Open OV Memory</button>
             <button class="action open" data-action="open" data-project="${project.project_id}">Open Project</button>
           </div>
         </section>
@@ -750,6 +847,17 @@ def _dashboard_html() -> str:
       showToast(`opened ${projectId}`);
     }
 
+    async function openOvMemory(projectId) {
+      const response = await fetch(`/api/projects/${projectId}/open-ov-memory`, {
+        method: 'POST'
+      });
+      if (!response.ok) {
+        showToast(`open ov failed: ${projectId}`);
+        return;
+      }
+      showToast(`opened ov memory: ${projectId}`);
+    }
+
     async function focusDriver(projectId) {
       const response = await fetch(`/api/projects/${projectId}/focus-driver`, {
         method: 'POST'
@@ -794,6 +902,10 @@ def _dashboard_html() -> str:
             await openProject(button.dataset.project);
             return;
           }
+          if (action === 'open-ov-memory') {
+            await openOvMemory(button.dataset.project);
+            return;
+          }
           if (action === 'focus-driver') {
             await focusDriver(button.dataset.project);
           }
@@ -827,6 +939,17 @@ def _open_project_path(project_id: str, store: ProjectContextStore | None = None
         return False
     try:
         subprocess.Popen(["open", str(workspace_path)])
+    except OSError:
+        return False
+    return True
+
+
+def _open_ov_memory_path(project_id: str) -> bool:
+    path = (DEFAULT_IMPORT_TREE_ROOT / project_id).resolve()
+    if not path.exists():
+        return False
+    try:
+        subprocess.Popen(["open", str(path)])
     except OSError:
         return False
     return True

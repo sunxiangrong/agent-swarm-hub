@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass
+from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,8 @@ _PROMPT_PROFILE_LIMIT = 160
 _PROMPT_FIELD_LIMIT = 180
 _PROMPT_MESSAGE_LIMIT = 120
 _PROMPT_RECENT_MESSAGE_COUNT = 2
+_GLOBAL_MEMORY_LIMIT = 8
+_GLOBAL_MEMORY_FILE = "SHARED_MEMORY.md"
 
 
 def project_ov_resource_uri(project_id: str) -> str:
@@ -49,73 +52,86 @@ class ProjectContextStore:
     def _init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS projects (
-                    project_id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    workspace_path TEXT NOT NULL DEFAULT '',
-                    profile TEXT NOT NULL DEFAULT '',
-                    summary TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS projects (
+                        project_id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        workspace_path TEXT NOT NULL DEFAULT '',
+                        profile TEXT NOT NULL DEFAULT '',
+                        summary TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
 
-                CREATE TABLE IF NOT EXISTS provider_sessions (
-                    provider TEXT NOT NULL,
-                    raw_session_id TEXT NOT NULL,
-                    project_id TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    notes TEXT NOT NULL DEFAULT '',
-                    source_path TEXT NOT NULL DEFAULT '',
-                    cwd TEXT NOT NULL DEFAULT '',
-                    last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (provider, raw_session_id)
-                );
+                    CREATE TABLE IF NOT EXISTS provider_sessions (
+                        provider TEXT NOT NULL,
+                        raw_session_id TEXT NOT NULL,
+                        project_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        notes TEXT NOT NULL DEFAULT '',
+                        source_path TEXT NOT NULL DEFAULT '',
+                        cwd TEXT NOT NULL DEFAULT '',
+                        last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (provider, raw_session_id)
+                    );
 
-                CREATE TABLE IF NOT EXISTS project_memory (
-                    project_id TEXT PRIMARY KEY,
-                    focus TEXT NOT NULL DEFAULT '',
-                    current_state TEXT NOT NULL DEFAULT '',
-                    recent_context TEXT NOT NULL DEFAULT '',
-                    memory TEXT NOT NULL DEFAULT '',
-                    recent_hints_json TEXT NOT NULL DEFAULT '[]',
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
+                    CREATE TABLE IF NOT EXISTS project_memory (
+                        project_id TEXT PRIMARY KEY,
+                        focus TEXT NOT NULL DEFAULT '',
+                        current_state TEXT NOT NULL DEFAULT '',
+                        recent_context TEXT NOT NULL DEFAULT '',
+                        memory TEXT NOT NULL DEFAULT '',
+                        recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
 
-                CREATE TABLE IF NOT EXISTS provider_bindings (
-                    project_id TEXT NOT NULL,
-                    provider TEXT NOT NULL,
-                    raw_session_id TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (project_id, provider)
-                );
+                    CREATE TABLE IF NOT EXISTS provider_bindings (
+                        project_id TEXT NOT NULL,
+                        provider TEXT NOT NULL,
+                        raw_session_id TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (project_id, provider)
+                    );
 
-                CREATE TABLE IF NOT EXISTS project_sessions (
-                    project_id TEXT NOT NULL,
-                    provider TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    title TEXT NOT NULL DEFAULT '',
-                    summary TEXT NOT NULL DEFAULT '',
-                    cwd TEXT NOT NULL DEFAULT '',
-                    source_path TEXT NOT NULL DEFAULT '',
-                    first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (provider, session_id)
-                );
+                    CREATE TABLE IF NOT EXISTS project_sessions (
+                        project_id TEXT NOT NULL,
+                        provider TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        title TEXT NOT NULL DEFAULT '',
+                        summary TEXT NOT NULL DEFAULT '',
+                        cwd TEXT NOT NULL DEFAULT '',
+                        source_path TEXT NOT NULL DEFAULT '',
+                        first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (provider, session_id)
+                    );
 
-                CREATE INDEX IF NOT EXISTS idx_project_sessions_project
-                ON project_sessions(project_id, provider, status, last_used_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_project_sessions_project
+                    ON project_sessions(project_id, provider, status, last_used_at DESC);
 
-                CREATE TABLE IF NOT EXISTS dashboard_project_pins (
-                    project_id TEXT PRIMARY KEY,
-                    pinned INTEGER NOT NULL DEFAULT 1,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-            self._migrate_project_memory_schema(conn)
+                    CREATE TABLE IF NOT EXISTS dashboard_project_pins (
+                        project_id TEXT PRIMARY KEY,
+                        pinned INTEGER NOT NULL DEFAULT 1,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+
+                    CREATE TABLE IF NOT EXISTS global_memory (
+                        memory_key TEXT PRIMARY KEY,
+                        category TEXT NOT NULL DEFAULT 'workflow',
+                        content TEXT NOT NULL DEFAULT '',
+                        source_project_id TEXT NOT NULL DEFAULT '',
+                        confidence REAL NOT NULL DEFAULT 0.5,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                self._migrate_project_memory_schema(conn)
+            except sqlite3.OperationalError as exc:
+                if "readonly" not in str(exc).lower():
+                    raise
 
     def _migrate_project_memory_schema(self, conn: sqlite3.Connection) -> None:
         try:
@@ -299,32 +315,17 @@ class ProjectContextStore:
         if snapshot["recent_hints"]:
             lines.append("Recent Memory Hints:")
             lines.extend(f"- {message}" for message in snapshot["recent_hints"])
+        if snapshot["global_memory"]:
+            lines.append(f"Global Memory: {snapshot['global_memory']}")
         return "\n".join(lines)
 
     def build_memory_snapshot(self, workspace_path: str | None) -> dict[str, Any]:
         project = self.get_for_workspace_path(workspace_path)
+        global_snapshot = self.build_global_memory_snapshot()
         if project is None:
-            return {
-                "project_id": "",
-                "workspace": "",
-                "profile": "",
-                "focus": "",
-                "current_state": "",
-                "recent_context": "",
-                "memory": "",
-                "recent_hints": [],
-            }
+            return self._empty_memory_snapshot(global_snapshot)
         stored_memory = self.get_project_memory(project.project_id)
-        recent_messages = stored_memory["recent_hints"] or [
-            self._compact(message, _PROMPT_MESSAGE_LIMIT)
-            for message in project.recent_messages[-_PROMPT_RECENT_MESSAGE_COUNT:]
-            if (message or "").strip()
-        ]
-        focus = stored_memory["focus"] or self._summary_field(project.summary, "Current focus:")
-        recent_context = stored_memory["recent_context"] or self._summary_state(project.summary)
-        memory = stored_memory["memory"] or (
-            self._compact(self._summary_compact_text(project.summary), _PROMPT_FIELD_LIMIT) if project.summary else ""
-        )
+        focus, recent_context, memory, recent_messages = self._project_memory_values(project, stored_memory)
         return {
             "project_id": project.project_id,
             "workspace": self._compact(project.workspace_path, _PROMPT_FIELD_LIMIT),
@@ -334,7 +335,97 @@ class ProjectContextStore:
             "recent_context": self._compact(recent_context, _PROMPT_FIELD_LIMIT) if recent_context else "",
             "memory": self._compact(memory, _PROMPT_FIELD_LIMIT) if memory else "",
             "recent_hints": recent_messages,
+            "global_memory": global_snapshot["summary"],
+            "global_hints": global_snapshot["hints"],
         }
+
+    def list_global_memory(self, *, limit: int = _GLOBAL_MEMORY_LIMIT) -> list[dict[str, Any]]:
+        if not self.db_path.exists():
+            return []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT memory_key, category, content, source_project_id, confidence, updated_at
+                    FROM global_memory
+                    WHERE COALESCE(content, '') != ''
+                    ORDER BY confidence DESC, updated_at DESC, memory_key ASC
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+        except sqlite3.Error:
+            return []
+        return [dict(row) for row in rows]
+
+    def build_global_memory_snapshot(self) -> dict[str, Any]:
+        rows = self.list_global_memory()
+        hints = [self._compact(str(row.get("content") or ""), _PROMPT_MESSAGE_LIMIT) for row in rows if str(row.get("content") or "").strip()]
+        summary = self._compact(" | ".join(hints[:3]), 220) if hints else ""
+        return {"summary": summary, "hints": hints[:_PROMPT_RECENT_MESSAGE_COUNT]}
+
+    def upsert_global_memory(
+        self,
+        *,
+        content: str,
+        category: str = "workflow",
+        source_project_id: str = "",
+        confidence: float = 0.6,
+    ) -> bool:
+        normalized = self._compact(self._strip_memory_label(content), 280)
+        if not normalized:
+            return False
+        memory_key = self._global_memory_key(normalized)
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO global_memory (memory_key, category, content, source_project_id, confidence, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(memory_key) DO UPDATE SET
+                        category = excluded.category,
+                        content = excluded.content,
+                        source_project_id = CASE
+                            WHEN excluded.source_project_id != '' THEN excluded.source_project_id
+                            ELSE global_memory.source_project_id
+                        END,
+                        confidence = CASE
+                            WHEN excluded.confidence > global_memory.confidence THEN excluded.confidence
+                            ELSE global_memory.confidence
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (memory_key, category.strip() or "workflow", normalized, source_project_id.strip(), float(confidence)),
+                )
+        except sqlite3.Error:
+            return False
+        return True
+
+    def promote_project_memory_to_global(
+        self,
+        project_id: str,
+        *,
+        focus: str = "",
+        recent_context: str = "",
+        memory: str = "",
+        recent_hints: list[str] | None = None,
+    ) -> int:
+        promoted = 0
+        for candidate in self._global_memory_candidates(
+            project_id,
+            focus=focus,
+            recent_context=recent_context,
+            memory=memory,
+            recent_hints=recent_hints or [],
+        ):
+            if self.upsert_global_memory(
+                content=candidate["content"],
+                category=candidate["category"],
+                source_project_id=project_id,
+                confidence=candidate["confidence"],
+            ):
+                promoted += 1
+        return promoted
 
     @classmethod
     def derive_session_brief(
@@ -601,15 +692,15 @@ class ProjectContextStore:
         if project is None:
             return ""
         stored_memory = self.get_project_memory(project_id)
+        global_snapshot = self.build_global_memory_snapshot()
         bindings = self.get_current_project_sessions(project_id)
         sessions = self.list_project_sessions(project_id, include_archived=False)
-        focus = stored_memory.get("focus", "") or self._summary_field(project.summary, "Current focus:")
-        current_state = stored_memory.get("recent_context", "") or self._summary_state(project.summary)
+        focus, current_state, memory, recent_hints = self._project_memory_values(project, stored_memory)
         brief = self.derive_session_brief(
             focus=focus,
             recent_context=current_state,
-            memory=stored_memory.get("memory", ""),
-            hints=stored_memory.get("recent_hints", []),
+            memory=memory,
+            hints=recent_hints,
         )
         next_step = brief["next_step"]
         lines = [
@@ -630,7 +721,7 @@ class ProjectContextStore:
             "",
             "## Current Focus",
         ]
-        ov_overview = read_openviking_overview(project_ov_resource_uri(project.project_id))
+        ov_overview = self._project_ov_overview(project.project_id)
         if ov_overview:
             lines[6:6] = [
                 "## OpenViking Overview",
@@ -673,6 +764,7 @@ class ProjectContextStore:
                 lines.append(f"- {item}")
         if not any(item for item in key_rules):
             lines.append("- No key rules recorded yet.")
+        self._append_global_memory_section(lines, global_snapshot, heading="## Global Memory")
         lines.extend(
             [
                 "",
@@ -720,11 +812,12 @@ class ProjectContextStore:
         stored_memory = self.get_project_memory(project_id)
         bindings = self.get_current_project_sessions(project_id)
         sessions = self.list_project_sessions(project_id, include_archived=False)
+        focus, current_state, memory, recent_hints = self._project_memory_values(project, stored_memory)
         brief = self.derive_session_brief(
-            focus=stored_memory.get("focus", "") or self._summary_field(project.summary, "Current focus:"),
-            recent_context=stored_memory.get("recent_context", "") or self._summary_state(project.summary),
-            memory=stored_memory.get("memory", "") or self._summary_compact_text(project.summary),
-            hints=stored_memory.get("recent_hints", []),
+            focus=focus,
+            recent_context=current_state,
+            memory=memory,
+            hints=recent_hints,
         )
         lines = [
             f"Project: {project.project_id}",
@@ -749,10 +842,7 @@ class ProjectContextStore:
             )
             if providers:
                 lines.append(f"Current sessions: {providers}")
-        ov_overview = self._compact(
-            read_openviking_overview(project_ov_resource_uri(project.project_id)),
-            220,
-        )
+        ov_overview = self._project_ov_overview(project.project_id, limit=220)
         if ov_overview:
             lines.append(f"OpenViking overview: {ov_overview}")
         return "\n".join(lines)
@@ -762,12 +852,9 @@ class ProjectContextStore:
         if project is None:
             return ""
         stored_memory = self.get_project_memory(project_id)
-        focus = stored_memory.get("focus", "") or self._summary_field(project.summary, "Current focus:")
-        recent_context = stored_memory.get("recent_context", "") or self._summary_state(project.summary)
-        ov_overview = self._compact(
-            read_openviking_overview(project_ov_resource_uri(project.project_id)),
-            420,
-        )
+        global_snapshot = self.build_global_memory_snapshot()
+        focus, recent_context, _memory, _recent_hints = self._project_memory_values(project, stored_memory)
+        ov_overview = self._project_ov_overview(project.project_id, limit=420)
         lines = [
             "# PROJECT_SKILL",
             "",
@@ -808,15 +895,22 @@ class ProjectContextStore:
                 "",
                 "## Memory Rules",
                 "- Project-scoped context belongs in OpenViking under the project resource directory when OV is enabled.",
+                "- Cross-project rules and preferences belong in shared global memory, not repeated per-project state.",
                 "- Local project files are generated exported views; refresh them through the shared sync flow instead of treating them as the primary source of truth.",
                 "- Do not overwrite project memory with meta chat such as asking whether memory exists.",
                 "- When the task meaningfully changes, update project memory through the shared sync flow.",
+            ]
+        )
+        self._append_global_memory_section(lines, global_snapshot, heading="## Shared Global Memory")
+        lines.extend(
+            [
                 "",
                 "## Files",
                 f"- Workspace: `{project.workspace_path}`",
                 f"- OpenViking project context: `{project_ov_resource_uri(project.project_id)}`",
                 "- Local exported memory view: `PROJECT_MEMORY.md`",
                 "- Local exported rules view: `PROJECT_SKILL.md`",
+                f"- Shared global memory view: `{self.db_path.parent / _GLOBAL_MEMORY_FILE}`",
                 "",
             ]
         )
@@ -871,7 +965,40 @@ class ProjectContextStore:
             skill_path = self.sync_project_skill_file(project.project_id)
             if skill_path is not None:
                 written.append(skill_path)
+        global_path = self.sync_global_memory_file()
+        if global_path is not None:
+            written.append(global_path)
         return written
+
+    def render_global_memory_markdown(self) -> str:
+        rows = self.list_global_memory(limit=64)
+        lines = [
+            "# SHARED_MEMORY",
+            "",
+            "## Role",
+            "This file is the generated cross-project memory view exported from the shared project state database.",
+            "",
+            "## Global Rules And Preferences",
+        ]
+        if rows:
+            for row in rows:
+                category = str(row.get("category") or "workflow").strip()
+                source_project = str(row.get("source_project_id") or "").strip()
+                suffix = f" [{category}]" + (f" (source: {source_project})" if source_project else "")
+                lines.append(f"- {row.get('content', '')}{suffix}")
+        else:
+            lines.append("- No shared global memory recorded yet.")
+        lines.extend(["", "## Updated At", self._global_memory_updated_at(), ""])
+        return "\n".join(lines)
+
+    def sync_global_memory_file(self) -> Path | None:
+        output_path = self.db_path.parent / _GLOBAL_MEMORY_FILE
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(self.render_global_memory_markdown(), encoding="utf-8")
+        except OSError:
+            return None
+        return output_path
 
     def sync_project_summary(self, project_id: str) -> bool:
         if not project_id or not self.db_path.exists():
@@ -943,6 +1070,13 @@ class ProjectContextStore:
         if not any((focus, current_state, long_term_memory, key_points)):
             return False
         self.upsert_project_memory(
+            project_id,
+            focus=focus,
+            recent_context=current_state,
+            memory=long_term_memory,
+            recent_hints=key_points,
+        )
+        self.promote_project_memory_to_global(
             project_id,
             focus=focus,
             recent_context=current_state,
@@ -1104,6 +1238,67 @@ class ProjectContextStore:
             return ""
         return str(row["updated_at"] or "").strip() or ""
 
+    def _global_memory_updated_at(self) -> str:
+        try:
+            with self._connect() as conn:
+                row = conn.execute("SELECT MAX(updated_at) AS updated_at FROM global_memory").fetchone()
+        except sqlite3.Error:
+            return ""
+        return str((row["updated_at"] if row else "") or "").strip() or ""
+
+    @classmethod
+    def _empty_memory_snapshot(cls, global_snapshot: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "project_id": "",
+            "workspace": "",
+            "profile": "",
+            "focus": "",
+            "current_state": "",
+            "recent_context": "",
+            "memory": "",
+            "recent_hints": [],
+            "global_memory": global_snapshot["summary"],
+            "global_hints": global_snapshot["hints"],
+        }
+
+    def _project_memory_values(
+        self,
+        project: ProjectContext,
+        stored_memory: dict[str, Any],
+    ) -> tuple[str, str, str, list[str]]:
+        recent_hints = stored_memory["recent_hints"] or [
+            self._compact(message, _PROMPT_MESSAGE_LIMIT)
+            for message in project.recent_messages[-_PROMPT_RECENT_MESSAGE_COUNT:]
+            if (message or "").strip()
+        ]
+        focus = stored_memory["focus"] or self._summary_field(project.summary, "Current focus:")
+        recent_context = stored_memory["recent_context"] or self._summary_state(project.summary)
+        memory = stored_memory["memory"] or (
+            self._compact(self._summary_compact_text(project.summary), _PROMPT_FIELD_LIMIT) if project.summary else ""
+        )
+        return focus, recent_context, memory, recent_hints
+
+    def _project_ov_overview(self, project_id: str, *, limit: int | None = None) -> str:
+        overview = read_openviking_overview(project_ov_resource_uri(project_id))
+        if limit is None:
+            return overview
+        return self._compact(overview, limit)
+
+    @classmethod
+    def _append_global_memory_section(
+        cls,
+        lines: list[str],
+        global_snapshot: dict[str, Any],
+        *,
+        heading: str,
+    ) -> None:
+        lines.extend(["", heading])
+        if global_snapshot["hints"]:
+            for item in global_snapshot["hints"]:
+                lines.append(f"- {item}")
+        else:
+            lines.append("- No shared cross-project memory recorded yet.")
+
     @classmethod
     def _derive_next_step(
         cls,
@@ -1153,3 +1348,81 @@ class ProjectContextStore:
         normalized_left = cls._strip_memory_label(left).casefold()
         normalized_right = cls._strip_memory_label(right).casefold()
         return bool(normalized_left and normalized_right and normalized_left == normalized_right)
+
+    @classmethod
+    def _global_memory_key(cls, content: str) -> str:
+        normalized = cls._strip_memory_label(content).casefold()
+        return sha1(normalized.encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def _is_global_memory_candidate(cls, project_id: str, text: str) -> bool:
+        normalized = cls._strip_memory_label(text)
+        lowered = normalized.casefold()
+        if len(normalized) < 12:
+            return False
+        if project_id and project_id.casefold() in lowered:
+            return False
+        markers = (
+            "默认",
+            "总是",
+            "不要",
+            "优先",
+            "本地",
+            "服务器",
+            "代理",
+            "全局",
+            "跨项目",
+            "shared",
+            "global",
+            "local",
+            "server",
+            "proxy",
+            "openviking",
+            "ov ",
+            "codex",
+            "claude",
+            "ash",
+            "tmux",
+            "mcp",
+            "mac",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @classmethod
+    def _global_memory_category(cls, text: str) -> str:
+        lowered = cls._strip_memory_label(text).casefold()
+        if any(token in lowered for token in ("proxy", "代理", "mcp", "tmux", "server", "mac", "local")):
+            return "environment"
+        if any(token in lowered for token in ("prefer", "默认", "优先", "不要", "总是")):
+            return "preference"
+        return "workflow"
+
+    @classmethod
+    def _global_memory_candidates(
+        cls,
+        project_id: str,
+        *,
+        focus: str,
+        recent_context: str,
+        memory: str,
+        recent_hints: list[str],
+    ) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        candidates: list[dict[str, Any]] = []
+        for raw in [memory, *recent_hints, recent_context, focus]:
+            normalized = cls._strip_memory_label(raw)
+            key = normalized.casefold()
+            if not normalized or key in seen:
+                continue
+            seen.add(key)
+            if not cls._is_global_memory_candidate(project_id, normalized):
+                continue
+            confidence = 0.8 if raw == memory else 0.65
+            candidates.append(
+                {
+                    "content": normalized,
+                    "category": cls._global_memory_category(normalized),
+                    "confidence": confidence,
+                }
+            )
+        return candidates

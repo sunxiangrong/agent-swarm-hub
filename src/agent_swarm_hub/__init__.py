@@ -18,8 +18,6 @@ from .executor import (
     build_executor_for_config,
 )
 from .lark import LarkOutboundMessage, build_lark_text_outbound, lark_event_to_remote_message
-from .lark_service import LarkDispatch, LarkService
-from .lark_ws_runner import LarkWebSocketRunner
 from .models import Event, EventType, Task, TaskStatus
 from .remote import RemoteCommand, RemoteMessage, RemotePlatform, parse_remote_command
 from .session_store import (
@@ -37,6 +35,21 @@ from .telegram import TelegramOutboundMessage, build_telegram_outbound, telegram
 from .telegram_service import TelegramDispatch, TelegramService
 from .telegram_transport import TelegramRequest, TelegramTransport
 from .worker_session import ExecutorBusyError, LocalExecutorSession, LocalExecutorSessionPool
+
+
+def __getattr__(name: str):
+    if name in {"LarkDispatch", "LarkService"}:
+        from .lark_service import LarkDispatch, LarkService
+
+        globals()["LarkDispatch"] = LarkDispatch
+        globals()["LarkService"] = LarkService
+        return globals()[name]
+    if name == "LarkWebSocketRunner":
+        from .lark_ws_runner import LarkWebSocketRunner
+
+        globals()["LarkWebSocketRunner"] = LarkWebSocketRunner
+        return LarkWebSocketRunner
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "AdapterResponse",
