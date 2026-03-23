@@ -34,6 +34,8 @@
   进入项目前显示的稳定项目摘要
 - `project_memory`
   动态工作记忆，用于承接最近状态
+- `global_memory`
+  跨项目共享规则、偏好、环境约定
 - `provider_bindings`
   当前默认恢复哪条 Claude / Codex 原生会话
 - `provider_sessions`
@@ -45,8 +47,21 @@
 
 - `summary` 是稳定项目视图
 - `project_memory` 是动态工作记忆
+- `global_memory` 是跨项目共享层
 - `provider_bindings` 决定默认恢复哪条原生会话
 - `active / archived` 只是原生会话的保留状态，不等于当前绑定
+
+进一步说，当前记忆主线已经收口成三层：
+
+- `project_memory`
+  - 项目内运行时主记忆源
+  - 直接服务项目启动、恢复、dashboard 展示
+- `global_memory`
+  - 从项目记忆中“保守提升”得到的共享规则层
+  - 只存适合跨项目复用的偏好、环境约束、工作规则
+- OpenViking 项目树 / memory bundle
+  - 导出和同步后的资源视图
+  - 不是原始写入点
 
 ## 使用入口
 
@@ -133,6 +148,7 @@ Core regression:
 This covers the current core chain:
 - native entry via `ash-chat` / `local-native`
 - Codex/Claude session reuse and project memory injection
+- global memory promotion and shared-memory export
 - OpenViking support and overview fallback
 - runtime cleanup
 - tmux/swarm launch behavior
@@ -213,7 +229,7 @@ Telegram / Lark
 
 - 项目进入与项目路径绑定
 - Claude / Codex 原生会话恢复
-- 项目 `summary` 与 `project_memory` 分层
+- 项目 `summary` / `project_memory` / `global_memory` 分层
 - 原生会话按项目归档
 - `provider_bindings` 管当前默认恢复会话
 - `active / archived` 管原生会话生命周期
@@ -265,9 +281,18 @@ Telegram / Lark
 - 项目总账
 - 项目画像
 - 项目摘要
-- 项目长期记忆
+- 项目长期记忆（`project_memory`）
+- 跨项目共享记忆（`global_memory`）
 - Claude / Codex 原生会话归类
 - 当前绑定会话
+
+导出文件：
+
+- 每个项目工作区内：
+  - `PROJECT_MEMORY.md`
+  - `PROJECT_SKILL.md`
+- 共享数据库目录内：
+  - `SHARED_MEMORY.md`
 
 ### 本地运行时库
 
@@ -281,6 +306,49 @@ Telegram / Lark
 - handoff
 - worker 运行态
 - 临时消息与执行流
+
+## 代码结构
+
+当前入口已经按职责拆分，`cli.py` 只保留总入口、命令分发和少量兼容包装：
+
+- `src/agent_swarm_hub/cli.py`
+  - 总入口、命令分发、兼容层
+- `src/agent_swarm_hub/workspace_ops.py`
+  - 项目选择、workspace 校验、新项目建档
+- `src/agent_swarm_hub/local_chat.py`
+  - `local-chat` 交互循环与记忆 checkpoint / finalize
+- `src/agent_swarm_hub/native_entry.py`
+  - `local-native` 启动链、session 恢复、上下文注入、postrun 回写
+- `src/agent_swarm_hub/cli_ops.py`
+  - OpenViking 管理、project session 命令、runtime cleanup
+- `src/agent_swarm_hub/project_context.py`
+  - 项目记忆、全局记忆、导出文件、记忆 consolidation
+
+这意味着现在的主从关系是：
+
+- shell / tmux 入口负责触发
+- `cli.py` 负责路由
+- 各子模块负责各自 workflow
+- `project_context.py` 负责记忆和导出
+
+## 记忆流转
+
+简化后的记忆流转如下：
+
+```text
+项目对话 / 原生会话
+  -> project_memory
+  -> 保守提升一部分到 global_memory
+  -> 导出 PROJECT_MEMORY.md / PROJECT_SKILL.md / SHARED_MEMORY.md
+  -> 再同步到 OpenViking 项目树与 memory bundle
+```
+
+所以现在的写入优先级是：
+
+1. 先写项目记忆
+2. 再按规则提升到全局记忆
+3. 再导出成本地视图
+4. 再同步成 OV 视图
 
 ## 路径约定
 
