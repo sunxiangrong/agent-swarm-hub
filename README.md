@@ -24,6 +24,23 @@
 
 `agent-swarm-hub` 的核心做法是把 `project` 作为第一对象，而不是把 provider session id 当主对象。
 
+它的定位应该理解成：
+
+- 一个共享项目 harness
+- 上面挂多个 agent CLI / provider
+- 而不是某一个智能体专用的壳
+
+这也是本仓库当前采用的 harness 思路：
+
+- 人负责设计项目边界、记忆边界、共享规则和回收机制
+- agent 负责在这些约束内执行
+- 仓库文件而不是口头约定，才是系统真实规则
+
+仓库导航与架构边界：
+
+- `AGENTS.md`
+- `docs/ARCHITECTURE.md`
+
 ## 核心模型
 
 每个项目至少有这些信息：
@@ -37,9 +54,9 @@
 - `global_memory`
   跨项目共享规则、偏好、环境约定
 - `provider_bindings`
-  当前默认恢复哪条 Claude / Codex 原生会话
+  当前默认恢复哪条 provider 原生会话
 - `provider_sessions`
-  这个项目下归档过的原生会话历史
+  这个项目下归档过的 provider 原生会话历史
 - `active / archived`
   原生会话生命周期状态
 
@@ -50,6 +67,21 @@
 - `global_memory` 是跨项目共享层
 - `provider_bindings` 决定默认恢复哪条原生会话
 - `active / archived` 只是原生会话的保留状态，不等于当前绑定
+
+而 provider 模型单独放在这条共享主线之下：
+
+- 共享层：
+  - project identity
+  - project memory
+  - shared/global memory
+  - exported views
+  - OpenViking sync/view
+- provider 层：
+  - raw session ids
+  - resume conventions
+  - runtime-specific execution quirks
+
+这意味着大多数 `ash` 内部改动都应该跨 agent CLI 复用，而不是只服务某一个智能体。
 
 进一步说，当前记忆主线已经收口成三层：
 
@@ -234,6 +266,7 @@ Telegram / Lark
 - `provider_bindings` 管当前默认恢复会话
 - `active / archived` 管原生会话生命周期
 - 远程聊天与本地原生 CLI 共用同一套项目模型
+- 共享项目层默认跨 agent CLI 复用，provider 细节再单独隔离
 
 ## 常用命令
 
