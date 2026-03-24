@@ -251,6 +251,8 @@ def build_project_summary_prompt(
         lines.append(f"- Cache Summary: {brief['memory']}")
     if snapshot.get("global_memory"):
         lines.append(f"- Shared Global Memory: {snapshot['global_memory']}")
+    if snapshot.get("shared_scopes"):
+        lines.append(f"- Shared Memory Scopes: {', '.join(snapshot['shared_scopes'])}")
     ov_overview = ProjectContextStore._compact(
         read_openviking_overview_cb(project_ov_resource_uri(workspace_id)).replace("\n", " ").strip(),
         240,
@@ -367,6 +369,9 @@ def clear_project_runtime_env(env: dict[str, str]) -> None:
         "ASH_PROJECT_MEMORY_OVERVIEW",
         "ASH_GLOBAL_MEMORY_SUMMARY",
         "ASH_GLOBAL_MEMORY_HINTS",
+        "ASH_SHARED_MEMORY_SUMMARY",
+        "ASH_SHARED_MEMORY_HINTS",
+        "ASH_SHARED_MEMORY_SCOPES",
         "ASH_PROVIDER_SESSION_ID",
         "ASH_CLAUDE_SESSION_ID",
         "ASH_CODEX_SESSION_ID",
@@ -424,6 +429,9 @@ def inject_project_memory_env(
     )
     env["ASH_GLOBAL_MEMORY_SUMMARY"] = str(snapshot.get("global_memory") or "")
     env["ASH_GLOBAL_MEMORY_HINTS"] = " || ".join(snapshot.get("global_hints", []) or [])
+    env["ASH_SHARED_MEMORY_SUMMARY"] = str(snapshot.get("shared_memory") or "")
+    env["ASH_SHARED_MEMORY_HINTS"] = " || ".join(snapshot.get("shared_hints", []) or [])
+    env["ASH_SHARED_MEMORY_SCOPES"] = " || ".join(snapshot.get("shared_scopes", []) or [])
     return True
 
 

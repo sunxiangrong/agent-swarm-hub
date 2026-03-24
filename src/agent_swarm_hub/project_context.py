@@ -19,6 +19,9 @@ _PROMPT_MESSAGE_LIMIT = 120
 _PROMPT_RECENT_MESSAGE_COUNT = 2
 _GLOBAL_MEMORY_LIMIT = 8
 _GLOBAL_MEMORY_FILE = "SHARED_MEMORY.md"
+_ALL_PROJECTS_SCOPE = "shared:all-projects"
+_BIOINFO_SCOPE = "shared:bioinfo"
+_KNOWLEDGE_SYSTEM_PROJECT = "knowledge-system"
 
 
 def project_ov_resource_uri(project_id: str) -> str:
@@ -120,11 +123,19 @@ class ProjectContextStore:
 
                     CREATE TABLE IF NOT EXISTS global_memory (
                         memory_key TEXT PRIMARY KEY,
+                        scope TEXT NOT NULL DEFAULT 'global',
                         category TEXT NOT NULL DEFAULT 'workflow',
                         content TEXT NOT NULL DEFAULT '',
                         source_project_id TEXT NOT NULL DEFAULT '',
                         confidence REAL NOT NULL DEFAULT 0.5,
                         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+
+                    CREATE TABLE IF NOT EXISTS project_memory_scopes (
+                        project_id TEXT NOT NULL,
+                        scope TEXT NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (project_id, scope)
                     );
                     """
                 )
@@ -157,6 +168,13 @@ class ProjectContextStore:
                     WHERE COALESCE(recent_context, '') = ''
                     """
                 )
+        except sqlite3.Error:
+            return
+        try:
+            global_columns = {row["name"] for row in conn.execute("PRAGMA table_info(global_memory)").fetchall()}
+            if "scope" not in global_columns:
+                conn.execute("ALTER TABLE global_memory ADD COLUMN scope TEXT NOT NULL DEFAULT 'global'")
+                conn.execute("UPDATE global_memory SET scope = 'global' WHERE COALESCE(scope, '') = ''")
         except sqlite3.Error:
             return
 
@@ -317,6 +335,8 @@ class ProjectContextStore:
             lines.extend(f"- {message}" for message in snapshot["recent_hints"])
         if snapshot["global_memory"]:
             lines.append(f"Global Memory: {snapshot['global_memory']}")
+        if snapshot.get("shared_scopes"):
+            lines.append(f"Shared Scopes: {', '.join(snapshot['shared_scopes'])}")
         return "\n".join(lines)
 
     def build_memory_snapshot(self, workspace_path: str | None) -> dict[str, Any]:
@@ -325,6 +345,9 @@ class ProjectContextStore:
         if project is None:
             return self._empty_memory_snapshot(global_snapshot)
         stored_memory = self.get_project_memory(project.project_id)
+        shared_scopes = self.resolve_project_memory_scopes(project.project_id)
+        shared_snapshot = self.build_global_memory_snapshot(scopes=shared_scopes, include_global=False)
+        combined_snapshot = self.build_global_memory_snapshot(scopes=shared_scopes, include_global=True)
         focus, recent_context, memory, recent_messages = self._project_memory_values(project, stored_memory)
         return {
             "project_id": project.project_id,
@@ -335,31 +358,59 @@ class ProjectContextStore:
             "recent_context": self._compact(recent_context, _PROMPT_FIELD_LIMIT) if recent_context else "",
             "memory": self._compact(memory, _PROMPT_FIELD_LIMIT) if memory else "",
             "recent_hints": recent_messages,
-            "global_memory": global_snapshot["summary"],
-            "global_hints": global_snapshot["hints"],
+            "global_memory": combined_snapshot["summary"],
+            "global_hints": combined_snapshot["hints"],
+            "shared_memory": shared_snapshot["summary"],
+            "shared_hints": shared_snapshot["hints"],
+            "shared_scopes": shared_scopes,
+            "universal_memory": global_snapshot["summary"],
+            "universal_hints": global_snapshot["hints"],
         }
 
-    def list_global_memory(self, *, limit: int = _GLOBAL_MEMORY_LIMIT) -> list[dict[str, Any]]:
+    def list_global_memory(
+        self,
+        *,
+        limit: int = _GLOBAL_MEMORY_LIMIT,
+        scopes: list[str] | None = None,
+        include_global: bool = True,
+    ) -> list[dict[str, Any]]:
         if not self.db_path.exists():
+            return []
+        normalized_scopes = [self._normalize_memory_scope(item) for item in (scopes or []) if self._normalize_memory_scope(item)]
+        clauses: list[str] = []
+        params: list[Any] = []
+        if normalized_scopes:
+            placeholders = ",".join("?" for _ in normalized_scopes)
+            clauses.append(f"scope IN ({placeholders})")
+            params.extend(normalized_scopes)
+        if include_global:
+            clauses.append("scope = 'global'")
+        if not clauses:
             return []
         try:
             with self._connect() as conn:
                 rows = conn.execute(
-                    """
-                    SELECT memory_key, category, content, source_project_id, confidence, updated_at
+                    f"""
+                    SELECT memory_key, scope, category, content, source_project_id, confidence, updated_at
                     FROM global_memory
                     WHERE COALESCE(content, '') != ''
+                      AND ({' OR '.join(clauses)})
                     ORDER BY confidence DESC, updated_at DESC, memory_key ASC
                     LIMIT ?
                     """,
-                    (max(1, int(limit)),),
+                    (*params, max(1, int(limit))),
                 ).fetchall()
         except sqlite3.Error:
             return []
         return [dict(row) for row in rows]
 
-    def build_global_memory_snapshot(self) -> dict[str, Any]:
-        rows = self.list_global_memory()
+    def build_global_memory_snapshot(
+        self,
+        *,
+        scopes: list[str] | None = None,
+        include_global: bool = True,
+    ) -> dict[str, Any]:
+        rows = self.list_global_memory(scopes=scopes, include_global=include_global)
         hints = [self._compact(str(row.get("content") or ""), _PROMPT_MESSAGE_LIMIT) for row in rows if str(row.get("content") or "").strip()]
         summary = self._compact(" | ".join(hints[:3]), 220) if hints else ""
         return {"summary": summary, "hints": hints[:_PROMPT_RECENT_MESSAGE_COUNT]}
@@ -368,6 +419,7 @@ class ProjectContextStore:
         self,
         *,
         content: str,
+        scope: str = "global",
         category: str = "workflow",
         source_project_id: str = "",
         confidence: float = 0.6,
@@ -375,14 +427,16 @@ class ProjectContextStore:
         normalized = self._compact(self._strip_memory_label(content), 280)
         if not normalized:
             return False
-        memory_key = self._global_memory_key(normalized)
+        scope_value = self._normalize_memory_scope(scope) or "global"
+        memory_key = self._scoped_memory_key(scope_value, normalized)
         try:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO global_memory (memory_key, category, content, source_project_id, confidence, updated_at)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    INSERT INTO global_memory (memory_key, scope, category, content, source_project_id, confidence, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(memory_key) DO UPDATE SET
+                        scope = excluded.scope,
                         category = excluded.category,
                         content = excluded.content,
                         source_project_id = CASE
@@ -395,11 +449,117 @@ class ProjectContextStore:
                         END,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    (memory_key, category.strip() or "workflow", normalized, source_project_id.strip(), float(confidence)),
+                    (memory_key, scope_value, category.strip() or "workflow", normalized, source_project_id.strip(), float(confidence)),
                 )
         except sqlite3.Error:
             return False
         return True
+
+    def list_project_memory_scopes(self, project_id: str) -> list[str]:
+        if not project_id or not self.db_path.exists():
+            return []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT scope
+                    FROM project_memory_scopes
+                    WHERE project_id = ?
+                    ORDER BY scope ASC
+                    """,
+                    (project_id,),
+                ).fetchall()
+        except sqlite3.Error:
+            return []
+        return [str(row["scope"]).strip() for row in rows if str(row["scope"]).strip()]
+
+    def resolve_project_memory_scopes(self, project_id: str) -> list[str]:
+        scopes = set(self.list_project_memory_scopes(project_id))
+        scopes.update(self.default_project_memory_scopes(project_id))
+        if project_id == _KNOWLEDGE_SYSTEM_PROJECT:
+            scopes.update(self.list_memory_scopes())
+        return sorted(scope for scope in scopes if scope and scope != "global")
+
+    def default_project_memory_scopes(self, project_id: str) -> list[str]:
+        normalized = (project_id or "").strip().casefold()
+        if not normalized:
+            return []
+        scopes = {_ALL_PROJECTS_SCOPE}
+        bioinfo_markers = ("gwas", "qtl", "genome", "scpagwas", "bioinfo")
+        if normalized in {"cell_qtl", "genome_functional", "post-gwas", "scpagwas_celltype"} or any(
+            marker in normalized for marker in bioinfo_markers
+        ):
+            scopes.add(_BIOINFO_SCOPE)
+        return sorted(scopes)
+
+    def ensure_default_project_memory_scopes(self, project_id: str) -> int:
+        added = 0
+        for scope in self.default_project_memory_scopes(project_id):
+            if self.bind_project_memory_scope(project_id, scope):
+                added += 1
+        return added
+
+    def ensure_default_memory_scopes_for_all_projects(self) -> int:
+        added = 0
+        for project in self.list_projects():
+            added += self.ensure_default_project_memory_scopes(project.project_id)
+        return added
+
+    def bind_project_memory_scope(self, project_id: str, scope: str) -> bool:
+        normalized = self._normalize_memory_scope(scope)
+        if not project_id or not normalized or normalized == "global":
+            return False
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO project_memory_scopes (project_id, scope, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(project_id, scope) DO UPDATE SET
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (project_id, normalized),
+                )
+        except sqlite3.Error:
+            return False
+        return True
+
+    def unbind_project_memory_scope(self, project_id: str, scope: str) -> bool:
+        normalized = self._normalize_memory_scope(scope)
+        if not project_id or not normalized:
+            return False
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM project_memory_scopes WHERE project_id = ? AND scope = ?",
+                    (project_id, normalized),
+                )
+        except sqlite3.Error:
+            return False
+        return True
+
+    def prune_global_memory(self) -> int:
+        rows = self.list_global_memory(limit=256)
+        stale_keys = [
+            str(row.get("memory_key") or "")
+            for row in rows
+            if not self._accept_global_memory_candidate(
+                str(row.get("source_project_id") or ""),
+                str(row.get("content") or ""),
+                from_ai=False,
+            )
+        ]
+        if not stale_keys:
+            return 0
+        try:
+            with self._connect() as conn:
+                conn.executemany(
+                    "DELETE FROM global_memory WHERE memory_key = ?",
+                    [(key,) for key in stale_keys if key],
+                )
+        except sqlite3.Error:
+            return 0
+        return len(stale_keys)
 
     def promote_project_memory_to_global(
         self,
@@ -409,14 +569,18 @@ class ProjectContextStore:
         recent_context: str = "",
         memory: str = "",
         recent_hints: list[str] | None = None,
+        ai_candidates: list[dict[str, Any]] | None = None,
     ) -> int:
         promoted = 0
+        mode = self._global_memory_promotion_mode()
         for candidate in self._global_memory_candidates(
             project_id,
             focus=focus,
             recent_context=recent_context,
             memory=memory,
             recent_hints=recent_hints or [],
+            ai_candidates=ai_candidates or [],
+            mode=mode,
         ):
             if self.upsert_global_memory(
                 content=candidate["content"],
@@ -692,7 +856,9 @@ class ProjectContextStore:
         if project is None:
             return ""
         stored_memory = self.get_project_memory(project_id)
-        global_snapshot = self.build_global_memory_snapshot()
+        shared_scopes = self.resolve_project_memory_scopes(project_id)
+        shared_snapshot = self.build_global_memory_snapshot(scopes=shared_scopes, include_global=False)
+        global_snapshot = self.build_global_memory_snapshot(scopes=shared_scopes, include_global=True)
         bindings = self.get_current_project_sessions(project_id)
         sessions = self.list_project_sessions(project_id, include_archived=False)
         focus, current_state, memory, recent_hints = self._project_memory_values(project, stored_memory)
@@ -764,6 +930,22 @@ class ProjectContextStore:
                 lines.append(f"- {item}")
         if not any(item for item in key_rules):
             lines.append("- No key rules recorded yet.")
+        lines.extend(
+            [
+                "",
+                "## Shared Memory Hooks",
+            ]
+        )
+        if shared_scopes:
+            for scope in shared_scopes:
+                lines.append(f"- scope: {scope}")
+        else:
+            lines.append("- No shared scopes bound.")
+        lines.append(f"- shared memory file: {self.db_path.parent / _GLOBAL_MEMORY_FILE}")
+        if shared_snapshot["hints"]:
+            lines.append("- active shared hints:")
+            for item in shared_snapshot["hints"]:
+                lines.append(f"  {item}")
         self._append_global_memory_section(lines, global_snapshot, heading="## Global Memory")
         lines.extend(
             [
@@ -845,6 +1027,9 @@ class ProjectContextStore:
         ov_overview = self._project_ov_overview(project.project_id, limit=220)
         if ov_overview:
             lines.append(f"OpenViking overview: {ov_overview}")
+        shared_scopes = self.resolve_project_memory_scopes(project_id)
+        if shared_scopes:
+            lines.append(f"Shared scopes: {', '.join(shared_scopes)}")
         return "\n".join(lines)
 
     def render_project_skill_markdown(self, project_id: str) -> str:
@@ -852,7 +1037,9 @@ class ProjectContextStore:
         if project is None:
             return ""
         stored_memory = self.get_project_memory(project_id)
-        global_snapshot = self.build_global_memory_snapshot()
+        shared_scopes = self.resolve_project_memory_scopes(project_id)
+        shared_snapshot = self.build_global_memory_snapshot(scopes=shared_scopes, include_global=False)
+        global_snapshot = self.build_global_memory_snapshot(scopes=shared_scopes, include_global=True)
         focus, recent_context, _memory, _recent_hints = self._project_memory_values(project, stored_memory)
         ov_overview = self._project_ov_overview(project.project_id, limit=420)
         lines = [
@@ -895,12 +1082,28 @@ class ProjectContextStore:
                 "",
                 "## Memory Rules",
                 "- Project-scoped context belongs in OpenViking under the project resource directory when OV is enabled.",
-                "- Cross-project rules and preferences belong in shared global memory, not repeated per-project state.",
+                "- Cross-project rules and preferences belong in shared/global memory, not repeated per-project state.",
                 "- Local project files are generated exported views; refresh them through the shared sync flow instead of treating them as the primary source of truth.",
                 "- Do not overwrite project memory with meta chat such as asking whether memory exists.",
                 "- When the task meaningfully changes, update project memory through the shared sync flow.",
             ]
         )
+        lines.extend(
+            [
+                "",
+                "## Shared Memory Hooks",
+            ]
+        )
+        if shared_scopes:
+            for scope in shared_scopes:
+                lines.append(f"- Attach shared rules from `{scope}` when they match the task.")
+        else:
+            lines.append("- No shared scopes bound for this project yet.")
+        lines.append(f"- Read shared rules from `{self.db_path.parent / _GLOBAL_MEMORY_FILE}` when you need cross-project guidance.")
+        if shared_snapshot["hints"]:
+            lines.append("- Current shared hints:")
+            for item in shared_snapshot["hints"]:
+                lines.append(f"- {item}")
         self._append_global_memory_section(lines, global_snapshot, heading="## Shared Global Memory")
         lines.extend(
             [
@@ -971,25 +1174,56 @@ class ProjectContextStore:
         return written
 
     def render_global_memory_markdown(self) -> str:
-        rows = self.list_global_memory(limit=64)
+        rows = self.list_global_memory(limit=64, scopes=self.list_memory_scopes(), include_global=True)
         lines = [
             "# SHARED_MEMORY",
             "",
             "## Role",
-            "This file is the generated cross-project memory view exported from the shared project state database.",
+            "This file is the generated shared-memory view exported from the shared project state database.",
             "",
-            "## Global Rules And Preferences",
+            "## Shared And Global Rules",
         ]
         if rows:
             for row in rows:
                 category = str(row.get("category") or "workflow").strip()
                 source_project = str(row.get("source_project_id") or "").strip()
-                suffix = f" [{category}]" + (f" (source: {source_project})" if source_project else "")
+                scope = str(row.get("scope") or "global").strip() or "global"
+                suffix = f" [{scope} / {category}]" + (f" (source: {source_project})" if source_project else "")
                 lines.append(f"- {row.get('content', '')}{suffix}")
         else:
-            lines.append("- No shared global memory recorded yet.")
+            lines.append("- No shared or global memory recorded yet.")
         lines.extend(["", "## Updated At", self._global_memory_updated_at(), ""])
         return "\n".join(lines)
+
+    def list_memory_scopes(self) -> list[str]:
+        if not self.db_path.exists():
+            return []
+        try:
+            with self._connect() as conn:
+                global_rows = conn.execute(
+                    """
+                    SELECT DISTINCT scope
+                    FROM global_memory
+                    WHERE COALESCE(scope, '') != '' AND scope != 'global'
+                    ORDER BY scope ASC
+                    """
+                ).fetchall()
+                binding_rows = conn.execute(
+                    """
+                    SELECT DISTINCT scope
+                    FROM project_memory_scopes
+                    WHERE COALESCE(scope, '') != ''
+                    ORDER BY scope ASC
+                    """
+                ).fetchall()
+        except sqlite3.Error:
+            return []
+        scopes = {
+            str(row["scope"]).strip()
+            for row in [*global_rows, *binding_rows]
+            if str(row["scope"]).strip()
+        }
+        return sorted(scopes)
 
     def sync_global_memory_file(self) -> Path | None:
         output_path = self.db_path.parent / _GLOBAL_MEMORY_FILE
@@ -1082,6 +1316,11 @@ class ProjectContextStore:
             recent_context=current_state,
             memory=long_term_memory,
             recent_hints=key_points,
+            ai_candidates=(
+                self._parse_ai_global_memory_candidates(payload.get("global_memory_candidates") or [])
+                if self._ai_global_memory_candidates_enabled()
+                else []
+            ),
         )
         self.sync_project_summary(project_id)
         return True
@@ -1147,13 +1386,18 @@ class ProjectContextStore:
             [
                 "You are consolidating project memory for a coding workspace.",
                 "Return JSON only. No markdown fences.",
-                'Schema: {"focus":"...","current_state":"...","next_step":"...","long_term_memory":"...","key_points":["..."]}',
+                'Schema: {"focus":"...","current_state":"...","next_step":"...","long_term_memory":"...","key_points":["..."],"global_memory_candidates":[{"content":"...","category":"environment|preference|workflow","confidence":0.0,"reason":"..."}]}',
                 "Rules:",
                 "- Focus on durable project understanding, not chat meta.",
                 "- current_state should describe the latest meaningful situation in 1 sentence.",
                 "- next_step should be the single most important next action.",
                 "- long_term_memory should capture stable constraints, decisions, or strategy.",
                 "- key_points should contain at most 3 short bullets worth remembering.",
+                "- global_memory_candidates should contain at most 3 durable cross-project rules, defaults, or preferences.",
+                "- Only emit a global_memory_candidate when the content would still be useful in other projects.",
+                "- Never emit project-specific tasks, temporary statuses, or one-off troubleshooting notes as global memory.",
+                "- Do not include direct project names or absolute paths in global_memory_candidates; abstract them into reusable rules.",
+                "- confidence should be between 0.0 and 1.0.",
                 "",
                 f"Project: {project_id}",
                 f"Workspace: {workspace_path}",
@@ -1201,6 +1445,47 @@ class ProjectContextStore:
             except Exception:
                 return {}
         return {}
+
+    @classmethod
+    def _parse_ai_global_memory_candidates(cls, raw_candidates: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw_candidates, list):
+            return []
+        parsed: list[dict[str, Any]] = []
+        for item in raw_candidates[:6]:
+            if not isinstance(item, dict):
+                continue
+            content = cls._compact(cls._strip_memory_label(str(item.get("content") or "")), 280)
+            reason = cls._compact(str(item.get("reason") or ""), 160)
+            category = str(item.get("category") or "").strip().lower() or "workflow"
+            if category not in {"environment", "preference", "workflow"}:
+                category = "workflow"
+            try:
+                confidence = float(item.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            parsed.append(
+                {
+                    "content": content,
+                    "reason": reason,
+                    "category": category,
+                    "confidence": min(1.0, max(0.0, confidence)),
+                }
+            )
+        return parsed
+
+    @staticmethod
+    def _ai_global_memory_candidates_enabled() -> bool:
+        raw = (os.getenv("ASH_ENABLE_AI_GLOBAL_MEMORY_CANDIDATES") or "").strip().casefold()
+        if raw in {"0", "false", "off", "no"}:
+            return False
+        return True
+
+    @staticmethod
+    def _global_memory_promotion_mode() -> str:
+        raw = (os.getenv("ASH_GLOBAL_MEMORY_PROMOTION_MODE") or "").strip().casefold()
+        if raw in {"ai-only", "rules-only", "hybrid"}:
+            return raw
+        return "hybrid"
 
     @classmethod
     def _parse_hints_json(cls, raw: str | None) -> list[str]:
@@ -1259,6 +1544,11 @@ class ProjectContextStore:
             "recent_hints": [],
             "global_memory": global_snapshot["summary"],
             "global_hints": global_snapshot["hints"],
+            "shared_memory": "",
+            "shared_hints": [],
+            "shared_scopes": [],
+            "universal_memory": global_snapshot["summary"],
+            "universal_hints": global_snapshot["hints"],
         }
 
     def _project_memory_values(
@@ -1351,8 +1641,25 @@ class ProjectContextStore:
 
     @classmethod
     def _global_memory_key(cls, content: str) -> str:
-        normalized = cls._strip_memory_label(content).casefold()
+        return cls._scoped_memory_key("global", content)
+
+    @classmethod
+    def _scoped_memory_key(cls, scope: str, content: str) -> str:
+        normalized = f"{cls._normalize_memory_scope(scope) or 'global'}::{cls._strip_memory_label(content).casefold()}"
         return sha1(normalized.encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def _normalize_memory_scope(cls, scope: str | None) -> str:
+        normalized = " ".join((scope or "").split()).strip().casefold()
+        if not normalized:
+            return ""
+        if normalized == "global":
+            return "global"
+        if normalized.startswith("shared:") and len(normalized) > len("shared:"):
+            return normalized
+        if normalized.startswith("shared/") and len(normalized) > len("shared/"):
+            return "shared:" + normalized.removeprefix("shared/")
+        return f"shared:{normalized}"
 
     @classmethod
     def _is_global_memory_candidate(cls, project_id: str, text: str) -> bool:
@@ -1362,11 +1669,7 @@ class ProjectContextStore:
             return False
         if project_id and project_id.casefold() in lowered:
             return False
-        markers = (
-            "默认",
-            "总是",
-            "不要",
-            "优先",
+        scope_markers = (
             "本地",
             "服务器",
             "代理",
@@ -1377,16 +1680,27 @@ class ProjectContextStore:
             "local",
             "server",
             "proxy",
-            "openviking",
-            "ov ",
-            "codex",
-            "claude",
-            "ash",
             "tmux",
             "mcp",
             "mac",
         )
-        return any(marker in lowered for marker in markers)
+        directive_markers = (
+            "默认",
+            "总是",
+            "不要",
+            "优先",
+            "保持",
+            "禁用",
+            "开启",
+            "关闭",
+            "prefer",
+            "default",
+            "always",
+            "never",
+            "avoid",
+            "should",
+        )
+        return any(marker in lowered for marker in scope_markers) and any(marker in lowered for marker in directive_markers)
 
     @classmethod
     def _global_memory_category(cls, text: str) -> str:
@@ -1398,6 +1712,69 @@ class ProjectContextStore:
         return "workflow"
 
     @classmethod
+    def _looks_like_path(cls, text: str) -> bool:
+        lowered = cls._strip_memory_label(text).casefold()
+        return any(
+            token in lowered
+            for token in (
+                "/users/",
+                "/home/",
+                "/tmp/",
+                "/var/",
+                "file://",
+                "\\users\\",
+                ":\\",
+            )
+        )
+
+    @classmethod
+    def _looks_like_runtime_noise(cls, text: str) -> bool:
+        lowered = cls._strip_memory_label(text).casefold()
+        noise_markers = (
+            "task id:",
+            "phase:",
+            "backend:",
+            "pending=",
+            "completed=",
+            "in_progress",
+            "blocked=",
+            "recent: no notable",
+            "no notable updates",
+        )
+        return any(marker in lowered for marker in noise_markers)
+
+    @classmethod
+    def _looks_like_project_description(cls, text: str) -> bool:
+        lowered = cls._strip_memory_label(text).casefold()
+        description_markers = (
+            "基于 openviking 平台进行",
+            "项目，重点是",
+            "project involves",
+            "core workspace",
+            "core project workspace",
+            "核心策略是",
+        )
+        return any(marker in lowered for marker in description_markers)
+
+    @classmethod
+    def _accept_global_memory_candidate(cls, project_id: str, text: str, *, from_ai: bool = False) -> bool:
+        normalized = cls._strip_memory_label(text)
+        lowered = normalized.casefold()
+        if cls._looks_like_runtime_noise(normalized):
+            return False
+        if project_id and project_id.casefold() in lowered:
+            return False
+        if cls._looks_like_path(normalized):
+            return False
+        if cls._looks_like_project_description(normalized):
+            return False
+        if from_ai:
+            return len(normalized) >= 12
+        if not cls._is_global_memory_candidate(project_id, normalized):
+            return False
+        return True
+
+    @classmethod
     def _global_memory_candidates(
         cls,
         project_id: str,
@@ -1406,23 +1783,42 @@ class ProjectContextStore:
         recent_context: str,
         memory: str,
         recent_hints: list[str],
+        ai_candidates: list[dict[str, Any]] | None = None,
+        mode: str = "hybrid",
     ) -> list[dict[str, Any]]:
         seen: set[str] = set()
         candidates: list[dict[str, Any]] = []
-        for raw in [memory, *recent_hints, recent_context, focus]:
-            normalized = cls._strip_memory_label(raw)
-            key = normalized.casefold()
-            if not normalized or key in seen:
-                continue
-            seen.add(key)
-            if not cls._is_global_memory_candidate(project_id, normalized):
-                continue
-            confidence = 0.8 if raw == memory else 0.65
-            candidates.append(
-                {
-                    "content": normalized,
-                    "category": cls._global_memory_category(normalized),
-                    "confidence": confidence,
-                }
-            )
+        if mode in {"hybrid", "ai-only"}:
+            for item in ai_candidates or []:
+                normalized = cls._strip_memory_label(str(item.get("content") or ""))
+                key = normalized.casefold()
+                if not normalized or key in seen:
+                    continue
+                seen.add(key)
+                if not cls._accept_global_memory_candidate(project_id, normalized, from_ai=True):
+                    continue
+                candidates.append(
+                    {
+                        "content": normalized,
+                        "category": str(item.get("category") or cls._global_memory_category(normalized)),
+                        "confidence": max(0.7, min(0.95, float(item.get("confidence") or 0.0) or 0.7)),
+                    }
+                )
+        if mode in {"hybrid", "rules-only"}:
+            for raw in [memory, *recent_hints, recent_context, focus]:
+                normalized = cls._strip_memory_label(raw)
+                key = normalized.casefold()
+                if not normalized or key in seen:
+                    continue
+                seen.add(key)
+                if not cls._accept_global_memory_candidate(project_id, normalized):
+                    continue
+                confidence = 0.8 if raw == memory else 0.65
+                candidates.append(
+                    {
+                        "content": normalized,
+                        "category": cls._global_memory_category(normalized),
+                        "confidence": confidence,
+                    }
+                )
         return candidates

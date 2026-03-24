@@ -138,6 +138,7 @@ def upsert_project_workspace(*, store: SessionStore, title: str, workspace_path:
         transport="direct",
     )
     context_store = ProjectContextStore(str(db_path))
+    context_store.ensure_default_project_memory_scopes(project_id)
     context_store.sync_project_memory_file(project_id)
     context_store.sync_project_skill_file(project_id)
     return store.get_workspace(project_id) or WorkspaceRecord(

@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .adapter import CCConnectAdapter
@@ -32,6 +33,10 @@ from .telegram_service import TelegramService
 
 ADD_PROJECT_SENTINEL = workspace_ops.ADD_PROJECT_SENTINEL
 LarkWebSocketRunner = None
+
+# Keep the legacy `agent_swarm_hub.cli.time` attribute available so older
+# monkeypatch-based tests and downstream integrations can still target the
+# local-chat checkpoint clock through the historical import path.
 
 
 def _local_message(*, chat_id: str, user_id: str, text: str) -> RemoteMessage:

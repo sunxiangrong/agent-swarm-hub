@@ -307,6 +307,106 @@ Telegram / Lark
 - worker 运行态
 - 临时消息与执行流
 
+## 管理边界
+
+现在建议把整套系统理解成六条管理线：
+
+### 1. 项目管理
+
+负责回答“这个项目是谁、在哪、默认怎么进入”：
+
+- 项目 id
+- workspace path
+- 项目 summary
+- 项目默认 shared scopes
+
+主入口：
+
+- `workspace_ops.py`
+- 共享项目库里的 `projects`
+
+### 2. 会话管理
+
+负责回答“这个项目当前绑定哪个 provider 会话、历史有哪些会话”：
+
+- `provider_bindings`
+- `provider_sessions`
+- `active / archived`
+
+主入口：
+
+- `native_entry.py`
+- `project-sessions current/list/use`
+
+### 3. 记忆管理
+
+负责回答“项目自己记住什么、共享层记住什么”：
+
+- `project_memory`
+- `global_memory`
+- `project_memory_scopes`
+
+主入口：
+
+- `project_context.py`
+
+### 4. 共享记忆管理
+
+共享记忆现在不是单层，而是三层：
+
+- `project`
+  - 单项目使用
+- `shared:<group>`
+  - 一组项目共享
+  - 例如 `shared:all-projects`、`shared:bioinfo`、`shared:nwafu`
+- `global`
+  - 所有项目都通用
+
+当前原则：
+
+- 项目细节留在 `project_memory`
+- 跨项目规则进入 `shared:<group>`
+- 真正所有项目都适用的默认行为才进入 `global`
+
+### 5. OpenViking 管理
+
+负责回答“本地项目视图如何导出并同步到 OV”：
+
+- `PROJECT_MEMORY.md`
+- `PROJECT_SKILL.md`
+- `SHARED_MEMORY.md`
+- `var/openviking/imports/...`
+- `var/openviking/data/viking/...`
+
+主入口：
+
+- `cli_ops.py`
+- `openviking_support.py`
+- `agent-swarm-hub openviking|ov ...`
+
+### 6. 运行时清理管理
+
+负责回答“哪些是正在运行的状态，哪些是历史残留”：
+
+- tmux sessions / panes
+- pane logs
+- runtime workspace sessions
+- ccb registry
+- OV orphan imports
+
+主入口：
+
+- `project-sessions cleanup-runtime`
+
+一句话收口：
+
+- `workspace/project` 管身份
+- `session` 管当前入口
+- `memory` 管上下文
+- `shared/global` 管跨项目复用规则
+- `OV` 管导出和检索视图
+- `runtime cleanup` 管残留回收
+
 ## 代码结构
 
 当前入口已经按职责拆分，`cli.py` 只保留总入口、命令分发和少量兼容包装：
@@ -338,7 +438,8 @@ Telegram / Lark
 ```text
 项目对话 / 原生会话
   -> project_memory
-  -> 保守提升一部分到 global_memory
+  -> AI 提取 shared/global memory candidates
+  -> 提升到 shared:<group> 或 global
   -> 导出 PROJECT_MEMORY.md / PROJECT_SKILL.md / SHARED_MEMORY.md
   -> 再同步到 OpenViking 项目树与 memory bundle
 ```
@@ -346,9 +447,67 @@ Telegram / Lark
 所以现在的写入优先级是：
 
 1. 先写项目记忆
-2. 再按规则提升到全局记忆
-3. 再导出成本地视图
-4. 再同步成 OV 视图
+2. 再让 AI 提取跨项目共享候选
+3. 再按作用域写入 `shared:<group>` 或 `global`
+4. 再导出成本地视图
+5. 再同步成 OV 视图
+
+### 共享/全局记忆提取规则
+
+共享记忆不是直接把项目记忆整段塞进去，而是走两层：
+
+- AI 候选提取
+  - 从 consolidation 结果里提取跨项目候选
+  - 只允许输出长期有效的规则、偏好、环境约定
+- 作用域归类
+  - 若只对某些项目组有效，进入 `shared:<group>`
+  - 若对所有项目都有效，进入 `global`
+
+AI 侧约束重点：
+
+- 允许：
+  - 本地/服务器默认行为
+  - 代理、tmux、MCP、OpenViking、provider 使用约定
+  - 持续有效的工作习惯和偏好
+- 禁止：
+  - 项目专属任务
+  - 一次性排障状态
+  - 直接项目名
+  - 绝对路径
+
+如果某条内容带有项目名或路径，但确实有跨项目价值，应该先抽象成不依赖项目名和路径的通用规则，再进入共享记忆层。
+
+### 共享记忆钩子
+
+项目现在会自动带上“访问共享记忆的钩子”：
+
+- `PROJECT_MEMORY.md`
+  - `## Shared Memory Hooks`
+- `PROJECT_SKILL.md`
+  - `## Shared Memory Hooks`
+- native env
+  - `ASH_SHARED_MEMORY_SUMMARY`
+  - `ASH_SHARED_MEMORY_HINTS`
+  - `ASH_SHARED_MEMORY_SCOPES`
+- compatibility env
+  - `ASH_GLOBAL_MEMORY_SUMMARY`
+  - `ASH_GLOBAL_MEMORY_HINTS`
+
+这意味着项目在启动时不只知道“有全局记忆”，还知道自己绑定了哪些 `shared:<group>`，以及该去哪里读共享规则。
+
+### AI 全局候选提取开关
+
+默认开启：
+
+```text
+ASH_ENABLE_AI_GLOBAL_MEMORY_CANDIDATES=1
+```
+
+如果要退回到“只用本地规则提升，不采纳 AI 候选”的模式，可以设置：
+
+```text
+ASH_ENABLE_AI_GLOBAL_MEMORY_CANDIDATES=0
+```
 
 ## 路径约定
 

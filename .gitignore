@@ -20,6 +20,7 @@ var/*
 !var/db/.gitkeep
 var/db/*.sqlite3
 var/db/*.sqlite3-*
+var/db/SHARED_MEMORY.md
 !var/log/
 !var/log/.gitkeep
 !var/panes/
