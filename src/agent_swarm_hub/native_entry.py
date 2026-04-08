@@ -12,12 +12,13 @@ import os
 import sqlite3
 import subprocess
 import sys
-import time
+import re
 from hashlib import sha1
 from pathlib import Path
 
 from .paths import project_session_db_path, provider_command
 from .project_context import ProjectContextStore, project_ov_resource_uri
+from .runtime_health import codex_process_health, find_running_codex_session, terminate_process
 from .session_store import SessionStore, WorkspaceRecord
 from .openviking_support import read_openviking_overview
 
@@ -57,9 +58,13 @@ def latest_provider_session(
     context_store: ProjectContextStore | None = None,
 ) -> str | None:
     store = context_store or ProjectContextStore()
-    bound_session_id = store.get_provider_binding(project_id, provider)
+    current_sessions = store.get_current_project_sessions(project_id)
+    bound_session_id = current_sessions.get(provider)
     if bound_session_id and provider_session_exists(provider=provider, session_id=bound_session_id):
         return bound_session_id
+    stale_bound_session_id = store.get_provider_binding(project_id, provider)
+    if stale_bound_session_id and stale_bound_session_id != bound_session_id:
+        store.clear_provider_binding(project_id, provider)
 
     db_path = project_session_db_path()
     if not db_path.exists():
@@ -67,12 +72,17 @@ def latest_provider_session(
 
     def fetch_latest(conn: sqlite3.Connection, resolved_project_id: str) -> str | None:
         provider_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_sessions)").fetchall()}
-        status_order = "CASE WHEN status = 'active' THEN 0 ELSE 1 END, " if "status" in provider_columns else ""
+        if "status" in provider_columns:
+            status_filter = "AND COALESCE(status, 'active') != 'quarantined'"
+            status_order = "CASE WHEN status = 'active' THEN 0 WHEN status = 'archived' THEN 1 ELSE 2 END, "
+        else:
+            status_filter = ""
+            status_order = ""
         rows = conn.execute(
             f"""
             SELECT raw_session_id
             FROM provider_sessions
-            WHERE project_id = ? AND provider = ?
+            WHERE project_id = ? AND provider = ? {status_filter}
             ORDER BY {status_order} last_used_at DESC, raw_session_id DESC
             """,
             (resolved_project_id, provider),
@@ -146,38 +156,14 @@ def find_codex_session_file(session_id: str) -> Path | None:
     return matches[0] if matches else None
 
 
-def find_running_codex_session(*, session_id: str | None, work_dir: str | None) -> dict[str, str] | None:
-    if not session_id and not work_dir:
-        return None
-    try:
-        result = subprocess.run(
-            ["ps", "-ax", "-o", "pid=,command="],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    stdout = str(getattr(result, "stdout", "") or "")
-    if not stdout:
-        return None
-    session_marker = f"resume {session_id}" if session_id else ""
-    work_dir_marker = f"-C {work_dir}".strip() if work_dir else ""
-    for raw in stdout.splitlines():
-        line = raw.strip()
-        if not line or "codex-aarch64-apple-darwin" not in line:
-            continue
-        parts = line.split(maxsplit=1)
-        if len(parts) != 2:
-            continue
-        pid, command = parts
-        if session_marker and session_marker in command:
-            return {"pid": pid.strip(), "command": command}
-        if work_dir_marker and work_dir_marker in command:
-            return {"pid": pid.strip(), "command": command}
-    return None
+def _extract_codex_resume_session_id(command: str) -> str:
+    match = re.search(r"\bresume\s+([^\s]+)", command or "")
+    return match.group(1).strip() if match else ""
+
+
+def _extract_codex_work_dir(command: str) -> str:
+    match = re.search(r"\s-C\s+([^\s]+)", command or "")
+    return match.group(1).strip() if match else ""
 
 
 def read_codex_session_cwd(session_file: Path) -> str:
@@ -969,11 +955,81 @@ def run_local_native(
         if provider == "codex":
             running_session = find_running_codex_session(session_id=resume_session_id, work_dir=work_dir)
             if running_session is not None:
-                print(
-                    "[agent-swarm-hub] detected existing codex process; "
-                    f"skip duplicate launch (pid={running_session['pid']})"
+                health = codex_process_health(pid=running_session["pid"])
+                if resume_session_id and bool(health["unhealthy"]):
+                    context_store.record_runtime_health(
+                        workspace.workspace_id,
+                        provider,
+                        status="quarantined",
+                        summary=(
+                            f"Entry heartbeat quarantined unhealthy codex session {resume_session_id} "
+                            f"(pid={running_session['pid']} cpu={health['cpu_percent']:.1f} cpu_time_s={int(health['cpu_time_seconds'])}) "
+                            "and fell back to a fresh launch."
+                        ),
+                        details={
+                            "session_id": resume_session_id,
+                            "pid": running_session["pid"],
+                            "cpu_percent": health["cpu_percent"],
+                            "cpu_time_seconds": health["cpu_time_seconds"],
+                            "issue": "unhealthy",
+                            "quarantined": True,
+                            "entry_probe": True,
+                        },
+                    )
+                    print(
+                        "[agent-swarm-hub] heartbeat check: unhealthy existing codex process; "
+                        f"quarantine session `{resume_session_id}` and fall back to a fresh launch "
+                        f"(pid={running_session['pid']} cpu={health['cpu_percent']:.1f} "
+                        f"cpu_time_s={int(health['cpu_time_seconds'])})"
+                    )
+                    terminate_process(running_session["pid"])
+                    context_store.quarantine_provider_session(workspace.workspace_id, provider, resume_session_id)
+                    provider_sessions.pop(provider, None)
+                    env.pop("ASH_PROVIDER_SESSION_ID", None)
+                    env.pop("ASH_CODEX_SESSION_ID", None)
+                    resume_session_id = None
+                    session_mode = "fresh-project-context"
+                else:
+                    if resume_session_id:
+                        context_store.record_runtime_health(
+                            workspace.workspace_id,
+                            provider,
+                            status="healthy",
+                            summary=(
+                                f"Entry heartbeat confirmed bound codex session {resume_session_id} is healthy "
+                                f"(pid={running_session['pid']} cpu={health['cpu_percent']:.1f} cpu_time_s={int(health['cpu_time_seconds'])})."
+                            ),
+                            details={
+                                "session_id": resume_session_id,
+                                "pid": running_session["pid"],
+                                "cpu_percent": health["cpu_percent"],
+                                "cpu_time_seconds": health["cpu_time_seconds"],
+                                "issue": "healthy",
+                                "entry_probe": True,
+                            },
+                        )
+                    print(
+                        "[agent-swarm-hub] heartbeat check: healthy existing codex process; "
+                        f"skip duplicate launch (pid={running_session['pid']} cpu={health['cpu_percent']:.1f} "
+                        f"cpu_time_s={int(health['cpu_time_seconds'])})"
+                    )
+                    return 0
+            elif resume_session_id:
+                context_store.record_runtime_health(
+                    workspace.workspace_id,
+                    provider,
+                    status="resume-no-process",
+                    summary=f"Entry heartbeat found no running codex process for bound session {resume_session_id}; resume continues.",
+                    details={
+                        "session_id": resume_session_id,
+                        "issue": "resume-no-process",
+                        "entry_probe": True,
+                    },
                 )
-                return 0
+                print(
+                    "[agent-swarm-hub] heartbeat check: no running codex process detected for "
+                    f"bound session `{resume_session_id}`; continue with resume"
+                )
         if interactive:
             confirm_project_entry(provider=provider)
         inject_project_identity_env(

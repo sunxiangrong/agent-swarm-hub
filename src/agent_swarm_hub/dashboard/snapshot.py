@@ -39,6 +39,7 @@ def build_dashboard_snapshot(
         ov_brain_full = _read_project_brain(project["project_id"])
         ov_brain = _compact_text(ov_brain_full, 420)
         memory = project_store.get_project_memory(project["project_id"])
+        snapshot = project_store.build_memory_snapshot(project["workspace_path"])
         brief = project_store.derive_session_brief(
             focus=memory.get("focus", "") or project_store._summary_field(project["summary"], "Current focus:"),
             recent_context=memory.get("recent_context", "") or project_store._summary_state(project["summary"]),
@@ -110,8 +111,19 @@ def build_dashboard_snapshot(
                 "focus": brief["focus"],
                 "current_state": brief["current_state"],
                 "state": brief["current_state"],
+                "current_phase": snapshot.get("current_phase", ""),
+                "current_blocker": snapshot.get("current_blocker", ""),
+                "last_verified_result": snapshot.get("last_verified_result", ""),
                 "next_step": brief["next_step"],
                 "memory": brief["memory"],
+                "runtime_health_status": snapshot.get("runtime_health_status", ""),
+                "runtime_health_summary": snapshot.get("runtime_health_summary", ""),
+                "runtime_health_updated_at": snapshot.get("runtime_health_updated_at", ""),
+                "runtime_health_details": snapshot.get("runtime_health_details", {}),
+                "auto_continue_status": snapshot.get("auto_continue_status", ""),
+                "auto_continue_summary": snapshot.get("auto_continue_summary", ""),
+                "auto_continue_updated_at": snapshot.get("auto_continue_updated_at", ""),
+                "auto_continue_details": snapshot.get("auto_continue_details", {}),
                 "ov_resource_uri": ov_resource_uri,
                 "ov_brain": ov_brain,
                 "ov_brain_map": ov_brain_map,

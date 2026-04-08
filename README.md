@@ -1,6 +1,16 @@
 # agent-swarm-hub
 
-项目级 agent 入口层。
+本地、provider-agnostic 的项目级 agent runtime。
+
+这里的 `runtime` 和 `harness` 不冲突：
+
+- `runtime` 关注系统怎么运行
+- `harness` 关注系统怎么被组织、约束、恢复和观测
+
+对 `ash` 来说，更准确的理解是：
+
+- 它是一个本地 project-agent runtime
+- 同时也是一个 project-level harness
 
 它把这几件事统一起来：
 
@@ -11,7 +21,7 @@
 - 本地 swarm shell
 - Telegram / 飞书远程聊天入口
 
-目标不是再做一个聊天壳，而是让“进入项目”这件事本身就等于回到这个项目的工作上下文。
+目标不是再做一个聊天壳，而是让“进入项目”这件事本身就等于回到这个项目的工作上下文，并把不同 agent CLI、远程入口和 transport 都挂到同一个本地 runtime 下。
 
 ## 它解决什么问题
 
@@ -26,8 +36,8 @@
 
 它的定位应该理解成：
 
-- 一个共享项目 harness
-- 上面挂多个 agent CLI / provider
+- 一个共享项目 runtime
+- 上面挂多个 agent CLI / provider / 入口渠道
 - 而不是某一个智能体专用的壳
 
 这也是本仓库当前采用的 harness 思路：
@@ -40,8 +50,24 @@
 
 - `AGENTS.md`
 - `docs/ARCHITECTURE.md`
+- `docs/remote-tmux-bridge.md`
 
 ## 核心模型
+
+可以把 `ash` 理解成这几层：
+
+- `project identity`
+  项目是谁、路径在哪、当前要做什么
+- `memory orchestration`
+  项目记忆、共享记忆、全局记忆和导出视图
+- `session / runtime health`
+  provider 绑定、heartbeat、orphan detection、quarantine、repair/reset
+- `transport substrate`
+  默认通过 `ccb/askd` 等跨 agent transport 承载执行
+- `provider adapters`
+  `claude`、`codex` 以及以后别的 agent CLI
+- `entry surfaces`
+  terminal、dashboard、Telegram、飞书，以及以后别的入口
 
 每个项目至少有这些信息：
 
@@ -59,6 +85,34 @@
   这个项目下归档过的 provider 原生会话历史
 - `active / archived`
   原生会话生命周期状态
+
+## 受控远端 bridge
+
+`ash` 后续会复用 `tmux-bridge-mcp` 一类的 pane 原语，但第一阶段的目标不是做完整 MCP 平台，而是做：
+
+- 受控的 tmux + ssh pane bridge
+
+第一阶段只锁定：
+
+- `list / read / type / keys / name`
+- `ssh` shell pane 作为可交互 pane 类型
+- pane / path / command 三类边界
+
+设计入口见：
+
+- `docs/remote-tmux-bridge.md`
+
+实现策略：
+
+- `ash` 保留设计文档、边界策略和后续调用接口
+- 推荐把 `ash-workbench` 作为运行台项目名，用来承载 tmux workbench、ccb 会话、ssh pane、follow-up/monitor 的专用记忆与 skill
+- 当前薄接口包括：
+  - `project-sessions bridge-policy <project> --init`
+  - `project-sessions bridge-env <project>`
+  - `project-sessions bridge-status <project> --provider codex --exports`
+  - `project-sessions open-tmux <project> --provider codex`
+    - 可选 `--bridge-layout --ssh-target xinong --ssh-target ias`
+- tmux pane 原语和执行层优先外置到独立的 `tmux-bridge-mcp`
 
 关系是：
 
@@ -80,6 +134,12 @@
   - raw session ids
   - resume conventions
   - runtime-specific execution quirks
+
+这意味着：
+
+- `ash` 先定义项目、记忆和运行时健康
+- `ccb` 这类 transport 再负责跨 agent 的执行承载
+- `claude/codex/...` 只是执行面，不是系统主对象
 
 这意味着大多数 `ash` 内部改动都应该跨 agent CLI 复用，而不是只服务某一个智能体。
 
@@ -111,6 +171,8 @@ ash-chat claude
 - 进入某个项目后直接继续原生 Codex / Claude 工作
 - 在正确项目路径下恢复历史原生对话
 - 用项目摘要和项目记忆保持上下文连续
+- 进入项目时自动做 runtime heartbeat 检查，避免坏会话重复恢复
+- 让 runtime health phase 1 的半自动兜底默认生效
 
 进入流程：
 
@@ -121,6 +183,62 @@ ash-chat claude
 5. 优先恢复该项目当前绑定的原生会话
 6. 如果当前 provider 没有绑定会话，则在正确项目路径里启动 fresh native session
 7. 退出 native CLI 后回写项目记忆、刷新项目摘要，并在需要时归档旧会话
+
+### Runtime Health Phase 1
+
+当前 phase 1 已收口为半自动 runtime health：
+
+- 进入项目时自动 heartbeat
+- 健康旧会话跳过重复启动
+- 异常旧会话自动 quarantine 并 fresh-launch fallback
+- heartbeat 结果写回项目状态
+- dashboard / summary / exported memory 可见 runtime health
+- 显式运维入口保留：
+  - `project-sessions heartbeat [--apply]`
+  - `project-sessions reset-current [--quarantine]`
+
+这一层的目标是自动保活、自动避坑、自动收口状态，不是任务级全自动执行。
+
+### Minimal Auto Execution
+
+在 phase 1 之上，当前新增了一个最小自动执行器：
+
+- `project-sessions auto-continue <project>`
+  - `--explain` 可只展示当前自动推进计划，不执行
+- 远程/聊天入口：
+  - `/autostep [provider]`
+  - `/autostep [provider] [--explain]`
+
+它只做一次自动推进：
+
+- 读取项目当前 phase / next step / runtime health
+- 如果 runtime health 被阻塞则拒绝自动执行
+- 如果存在明确 next step，就自动推进一小步
+- 执行后立刻回写项目记忆、summary 和 dashboard 可见状态
+- `--explain` 或 `/autostep --explain` 也会把最近计划写回项目状态
+
+它的定位是单步 auto-continue，不是后台循环或完整 autonomous runtime。
+
+### Runtime Monitor Loop
+
+当前还新增了一个有界 runtime monitor：
+
+- `project-sessions monitor <project>`
+- `project-sessions monitor --all`
+
+可选能力：
+
+- 重复 heartbeat：
+  - `--cycles`
+  - `--interval`
+- 自动修复：
+  - `--apply`
+- heartbeat 驱动的单步续跑：
+  - `--auto-continue`
+- 以任务是否到达稳定停止条件为停止条件：
+  - `--until-complete`
+
+它的定位是“持续巡检 + 可选修复 + 每轮最多一次单步续跑”，可选地按“AI 结构化完成判断命中 completed / blocked / needs_confirmation，或没有进一步候选任务”为止提前停机，但仍不是无限后台 daemon。
 
 ### 2. 本地 swarm shell
 
@@ -152,6 +270,8 @@ ash-swarm claude
 - 监控执行状态
 - 让 Claude 汇报，让 Codex执行
 - 不在本地终端时继续管理项目
+
+这些入口不是独立系统，而是同一个 `ash runtime` 的不同表面。
 
 当前支持：
 
@@ -326,6 +446,9 @@ Telegram / Lark
   - `PROJECT_SKILL.md`
 - 共享数据库目录内：
   - `SHARED_MEMORY.md`
+- 仓库本地 skill：
+  - `skills/<skill-name>/SKILL.md`
+  - 仓库内是唯一维护来源；需要让 Codex 全局发现时，用 `scripts/install-local-skill.sh <skill-name>` 同步到 `~/.codex/skills/`
 
 ### 本地运行时库
 
@@ -572,7 +695,11 @@ ASH_PROXY_URL=http://127.0.0.1:6789
 
 - `ASH_EXECUTOR` 是默认 workspace 后端
 - workspace 级配置会覆盖全局默认值
-- `transport=ccb` 时优先走 `ask/askd + ccb`
+- 默认建议使用 `transport=auto`
+  - 优先走 `ask/askd + ccb`
+  - 不通时再回退 direct
+- `transport=ccb` 时强制偏向 bridge/askd 路径
+- 可以用 `ASH_PROJECT_DEFAULT_TRANSPORT` 覆盖新项目默认 transport
 
 ## 当前状态
 

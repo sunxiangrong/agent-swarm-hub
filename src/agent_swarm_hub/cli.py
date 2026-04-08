@@ -408,6 +408,135 @@ def _project_sessions_use(project_id: str, provider: str, session_id: str) -> in
     )
 
 
+def _project_sessions_reset_current(project_id: str, provider: str, *, quarantine: bool) -> int:
+    return cli_ops.project_sessions_reset_current(
+        project_id,
+        provider,
+        quarantine=quarantine,
+        sync_project_memory_artifacts_cb=_sync_project_memory_artifacts,
+    )
+
+
+def _project_sessions_auto_continue(project_id: str, *, provider: str | None, explain: bool) -> int:
+    return cli_ops.project_sessions_auto_continue_once(
+        project_id,
+        provider=provider,
+        explain=explain,
+        sync_project_memory_artifacts_cb=_sync_project_memory_artifacts,
+    )
+
+
+def _project_sessions_heartbeat(project_id: str | None, *, heartbeat_all: bool, apply: bool) -> int:
+    return cli_ops.project_sessions_heartbeat(project_id, heartbeat_all=heartbeat_all, apply=apply)
+
+
+def _project_sessions_monitor(
+    project_id: str | None,
+    *,
+    monitor_all: bool,
+    apply: bool,
+    auto_continue_enabled: bool,
+    until_complete: bool,
+    interval_seconds: float,
+    cycles: int,
+) -> int:
+    return cli_ops.project_sessions_monitor(
+        project_id,
+        monitor_all=monitor_all,
+        apply=apply,
+        auto_continue_enabled=auto_continue_enabled,
+        until_complete=until_complete,
+        interval_seconds=interval_seconds,
+        cycles=cycles,
+        sync_project_memory_artifacts_cb=_sync_project_memory_artifacts,
+    )
+
+
+def _project_sessions_followup_live(project_id: str, *, provider: str | None, prompt: str) -> int:
+    return cli_ops.project_sessions_followup_live(
+        project_id,
+        provider=provider,
+        prompt=prompt,
+    )
+
+
+def _project_sessions_bridge_policy(
+    project_id: str,
+    *,
+    init: bool,
+    force: bool,
+    set_ssh_targets: list[str] | None,
+) -> int:
+    return cli_ops.project_sessions_bridge_policy(
+        project_id,
+        init=init,
+        force=force,
+        set_ssh_targets=set_ssh_targets,
+    )
+
+
+def _project_sessions_bridge_env(project_id: str, *, init: bool) -> int:
+    return cli_ops.project_sessions_bridge_env(
+        project_id,
+        init=init,
+    )
+
+
+def _project_sessions_bridge_status(
+    project_id: str,
+    *,
+    provider: str | None,
+    init: bool,
+    exports: bool,
+) -> int:
+    return cli_ops.project_sessions_bridge_status(
+        project_id,
+        provider=provider,
+        init=init,
+        exports=exports,
+    )
+
+
+def _project_sessions_open_tmux_terminal(
+    project_id: str,
+    *,
+    provider: str | None,
+    bridge_layout: bool,
+    ssh_targets: list[str] | None,
+    manual_pane: bool,
+    secondary_agents: list[str] | None,
+) -> int:
+    return cli_ops.project_sessions_open_tmux_terminal(
+        project_id,
+        provider=provider,
+        bridge_layout=bridge_layout,
+        ssh_targets=ssh_targets,
+        manual_pane=manual_pane,
+        secondary_agents=secondary_agents,
+    )
+
+
+def _project_sessions_bridge_workbench(
+    project_id: str,
+    *,
+    provider: str | None,
+    ssh_targets: list[str] | None,
+    manual_pane: bool,
+    secondary_agents: list[str] | None,
+    init: bool,
+    exports: bool,
+) -> int:
+    return cli_ops.project_sessions_bridge_workbench(
+        project_id,
+        provider=provider,
+        ssh_targets=ssh_targets,
+        manual_pane=manual_pane,
+        secondary_agents=secondary_agents,
+        init=init,
+        exports=exports,
+    )
+
+
 def _sync_project_memory_artifacts(store: ProjectContextStore, project_id: str) -> None:
     cli_ops.sync_project_memory_artifacts(
         store,
@@ -772,8 +901,76 @@ def _handle_project_sessions_command(args) -> int | None:
         return _project_sessions_list(args.project, args.provider)
     if args.project_sessions_command == "use":
         return _project_sessions_use(args.project, args.provider.strip().lower(), args.session_id.strip())
+    if args.project_sessions_command == "reset-current":
+        return _project_sessions_reset_current(
+            args.project,
+            args.provider.strip().lower(),
+            quarantine=args.quarantine,
+        )
+    if args.project_sessions_command == "auto-continue":
+        return _project_sessions_auto_continue(
+            args.project,
+            provider=(args.provider.strip().lower() if args.provider else None),
+            explain=args.explain,
+        )
     if args.project_sessions_command == "sync-memory":
         return _project_sessions_sync_memory(args.project, sync_all=args.all)
+    if args.project_sessions_command == "heartbeat":
+        return _project_sessions_heartbeat(args.project, heartbeat_all=args.all, apply=args.apply)
+    if args.project_sessions_command == "monitor":
+        return _project_sessions_monitor(
+            args.project,
+            monitor_all=args.all,
+            apply=args.apply,
+            auto_continue_enabled=args.auto_continue,
+            until_complete=args.until_complete,
+            interval_seconds=args.interval,
+            cycles=args.cycles,
+        )
+    if args.project_sessions_command == "followup-live":
+        return _project_sessions_followup_live(
+            args.project,
+            provider=(args.provider.strip().lower() if args.provider else None),
+            prompt=" ".join(args.prompt).strip(),
+        )
+    if args.project_sessions_command == "bridge-policy":
+        return _project_sessions_bridge_policy(
+            args.project,
+            init=args.init,
+            force=args.force,
+            set_ssh_targets=list(args.set_ssh_target) if args.set_ssh_target is not None else None,
+        )
+    if args.project_sessions_command == "bridge-env":
+        return _project_sessions_bridge_env(
+            args.project,
+            init=args.init,
+        )
+    if args.project_sessions_command == "bridge-status":
+        return _project_sessions_bridge_status(
+            args.project,
+            provider=args.provider,
+            init=args.init,
+            exports=args.exports,
+        )
+    if args.project_sessions_command == "open-tmux":
+        return _project_sessions_open_tmux_terminal(
+            args.project,
+            provider=(args.provider.strip().lower() if args.provider else None),
+            bridge_layout=args.bridge_layout,
+            ssh_targets=list(args.ssh_target or []),
+            manual_pane=not args.no_manual,
+            secondary_agents=list(args.secondary_agent or []),
+        )
+    if args.project_sessions_command == "bridge-workbench":
+        return _project_sessions_bridge_workbench(
+            args.project,
+            provider=(args.provider.strip().lower() if args.provider else None),
+            ssh_targets=list(args.ssh_target or []),
+            manual_pane=not args.no_manual,
+            secondary_agents=list(args.secondary_agent or []),
+            init=args.init,
+            exports=args.exports,
+        )
     if args.project_sessions_command == "remove-project":
         return _project_sessions_remove_project(args.project)
     if args.project_sessions_command == "cleanup-runtime":
@@ -869,12 +1066,106 @@ def main() -> int:
     project_sessions_use.add_argument("project")
     project_sessions_use.add_argument("provider")
     project_sessions_use.add_argument("session_id")
+    project_sessions_reset = project_sessions_sub.add_parser(
+        "reset-current",
+        help="Clear the current bound session for a provider, optionally quarantining it",
+    )
+    project_sessions_reset.add_argument("project")
+    project_sessions_reset.add_argument("provider")
+    project_sessions_reset.add_argument(
+        "--quarantine",
+        action="store_true",
+        help="Quarantine the current bound session instead of only clearing the binding.",
+    )
+    project_sessions_auto_continue = project_sessions_sub.add_parser(
+        "auto-continue",
+        help="Run one automatic continuation step for a project from its current phase/next-step state",
+    )
+    project_sessions_auto_continue.add_argument("project")
+    project_sessions_auto_continue.add_argument("--provider", default=None)
+    project_sessions_auto_continue.add_argument(
+        "--explain",
+        action="store_true",
+        help="Explain the current auto-continue plan without executing it.",
+    )
     project_sessions_sync = project_sessions_sub.add_parser(
         "sync-memory",
         help="Rebuild structured project summary, PROJECT_MEMORY.md, and PROJECT_SKILL.md",
     )
     project_sessions_sync.add_argument("project", nargs="?")
     project_sessions_sync.add_argument("--all", action="store_true")
+    project_sessions_heartbeat = project_sessions_sub.add_parser(
+        "heartbeat",
+        help="Probe bound provider sessions for missing, unhealthy, or orphaned processes",
+    )
+    project_sessions_heartbeat.add_argument("project", nargs="?")
+    project_sessions_heartbeat.add_argument("--all", action="store_true")
+    project_sessions_heartbeat.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply heartbeat repairs such as clearing stale bindings or quarantining unhealthy sessions.",
+    )
+    project_sessions_monitor = project_sessions_sub.add_parser(
+        "monitor",
+        help="Run a bounded monitor loop with repeated heartbeat probes, optional repair, and optional auto-continue",
+    )
+    project_sessions_monitor.add_argument("project", nargs="?")
+    project_sessions_monitor.add_argument("--all", action="store_true")
+    project_sessions_monitor.add_argument("--apply", action="store_true")
+    project_sessions_monitor.add_argument("--auto-continue", action="store_true")
+    project_sessions_monitor.add_argument("--until-complete", action="store_true")
+    project_sessions_monitor.add_argument("--interval", type=float, default=30.0)
+    project_sessions_monitor.add_argument("--cycles", type=int, default=1)
+    project_sessions_followup = project_sessions_sub.add_parser(
+        "followup-live",
+        help="Inject one follow-up prompt into the currently live provider conversation for a project",
+    )
+    project_sessions_followup.add_argument("project")
+    project_sessions_followup.add_argument("prompt", nargs="+")
+    project_sessions_followup.add_argument("--provider", default=None)
+    project_sessions_bridge_policy = project_sessions_sub.add_parser(
+        "bridge-policy",
+        help="Show or initialize the thin project bridge policy used to drive tmux-bridge-mcp env boundaries",
+    )
+    project_sessions_bridge_policy.add_argument("project")
+    project_sessions_bridge_policy.add_argument("--init", action="store_true")
+    project_sessions_bridge_policy.add_argument("--force", action="store_true")
+    project_sessions_bridge_policy.add_argument("--set-ssh-target", action="append")
+    project_sessions_bridge_env = project_sessions_sub.add_parser(
+        "bridge-env",
+        help="Print tmux-bridge-mcp environment exports for a project's bridge policy",
+    )
+    project_sessions_bridge_env.add_argument("project")
+    project_sessions_bridge_env.add_argument("--init", action="store_true")
+    project_sessions_bridge_status = project_sessions_sub.add_parser(
+        "bridge-status",
+        help="Show the project's current tmux bridge workspace, pane labels, and bridge policy summary",
+    )
+    project_sessions_bridge_status.add_argument("project")
+    project_sessions_bridge_status.add_argument("--provider", default=None)
+    project_sessions_bridge_status.add_argument("--init", action="store_true")
+    project_sessions_bridge_status.add_argument("--exports", action="store_true")
+    project_sessions_open_tmux = project_sessions_sub.add_parser(
+        "open-tmux",
+        help="Open a new Terminal window attached to the project's tmux workspace",
+    )
+    project_sessions_open_tmux.add_argument("project")
+    project_sessions_open_tmux.add_argument("--provider", default=None)
+    project_sessions_open_tmux.add_argument("--bridge-layout", action="store_true")
+    project_sessions_open_tmux.add_argument("--ssh-target", action="append", default=[])
+    project_sessions_open_tmux.add_argument("--secondary-agent", action="append", default=[])
+    project_sessions_open_tmux.add_argument("--no-manual", action="store_true")
+    project_sessions_bridge_workbench = project_sessions_sub.add_parser(
+        "bridge-workbench",
+        help="Open the project's standard agent/manual/ssh tmux workbench and then print bridge status",
+    )
+    project_sessions_bridge_workbench.add_argument("project")
+    project_sessions_bridge_workbench.add_argument("--provider", default=None)
+    project_sessions_bridge_workbench.add_argument("--ssh-target", action="append", default=[])
+    project_sessions_bridge_workbench.add_argument("--secondary-agent", action="append", default=[])
+    project_sessions_bridge_workbench.add_argument("--no-manual", action="store_true")
+    project_sessions_bridge_workbench.add_argument("--init", action="store_true")
+    project_sessions_bridge_workbench.add_argument("--exports", action="store_true")
     project_sessions_remove = project_sessions_sub.add_parser(
         "remove-project",
         help="Remove a project/workspace and its stale runtime/session records",

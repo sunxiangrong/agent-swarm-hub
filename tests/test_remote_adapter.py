@@ -140,6 +140,20 @@ def test_parse_remote_command_supports_worker_and_tasks() -> None:
     assert tasks.name == "tasks"
 
 
+def test_parse_remote_command_supports_autostep() -> None:
+    command = parse_remote_command("/autostep codex")
+
+    assert command.name == "autostep"
+    assert command.argument == "codex"
+
+
+def test_parse_remote_command_supports_automonitor() -> None:
+    command = parse_remote_command("/automonitor --apply --auto-continue --cycles 2")
+
+    assert command.name == "automonitor"
+    assert command.argument == "--apply --auto-continue --cycles 2"
+
+
 def test_help_includes_command_explanations(tmp_path) -> None:
     adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(tmp_path / "sessions.sqlite3"))
 
@@ -155,6 +169,8 @@ def test_help_includes_command_explanations(tmp_path) -> None:
     assert "主路径:" in response.text
     assert "/use <workspace> 进入项目" in response.text
     assert "/quit 退出当前项目模式" in response.text
+    assert "/autostep [provider] [--explain]  自动推进当前项目的一小步" in response.text
+    assert "/automonitor [--apply] [--auto-continue] [--until-complete] [--cycles N] [--interval N]  运行当前项目范围的有界监控循环" in response.text
     assert "/worker  查看当前 worker phase" in response.text
     assert "/confirm  当 bridge 上浮确认请求时继续执行" in response.text
     assert "远程聊天默认按自然对话使用" in response.text
@@ -367,6 +383,283 @@ def test_plain_text_continues_existing_task(tmp_path) -> None:
 
     assert write_response.task_id == continue_response.task_id
     assert "Backend: echo" in continue_response.text
+
+
+def test_autostep_runs_single_increment_for_bound_project(tmp_path, monkeypatch) -> None:
+    session_db = tmp_path / "sessions.sqlite3"
+    project_db = tmp_path / "project-sessions.sqlite3"
+    workspace_dir = tmp_path / "sheep-gwas"
+    workspace_dir.mkdir()
+    _init_project_session_db(project_db, str(workspace_dir.resolve()))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(project_db))
+
+    from agent_swarm_hub.project_context import ProjectContextStore
+
+    project_store = ProjectContextStore(str(project_db))
+    project_store.upsert_project_memory(
+        "sheep-gwas",
+        focus="收口 auto-step",
+        recent_context="runtime health 已稳定，可以推进最小自动执行。",
+        memory="Single-step auto execution should advance once and stop.",
+        recent_hints=["Next: expose single-step auto-continue as a project command"],
+    )
+
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(session_db))
+    _bind_workspace(adapter, workspace_id="sheep-gwas")
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/autostep codex",
+        )
+    )
+
+    assert "Automation Result" in response.text
+    assert "Project: sheep-gwas" in response.text
+    assert "Provider: codex" in response.text
+    assert "Executed next step: Next: expose single-step auto-continue as a project command" in response.text
+    assert "Execution output:" in response.text
+    assert "Backend: echo" in response.text
+    assert response.task_id is not None
+
+
+def test_autostep_explain_renders_plan_without_execution(tmp_path, monkeypatch) -> None:
+    session_db = tmp_path / "sessions.sqlite3"
+    project_db = tmp_path / "project-sessions.sqlite3"
+    workspace_dir = tmp_path / "sheep-gwas"
+    workspace_dir.mkdir()
+    _init_project_session_db(project_db, str(workspace_dir.resolve()))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(project_db))
+
+    from agent_swarm_hub.project_context import ProjectContextStore
+
+    project_store = ProjectContextStore(str(project_db))
+    project_store.upsert_project_memory(
+        "sheep-gwas",
+        focus="收口 auto-step explain",
+        recent_context="runtime health 已稳定，可以先解释自动推进计划。",
+        memory="Single-step auto execution should support explain-only mode.",
+        recent_hints=["Next: expose auto-continue explain mode"],
+    )
+
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(session_db))
+    _bind_workspace(adapter, workspace_id="sheep-gwas")
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/autostep --explain codex",
+        )
+    )
+
+    assert "Automation Preview" in response.text
+    assert "Project: sheep-gwas" in response.text
+    assert "Provider: codex" in response.text
+    assert "Planned next step: Next: expose auto-continue explain mode" in response.text
+    assert "Explain only: no execution performed." in response.text
+    assert "Backend: echo" not in response.text
+
+
+def test_automonitor_runs_bounded_monitor_for_bound_project(tmp_path, monkeypatch) -> None:
+    session_db = tmp_path / "sessions.sqlite3"
+    project_db = tmp_path / "project-sessions.sqlite3"
+    workspace_dir = tmp_path / "sheep-gwas"
+    workspace_dir.mkdir()
+    _init_project_session_db(project_db, str(workspace_dir.resolve()))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(project_db))
+
+    captured: dict[str, object] = {}
+
+    def fake_monitor(
+        project_id: str | None,
+        *,
+        monitor_all: bool,
+        apply: bool,
+        auto_continue_enabled: bool,
+        until_complete: bool,
+        interval_seconds: float,
+        cycles: int,
+        sync_project_memory_artifacts_cb,
+    ) -> int:
+        captured.update(
+            {
+                "project_id": project_id,
+                "monitor_all": monitor_all,
+                "apply": apply,
+                "auto_continue_enabled": auto_continue_enabled,
+                "until_complete": until_complete,
+                "interval_seconds": interval_seconds,
+                "cycles": cycles,
+                "has_sync_cb": callable(sync_project_memory_artifacts_cb),
+            }
+        )
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli_ops.project_sessions_monitor", fake_monitor)
+
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(session_db))
+    _bind_workspace(adapter, workspace_id="sheep-gwas")
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/automonitor --apply --auto-continue --until-complete --cycles 2 --interval 5",
+        )
+    )
+
+    assert "Automation Monitor" in response.text
+    assert "Project: sheep-gwas" in response.text
+    assert "Scope: current project only" in response.text
+    assert "Apply repair: yes" in response.text
+    assert "Auto-continue: yes" in response.text
+    assert "Until complete: yes" in response.text
+    assert "Cycles: 2" in response.text
+    assert "Interval: 5s" in response.text
+    assert "Monitor exit code: 0" in response.text
+    assert captured == {
+        "project_id": "sheep-gwas",
+        "monitor_all": False,
+        "apply": True,
+        "auto_continue_enabled": True,
+        "until_complete": True,
+        "interval_seconds": 5.0,
+        "cycles": 2,
+        "has_sync_cb": True,
+    }
+
+
+def test_natural_language_monitor_without_interval_asks_for_timing(tmp_path, monkeypatch) -> None:
+    session_db = tmp_path / "sessions.sqlite3"
+    project_db = tmp_path / "project-sessions.sqlite3"
+    workspace_dir = tmp_path / "sheep-gwas"
+    workspace_dir.mkdir()
+    _init_project_session_db(project_db, str(workspace_dir.resolve()))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(project_db))
+
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(session_db))
+    _bind_workspace(adapter, workspace_id="sheep-gwas")
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="帮我隔一段时间看看当前任务情况",
+        )
+    )
+
+    assert response.text == "隔多久看一次？"
+
+
+def test_natural_language_monitor_with_interval_routes_to_project_scoped_monitor(tmp_path, monkeypatch) -> None:
+    session_db = tmp_path / "sessions.sqlite3"
+    project_db = tmp_path / "project-sessions.sqlite3"
+    workspace_dir = tmp_path / "sheep-gwas"
+    workspace_dir.mkdir()
+    _init_project_session_db(project_db, str(workspace_dir.resolve()))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(project_db))
+
+    captured: dict[str, object] = {}
+
+    def fake_monitor(
+        project_id: str | None,
+        *,
+        monitor_all: bool,
+        apply: bool,
+        auto_continue_enabled: bool,
+        until_complete: bool,
+        interval_seconds: float,
+        cycles: int,
+        sync_project_memory_artifacts_cb,
+    ) -> int:
+        captured.update(
+            {
+                "project_id": project_id,
+                "monitor_all": monitor_all,
+                "apply": apply,
+                "auto_continue_enabled": auto_continue_enabled,
+                "until_complete": until_complete,
+                "interval_seconds": interval_seconds,
+                "cycles": cycles,
+            }
+        )
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli_ops.project_sessions_monitor", fake_monitor)
+
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(session_db))
+    _bind_workspace(adapter, workspace_id="sheep-gwas")
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="帮我每10秒看看当前任务情况",
+        )
+    )
+
+    assert "Automation Monitor" in response.text
+    assert "Project: sheep-gwas" in response.text
+    assert "Scope: current project only" in response.text
+    assert "Interval: 10s" in response.text
+    assert captured == {
+        "project_id": "sheep-gwas",
+        "monitor_all": False,
+        "apply": False,
+        "auto_continue_enabled": False,
+        "until_complete": False,
+        "interval_seconds": 10.0,
+        "cycles": 6,
+    }
+
+
+def test_autostep_refuses_quarantined_runtime_health(tmp_path, monkeypatch) -> None:
+    session_db = tmp_path / "sessions.sqlite3"
+    project_db = tmp_path / "project-sessions.sqlite3"
+    workspace_dir = tmp_path / "sheep-gwas"
+    workspace_dir.mkdir()
+    _init_project_session_db(project_db, str(workspace_dir.resolve()))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(project_db))
+
+    from agent_swarm_hub.project_context import ProjectContextStore
+
+    project_store = ProjectContextStore(str(project_db))
+    project_store.upsert_project_memory(
+        "sheep-gwas",
+        focus="收口 auto-step",
+        recent_context="runtime health 当前阻塞。",
+        memory="Auto execution should pause when runtime health is quarantined.",
+        recent_hints=["Next: expose single-step auto-continue as a project command"],
+    )
+    project_store.record_runtime_health(
+        "sheep-gwas",
+        "codex",
+        status="quarantined",
+        summary="Bound codex session is quarantined and must not be auto-continued.",
+        details={"session_id": "codex-bad", "issue": "unhealthy"},
+    )
+
+    adapter = CCConnectAdapter(executor=EchoExecutor(), store=SessionStore(session_db))
+    _bind_workspace(adapter, workspace_id="sheep-gwas")
+
+    response = adapter.handle_message(
+        RemoteMessage(
+            platform=RemotePlatform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+            text="/autostep codex",
+        )
+    )
+
+    assert "Auto-continue blocked by runtime health for `sheep-gwas`: quarantined" in response.text
+    assert "must not be auto-continued" in response.text
 
 
 def test_bound_plain_text_without_active_task_starts_task(tmp_path) -> None:

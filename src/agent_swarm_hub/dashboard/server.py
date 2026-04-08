@@ -586,6 +586,9 @@ def _dashboard_html() -> str:
     function statusTone(value) {
       const status = String(value || '').toLowerCase();
       if (['executing', 'running', 'active'].includes(status)) return 'executing';
+      if (['healthy'].includes(status)) return 'active';
+      if (['resume-no-process'].includes(status)) return 'tracked';
+      if (['unhealthy', 'quarantined', 'orphan-running', 'missing-binding-process'].includes(status)) return 'blocked';
       if (['discussion', 'reviewing', 'tracked'].includes(status)) return status;
       if (['blocked', 'error', 'failed'].includes(status)) return 'blocked';
       if (['completed', 'merged'].includes(status)) return 'executing';
@@ -636,6 +639,9 @@ def _dashboard_html() -> str:
       const pinLabel = project.pinned ? 'Unpin' : 'Pin';
       const pinClass = project.pinned ? 'pin active' : 'pin';
       const tone = statusTone(project.status);
+      const runtimeHealthBadge = project.runtime_health_status
+        ? `<span class="status-badge" data-tone="${statusTone(project.runtime_health_status)}">${escapeHtml(project.runtime_health_status)}</span>`
+        : `<span class="status-badge" data-tone="idle">unknown</span>`;
       const currentSessions = project.current_sessions ? `<span>${escapeHtml(project.current_sessions)}</span>` : '<span>no current binding</span>';
       const tmuxPreview = project.tmux_preview ? escapeHtml(project.tmux_preview) : 'No tmux pane attached.';
       const updatedAt = project.updated_at ? `<div class="timestamp">updated ${escapeHtml(project.updated_at)}</div>` : '';
@@ -735,6 +741,10 @@ def _dashboard_html() -> str:
                 <div class="runtime-item">${escapeHtml(project.session_policy_text || 'No session policy available.')}</div>
                 <div class="runtime-item">Current Sessions: <span class="kv">${currentSessions}</span></div>
                 <div class="runtime-item">Phase: ${escapeHtml(project.live_phase || 'n/a')}</div>
+                <div class="runtime-item">Runtime Health: ${escapeHtml(project.runtime_health_status || 'unknown')}</div>
+                <div class="runtime-item">${escapeHtml(project.runtime_health_summary || 'No heartbeat status recorded yet.')}</div>
+                <div class="runtime-item">Auto-continue: ${escapeHtml(project.auto_continue_status || 'unknown')}</div>
+                <div class="runtime-item">${escapeHtml(project.auto_continue_summary || 'No auto-continue state recorded yet.')}</div>
               </div>
             </div>
             <div class="runtime">
@@ -788,6 +798,14 @@ def _dashboard_html() -> str:
             <div class="summary-item">
               <dt>Sessions</dt>
               <dd>${escapeHtml(project.session_overview_text || 'No session overview available.')}</dd>
+            </div>
+            <div class="summary-item">
+              <dt>Runtime Health</dt>
+              <dd>${runtimeHealthBadge}<div class="timestamp">${escapeHtml(project.runtime_health_summary || 'No heartbeat status recorded yet.')}</div></dd>
+            </div>
+            <div class="summary-item">
+              <dt>Auto-Continue</dt>
+              <dd><span class="status-badge" data-tone="${statusTone(project.auto_continue_status || 'unknown')}">${escapeHtml(project.auto_continue_status || 'unknown')}</span><div class="timestamp">${escapeHtml(project.auto_continue_summary || 'No auto-continue state recorded yet.')}</div></dd>
             </div>
             <div class="summary-item">
               <dt>OpenViking Path</dt>

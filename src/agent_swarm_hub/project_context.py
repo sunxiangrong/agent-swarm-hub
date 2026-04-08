@@ -22,6 +22,7 @@ _GLOBAL_MEMORY_FILE = "SHARED_MEMORY.md"
 _ALL_PROJECTS_SCOPE = "shared:all-projects"
 _BIOINFO_SCOPE = "shared:bioinfo"
 _KNOWLEDGE_SYSTEM_PROJECT = "knowledge-system"
+_WORKBENCH_PROJECT = "ash-workbench"
 
 
 def project_ov_resource_uri(project_id: str) -> str:
@@ -136,6 +137,26 @@ class ProjectContextStore:
                         scope TEXT NOT NULL,
                         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         PRIMARY KEY (project_id, scope)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS project_runtime_health (
+                        project_id TEXT NOT NULL,
+                        provider TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT '',
+                        summary TEXT NOT NULL DEFAULT '',
+                        details_json TEXT NOT NULL DEFAULT '{}',
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (project_id, provider)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS project_auto_continue_state (
+                        project_id TEXT NOT NULL,
+                        provider TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT '',
+                        summary TEXT NOT NULL DEFAULT '',
+                        details_json TEXT NOT NULL DEFAULT '{}',
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (project_id, provider)
                     );
                     """
                 )
@@ -326,8 +347,18 @@ class ProjectContextStore:
         ]
         if snapshot["focus"]:
             lines.append(f"Focus: {snapshot['focus']}")
+        if snapshot.get("current_phase"):
+            lines.append(f"Current Phase: {snapshot['current_phase']}")
         if snapshot["recent_context"]:
             lines.append(f"Current State: {snapshot['recent_context']}")
+        if snapshot.get("current_blocker"):
+            lines.append(f"Current Blocker: {snapshot['current_blocker']}")
+        if snapshot.get("last_verified_result"):
+            lines.append(f"Last Verified Result: {snapshot['last_verified_result']}")
+        if snapshot.get("runtime_health_summary"):
+            lines.append(f"Runtime Health: {snapshot['runtime_health_summary']}")
+        if snapshot.get("auto_continue_summary"):
+            lines.append(f"Auto-continue: {snapshot['auto_continue_summary']}")
         elif snapshot["memory"]:
             lines.append(f"Cache Summary: {snapshot['memory']}")
         if snapshot["recent_hints"]:
@@ -348,7 +379,17 @@ class ProjectContextStore:
         shared_scopes = self.resolve_project_memory_scopes(project.project_id)
         shared_snapshot = self.build_global_memory_snapshot(scopes=shared_scopes, include_global=False)
         combined_snapshot = self.build_global_memory_snapshot(scopes=shared_scopes, include_global=True)
+        runtime_health = self.get_runtime_health(project.project_id, "codex")
+        auto_continue_state = self.get_auto_continue_state(project.project_id, "codex")
         focus, recent_context, memory, recent_messages = self._project_memory_values(project, stored_memory)
+        daily_projection = self.derive_daily_projection(
+            project_id=project.project_id,
+            focus=focus,
+            current_state=recent_context,
+            memory=memory,
+            hints=recent_messages,
+            workspace_path=project.workspace_path or "",
+        )
         return {
             "project_id": project.project_id,
             "workspace": self._compact(project.workspace_path, _PROMPT_FIELD_LIMIT),
@@ -358,6 +399,19 @@ class ProjectContextStore:
             "recent_context": self._compact(recent_context, _PROMPT_FIELD_LIMIT) if recent_context else "",
             "memory": self._compact(memory, _PROMPT_FIELD_LIMIT) if memory else "",
             "recent_hints": recent_messages,
+            "current_phase": daily_projection["current_phase"],
+            "current_blocker": daily_projection["current_blocker"],
+            "last_verified_result": daily_projection["last_verified_result"],
+            "stable_memory_hint": daily_projection["stable_memory_hint"],
+            "daily_state_source": daily_projection["state_source"],
+            "runtime_health_status": str(runtime_health.get("status") or ""),
+            "runtime_health_summary": self._compact(str(runtime_health.get("summary") or ""), 220) if runtime_health.get("summary") else "",
+            "runtime_health_updated_at": str(runtime_health.get("updated_at") or ""),
+            "runtime_health_details": dict(runtime_health.get("details") or {}),
+            "auto_continue_status": str(auto_continue_state.get("status") or ""),
+            "auto_continue_summary": self._compact(str(auto_continue_state.get("summary") or ""), 220) if auto_continue_state.get("summary") else "",
+            "auto_continue_updated_at": str(auto_continue_state.get("updated_at") or ""),
+            "auto_continue_details": dict(auto_continue_state.get("details") or {}),
             "global_memory": combined_snapshot["summary"],
             "global_hints": combined_snapshot["hints"],
             "shared_memory": shared_snapshot["summary"],
@@ -624,6 +678,193 @@ class ProjectContextStore:
             "memory": memory_brief,
         }
 
+    @classmethod
+    def _daily_projection_is_low_signal(cls, text: str) -> bool:
+        lowered = " ".join((text or "").split()).strip().casefold()
+        if not lowered:
+            return True
+        return any(
+            marker in lowered
+            for marker in (
+                "user:",
+                "assistant:",
+                "project summary for this session",
+                "hi",
+                "hello",
+                "继续",
+                "好的",
+                "看看任务进度",
+                "查看链接恢复",
+            )
+        )
+
+    @classmethod
+    def _daily_projection_verified_result(cls, current_state: str, memory: str) -> str:
+        for raw in (current_state, memory):
+            value = cls._strip_memory_label(raw)
+            lowered = value.casefold()
+            if value and any(
+                marker in lowered
+                for marker in (
+                    "verified",
+                    "confirmed",
+                    "validated",
+                    "passed",
+                    "through",
+                    "done",
+                    "completed",
+                    "已完成",
+                    "已实现",
+                    "已通过",
+                    "已验证",
+                    "已确认",
+                    "已接入",
+                    "已加上",
+                    "已固定",
+                    "已锁定",
+                    "is now fixed",
+                    "now fixed",
+                )
+            ):
+                return cls._compact(value, 120)
+        return ""
+
+    @classmethod
+    def _daily_projection_clean_memory(cls, memory: str) -> str:
+        text = " ".join((memory or "").split()).strip()
+        for separator in (" | State:", "| State:", "| state:"):
+            if separator in text:
+                text = text.split(separator, 1)[0].strip()
+        return cls._strip_memory_label(text)
+
+    @classmethod
+    def _daily_projection_blocker(cls, current_state: str, next_step: str) -> str:
+        state = cls._strip_memory_label(current_state)
+        lowered_state = state.casefold()
+        if state and any(
+            marker in lowered_state
+            for marker in ("blocked", "blocker", "卡住", "阻塞", "等待", "missing", "尚未", "无法", "not found", "error", "failed")
+        ):
+            return cls._compact(state, 120)
+        step = cls._strip_memory_label(next_step)
+        lowered_step = step.casefold()
+        if step and any(marker in lowered_step for marker in ("需要先", "before", "依赖", "等待", "确认")):
+            return cls._compact(step, 120)
+        return ""
+
+    @classmethod
+    def _daily_projection_phase(cls, focus: str, current_state: str, next_step: str, blocker: str) -> str:
+        if blocker:
+            return "blocked"
+        merged = " ".join((focus, current_state, next_step)).casefold()
+        phase_hints = {
+            "implementation": ("implement", "hardening", "接入", "实现", "重构", "优化", "修复", "开发"),
+            "validation": ("verify", "validated", "validation", "测试", "验证", "回归", "检查", "确认"),
+            "consolidation": ("consolidating", "整理", "汇总", "归档", "梳理", "收口", "总结"),
+            "monitoring": ("monitor", "monitoring", "heartbeat", "巡检", "排查", "health"),
+            "design": ("design", "roadmap", "方案", "设计", "规划"),
+        }
+        for phase, markers in phase_hints.items():
+            if any(marker in merged for marker in markers):
+                return phase
+        return "active"
+
+    @classmethod
+    def derive_daily_projection(
+        cls,
+        *,
+        project_id: str,
+        focus: str,
+        current_state: str,
+        memory: str,
+        hints: list[str] | None,
+        workspace_path: str = "",
+    ) -> dict[str, str]:
+        brief = cls.derive_session_brief(
+            focus=focus,
+            recent_context=current_state,
+            memory=memory,
+            hints=hints or [],
+        )
+        normalized_focus = brief["focus"]
+        raw_state = " ".join((current_state or "").split()).strip()
+        cleaned_state = cls._strip_memory_label(raw_state)
+        next_step = cls._strip_memory_label(brief["next_step"])
+        normalized_hints = [
+            (str(item), cls._strip_memory_label(item))
+            for item in (hints or [])
+            if cls._strip_memory_label(item)
+        ]
+        if cls._daily_projection_is_low_signal(next_step):
+            next_step = ""
+        if cls._memory_values_match(next_step, normalized_focus) or cls._memory_values_match(next_step, cleaned_state):
+            next_step = ""
+        if next_step and any(
+            cls._memory_values_match(next_step, cleaned_hint) and cls._daily_projection_is_low_signal(raw_hint)
+            for raw_hint, cleaned_hint in normalized_hints
+        ):
+            next_step = ""
+        cleaned_memory = cls._daily_projection_clean_memory(memory)
+        blocker = cls._daily_projection_blocker(cleaned_state, next_step)
+        phase = cls._daily_projection_phase(normalized_focus, cleaned_state, next_step, blocker)
+        state_source = "empty"
+        if cleaned_state and not cls._daily_projection_is_low_signal(raw_state):
+            state_value = cls._compact(cleaned_state, 140)
+            state_source = "recent_context"
+        elif cleaned_memory and cls._daily_projection_verified_result("", cleaned_memory):
+            state_value = cls._compact(cleaned_memory, 140)
+            state_source = "memory"
+        elif next_step:
+            state_value = f"当前阶段正在收口下一步：{cls._compact(next_step, 100)}"
+            state_source = "next_step"
+        elif normalized_focus:
+            prefix_map = {
+                "validation": "当前处于核查阶段：",
+                "consolidation": "当前处于整理收口阶段：",
+                "monitoring": "当前处于巡检监控阶段：",
+                "implementation": "当前处于实现推进阶段：",
+                "design": "当前处于方案设计阶段：",
+            }
+            state_value = f"{prefix_map.get(phase, '当前围绕项目目标推进：')}{cls._compact(normalized_focus, 100)}"
+            state_source = "focus"
+        else:
+            state_value = ""
+        verified = cls._daily_projection_verified_result(cleaned_state, cleaned_memory)
+        stable_hint = ""
+        if cleaned_memory and not verified:
+            candidate_hint = cls._compact(cleaned_memory, 110)
+            if not cls._memory_values_match(candidate_hint, normalized_focus):
+                stable_hint = candidate_hint
+        return {
+            "project_id": project_id,
+            "workspace_path": workspace_path,
+            "focus": cls._compact(normalized_focus, 120),
+            "current_phase": phase,
+            "current_state": state_value or "暂无稳定阶段状态",
+            "current_blocker": blocker,
+            "next_step": cls._compact(next_step, 120) if next_step else "",
+            "last_verified_result": verified,
+            "stable_memory_hint": stable_hint,
+            "state_source": state_source,
+        }
+
+    def build_daily_projection(self, project_id: str) -> dict[str, str] | None:
+        project = self.get_project(project_id)
+        if project is None:
+            return None
+        stored_memory = self.get_project_memory(project_id)
+        focus, current_state, memory, recent_hints = self._project_memory_values(project, stored_memory)
+        if not any((focus, current_state, memory, recent_hints)):
+            return None
+        return self.derive_daily_projection(
+            project_id=project_id,
+            focus=focus,
+            current_state=current_state,
+            memory=memory,
+            hints=recent_hints,
+            workspace_path=project.workspace_path or "",
+        )
+
     def get_project_memory(self, project_id: str) -> dict[str, Any]:
         if not project_id or not self.db_path.exists():
             return {"focus": "", "current_state": "", "recent_context": "", "memory": "", "recent_hints": []}
@@ -667,6 +908,171 @@ class ProjectContextStore:
             return None
         return (row["raw_session_id"] or "").strip() or None
 
+    def get_runtime_health(self, project_id: str, provider: str | None = None) -> dict[str, Any] | dict[str, dict[str, Any]]:
+        if not project_id or not self.db_path.exists():
+            return {} if provider is None else {"project_id": project_id, "provider": provider or "", "status": "", "summary": "", "details": {}, "updated_at": ""}
+        query = """
+            SELECT project_id, provider, status, summary, details_json, updated_at
+            FROM project_runtime_health
+            WHERE project_id = ?
+        """
+        params: list[Any] = [project_id]
+        if provider:
+            query += " AND provider = ?"
+            params.append(provider)
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(query, params).fetchall()
+        except sqlite3.Error:
+            rows = []
+        payload: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            details: dict[str, Any] = {}
+            raw_details = str(row["details_json"] or "").strip()
+            if raw_details:
+                try:
+                    parsed = json.loads(raw_details)
+                    if isinstance(parsed, dict):
+                        details = parsed
+                except json.JSONDecodeError:
+                    details = {}
+            item = {
+                "project_id": str(row["project_id"] or "").strip(),
+                "provider": str(row["provider"] or "").strip(),
+                "status": str(row["status"] or "").strip(),
+                "summary": str(row["summary"] or "").strip(),
+                "details": details,
+                "updated_at": str(row["updated_at"] or "").strip(),
+            }
+            payload[item["provider"]] = item
+        if provider:
+            return payload.get(provider, {"project_id": project_id, "provider": provider, "status": "", "summary": "", "details": {}, "updated_at": ""})
+        return payload
+
+    def get_auto_continue_state(self, project_id: str, provider: str | None = None) -> dict[str, Any] | dict[str, dict[str, Any]]:
+        if not project_id or not self.db_path.exists():
+            return {} if provider is None else {"project_id": project_id, "provider": provider or "", "status": "", "summary": "", "details": {}, "updated_at": ""}
+        query = """
+            SELECT project_id, provider, status, summary, details_json, updated_at
+            FROM project_auto_continue_state
+            WHERE project_id = ?
+        """
+        params: list[Any] = [project_id]
+        if provider:
+            query += " AND provider = ?"
+            params.append(provider)
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(query, params).fetchall()
+        except sqlite3.Error:
+            rows = []
+        payload: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            details: dict[str, Any] = {}
+            raw_details = str(row["details_json"] or "").strip()
+            if raw_details:
+                try:
+                    parsed = json.loads(raw_details)
+                    if isinstance(parsed, dict):
+                        details = parsed
+                except json.JSONDecodeError:
+                    details = {}
+            item = {
+                "project_id": str(row["project_id"] or "").strip(),
+                "provider": str(row["provider"] or "").strip(),
+                "status": str(row["status"] or "").strip(),
+                "summary": str(row["summary"] or "").strip(),
+                "details": details,
+                "updated_at": str(row["updated_at"] or "").strip(),
+            }
+            payload[item["provider"]] = item
+        if provider:
+            return payload.get(provider, {"project_id": project_id, "provider": provider, "status": "", "summary": "", "details": {}, "updated_at": ""})
+        return payload
+
+    def record_runtime_health(
+        self,
+        project_id: str,
+        provider: str,
+        *,
+        status: str,
+        summary: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if not project_id or not provider:
+            return
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO project_runtime_health (project_id, provider, status, summary, details_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(project_id, provider) DO UPDATE SET
+                        status = excluded.status,
+                        summary = excluded.summary,
+                        details_json = excluded.details_json,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        project_id,
+                        provider,
+                        status.strip(),
+                        self._compact(summary, 220),
+                        json.dumps(details or {}, ensure_ascii=False),
+                    ),
+                )
+        except sqlite3.Error:
+            return
+
+    def record_auto_continue_state(
+        self,
+        project_id: str,
+        provider: str,
+        *,
+        status: str,
+        summary: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if not project_id or not provider:
+            return
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO project_auto_continue_state (project_id, provider, status, summary, details_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(project_id, provider) DO UPDATE SET
+                        status = excluded.status,
+                        summary = excluded.summary,
+                        details_json = excluded.details_json,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        project_id,
+                        provider,
+                        status.strip(),
+                        self._compact(summary, 220),
+                        json.dumps(details or {}, ensure_ascii=False),
+                    ),
+                )
+        except sqlite3.Error:
+            return
+
+    def clear_runtime_health(self, project_id: str, provider: str | None = None) -> None:
+        if not project_id:
+            return
+        try:
+            with self._connect() as conn:
+                if provider:
+                    conn.execute(
+                        "DELETE FROM project_runtime_health WHERE project_id = ? AND provider = ?",
+                        (project_id, provider),
+                    )
+                else:
+                    conn.execute("DELETE FROM project_runtime_health WHERE project_id = ?", (project_id,))
+        except sqlite3.Error:
+            return
+
     def set_provider_binding(self, project_id: str, provider: str, raw_session_id: str) -> None:
         if not project_id or not provider or not raw_session_id:
             return
@@ -686,6 +1092,48 @@ class ProjectContextStore:
             return
         self.archive_other_project_sessions(project_id, provider, raw_session_id)
 
+    def clear_provider_binding(self, project_id: str, provider: str) -> None:
+        if not project_id or not provider:
+            return
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM provider_bindings WHERE project_id = ? AND provider = ?",
+                    (project_id, provider),
+                )
+        except sqlite3.Error:
+            return
+
+    def quarantine_provider_session(self, project_id: str, provider: str, session_id: str) -> None:
+        if not project_id or not provider or not session_id:
+            return
+        try:
+            with self._connect() as conn:
+                tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                if "project_sessions" in tables:
+                    conn.execute(
+                        """
+                        UPDATE project_sessions
+                        SET status = 'quarantined', last_used_at = CURRENT_TIMESTAMP
+                        WHERE project_id = ? AND provider = ? AND session_id = ?
+                        """,
+                        (project_id, provider, session_id),
+                    )
+                if "provider_sessions" in tables:
+                    provider_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_sessions)").fetchall()}
+                    if "status" in provider_columns:
+                        conn.execute(
+                            """
+                            UPDATE provider_sessions
+                            SET status = 'quarantined', last_used_at = CURRENT_TIMESTAMP
+                            WHERE project_id = ? AND provider = ? AND raw_session_id = ?
+                            """,
+                            (project_id, provider, session_id),
+                        )
+        except sqlite3.Error:
+            return
+        self.clear_provider_binding(project_id, provider)
+
     def archive_other_project_sessions(self, project_id: str, provider: str, keep_session_id: str) -> None:
         if not project_id or not provider or not keep_session_id or not self.db_path.exists():
             return
@@ -697,7 +1145,10 @@ class ProjectContextStore:
                         """
                         UPDATE project_sessions
                         SET status = 'archived', last_used_at = CURRENT_TIMESTAMP
-                        WHERE project_id = ? AND provider = ? AND session_id != ? AND status != 'archived'
+                        WHERE project_id = ?
+                          AND provider = ?
+                          AND session_id != ?
+                          AND status NOT IN ('archived', 'quarantined')
                         """,
                         (project_id, provider, keep_session_id),
                     )
@@ -708,7 +1159,10 @@ class ProjectContextStore:
                             """
                             UPDATE provider_sessions
                             SET status = 'archived', last_used_at = CURRENT_TIMESTAMP
-                            WHERE project_id = ? AND provider = ? AND raw_session_id != ? AND status != 'archived'
+                            WHERE project_id = ?
+                              AND provider = ?
+                              AND raw_session_id != ?
+                              AND status NOT IN ('archived', 'quarantined')
                             """,
                             (project_id, provider, keep_session_id),
                         )
@@ -845,11 +1299,52 @@ class ProjectContextStore:
                 """,
                 (project_id,),
             ).fetchall()
-        return {
+            tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            quarantined: set[tuple[str, str]] = set()
+            if "project_sessions" in tables:
+                quarantined.update(
+                    (
+                        str(row["provider"]).strip(),
+                        str(row["session_id"]).strip(),
+                    )
+                    for row in conn.execute(
+                        """
+                        SELECT provider, session_id
+                        FROM project_sessions
+                        WHERE project_id = ? AND status = 'quarantined'
+                        """,
+                        (project_id,),
+                    ).fetchall()
+                )
+            if "provider_sessions" in tables:
+                provider_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_sessions)").fetchall()}
+                if "status" in provider_columns:
+                    quarantined.update(
+                        (
+                            str(row["provider"]).strip(),
+                            str(row["raw_session_id"]).strip(),
+                        )
+                        for row in conn.execute(
+                            """
+                            SELECT provider, raw_session_id
+                            FROM provider_sessions
+                            WHERE project_id = ? AND status = 'quarantined'
+                            """,
+                            (project_id,),
+                        ).fetchall()
+                    )
+        bindings = {
             str(row["provider"]).strip(): str(row["raw_session_id"]).strip()
             for row in rows
             if (row["provider"] or "").strip() and (row["raw_session_id"] or "").strip()
         }
+        filtered: dict[str, str] = {}
+        for provider, session_id in bindings.items():
+            if (provider, session_id) in quarantined:
+                self.clear_provider_binding(project_id, provider)
+                continue
+            filtered[provider] = session_id
+        return filtered
 
     def render_project_memory_markdown(self, project_id: str) -> str:
         project = self.get_project(project_id)
@@ -862,6 +1357,14 @@ class ProjectContextStore:
         bindings = self.get_current_project_sessions(project_id)
         sessions = self.list_project_sessions(project_id, include_archived=False)
         focus, current_state, memory, recent_hints = self._project_memory_values(project, stored_memory)
+        daily_projection = self.derive_daily_projection(
+            project_id=project_id,
+            focus=focus,
+            current_state=current_state,
+            memory=memory,
+            hints=recent_hints,
+            workspace_path=project.workspace_path or "",
+        )
         brief = self.derive_session_brief(
             focus=focus,
             recent_context=current_state,
@@ -904,10 +1407,22 @@ class ProjectContextStore:
                 "## Current State",
             ]
         )
-        if current_state:
-            lines.append(current_state)
+        if daily_projection["current_state"]:
+            lines.append(daily_projection["current_state"])
         else:
             lines.append("No current state recorded yet.")
+        lines.extend(
+            [
+                "",
+                "## Daily Projection",
+                f"- phase: {daily_projection['current_phase'] or 'active'}",
+                f"- blocker: {daily_projection['current_blocker'] or 'none'}",
+                f"- last_verified_result: {daily_projection['last_verified_result'] or 'none'}",
+                f"- stable_memory_hint: {daily_projection['stable_memory_hint'] or 'none'}",
+                f"- runtime_health: {self.build_memory_snapshot(project.workspace_path).get('runtime_health_summary') or 'none'}",
+                f"- auto_continue: {self.build_memory_snapshot(project.workspace_path).get('auto_continue_summary') or 'none'}",
+            ]
+        )
         lines.extend(
             [
                 "",
@@ -930,6 +1445,9 @@ class ProjectContextStore:
                 lines.append(f"- {item}")
         if not any(item for item in key_rules):
             lines.append("- No key rules recorded yet.")
+        workbench_memory_lines = self._workbench_memory_lines(project.project_id)
+        if workbench_memory_lines:
+            lines.extend(["", "## Workbench Runtime", *workbench_memory_lines])
         lines.extend(
             [
                 "",
@@ -995,6 +1513,15 @@ class ProjectContextStore:
         bindings = self.get_current_project_sessions(project_id)
         sessions = self.list_project_sessions(project_id, include_archived=False)
         focus, current_state, memory, recent_hints = self._project_memory_values(project, stored_memory)
+        daily_projection = self.derive_daily_projection(
+            project_id=project_id,
+            focus=focus,
+            current_state=current_state,
+            memory=memory,
+            hints=recent_hints,
+            workspace_path=project.workspace_path or "",
+        )
+        snapshot = self.build_memory_snapshot(project.workspace_path)
         brief = self.derive_session_brief(
             focus=focus,
             recent_context=current_state,
@@ -1007,10 +1534,20 @@ class ProjectContextStore:
         ]
         if brief["focus"]:
             lines.append(f"Current focus: {brief['focus']}")
-        if brief["current_state"]:
-            lines.append(f"Current state: {brief['current_state']}")
+        if daily_projection["current_phase"]:
+            lines.append(f"Current phase: {daily_projection['current_phase']}")
+        if daily_projection["current_state"]:
+            lines.append(f"Current state: {daily_projection['current_state']}")
+        if daily_projection["current_blocker"]:
+            lines.append(f"Current blocker: {daily_projection['current_blocker']}")
         if brief["next_step"]:
             lines.append(f"Next step: {brief['next_step']}")
+        if daily_projection["last_verified_result"]:
+            lines.append(f"Last verified result: {daily_projection['last_verified_result']}")
+        if snapshot.get("runtime_health_summary"):
+            lines.append(f"Runtime health: {snapshot['runtime_health_summary']}")
+        if snapshot.get("auto_continue_summary"):
+            lines.append(f"Auto-continue: {snapshot['auto_continue_summary']}")
         if brief["memory"]:
             lines.append(f"Cache summary: {brief['memory']}")
         if bindings:
@@ -1091,6 +1628,29 @@ class ProjectContextStore:
         lines.extend(
             [
                 "",
+                "## Automation Protocol",
+                "- Canonical repo skill: `skills/automation-runtime/SKILL.md`.",
+                "- Treat automation as a layered protocol: skill decides whether to trigger, adapter provides the chat entry, runtime commands execute, and runtime health gates unsafe paths.",
+                "- Use `/autostep [provider] [--explain]` for one bounded automatic increment inside the current project.",
+                "- Use `/automonitor [--apply] [--auto-continue] [--until-complete] [--cycles N] [--interval N]` for bounded monitor loops inside the current project.",
+                "- If the user asks to periodically check project/task status without giving timing, ask one short clarifying question first: `隔多久看一次？`",
+                "- Treat watch-only requests as monitor-first behavior without `--auto-continue`; only add `--apply --auto-continue` when the user explicitly wants the task to keep moving.",
+                "- Default heartbeat/monitor behavior should remain project-scoped; only use all-project sweeps when the task is explicit runtime maintenance across projects.",
+                "- Before starting automation, first derive one concrete next step for the current project; if the next step is still generic or ambiguous, explain it and ask for confirmation before execution.",
+                "- Use `project-sessions auto-continue <project> [--provider ...] [--explain]` when you need the same one-step automation from the CLI side.",
+                "- Use `project-sessions monitor <project> [--apply] [--auto-continue] [--until-complete] [--cycles N] [--interval N]` when you need repeated heartbeat probes and optional single-step continuation from the CLI side.",
+                "- Keep automation bounded: one `autostep` executes at most one meaningful increment, and one monitor cycle triggers at most one auto-continue per eligible project.",
+                "- `--until-complete` means stop early when heartbeat remains healthy but no further stable auto-continue candidate is available, or when structured completion checks return `completed`, `blocked`, or `needs_confirmation`.",
+                "- Stop automation when runtime health is blocked (`quarantined`, `unhealthy`, `orphan-running`, `missing-binding-process`) or when no stable next step is available.",
+                "- Prefer `--explain` first when the next step is unclear or when you need to validate the plan before execution.",
+            ]
+        )
+        workbench_skill_lines = self._workbench_skill_lines(project.project_id)
+        if workbench_skill_lines:
+            lines.extend(["", "## Workbench Protocol", *workbench_skill_lines])
+        lines.extend(
+            [
+                "",
                 "## Shared Memory Hooks",
             ]
         )
@@ -1118,6 +1678,28 @@ class ProjectContextStore:
             ]
         )
         return "\n".join(lines)
+
+    def _workbench_memory_lines(self, project_id: str) -> list[str]:
+        if project_id != _WORKBENCH_PROJECT:
+            return []
+        return [
+            "- This project is the runtime workbench for tmux, ccb, ssh panes, and follow-up orchestration.",
+            "- Track default pane layouts, preferred ssh targets, pane roles, and recent bridge/runtime outcomes here.",
+            "- Keep business-project conclusions out of this project; store only workbench defaults, runtime constraints, and operator-facing status.",
+            "- Default light layout: one agent pane plus one ssh pane; add `manual` or a second agent only when the task needs them.",
+            "- Treat pane state, bridge policy, and ccb/tmux coordination as the primary memory concerns for this project.",
+        ]
+
+    def _workbench_skill_lines(self, project_id: str) -> list[str]:
+        if project_id != _WORKBENCH_PROJECT:
+            return []
+        return [
+            "- Canonical repo skill: `skills/ash-workbench/SKILL.md`.",
+            "- Treat this project as the control plane for tmux workbenches, ccb-linked provider panes, and ssh panes.",
+            "- Default to the lightest viable layout: `agent + ssh`, then add `manual` or `secondary agent` only when the task benefits from them.",
+            "- Use the workbench project to manage pane roles, bridge policy, follow-up cadence, and runtime visibility, not to store domain conclusions from business projects.",
+            "- Prefer `bridge-workbench` as the user-facing workspace entry; keep `project-sessions ...` as the lower-level control surface.",
+        ]
 
     def sync_project_memory_file(self, project_id: str) -> Path | None:
         project = self.get_project(project_id)
@@ -1542,6 +2124,19 @@ class ProjectContextStore:
             "recent_context": "",
             "memory": "",
             "recent_hints": [],
+            "current_phase": "",
+            "current_blocker": "",
+            "last_verified_result": "",
+            "stable_memory_hint": "",
+            "daily_state_source": "",
+            "runtime_health_status": "",
+            "runtime_health_summary": "",
+            "runtime_health_updated_at": "",
+            "runtime_health_details": {},
+            "auto_continue_status": "",
+            "auto_continue_summary": "",
+            "auto_continue_updated_at": "",
+            "auto_continue_details": {},
             "global_memory": global_snapshot["summary"],
             "global_hints": global_snapshot["hints"],
             "shared_memory": "",

@@ -1,28 +1,25 @@
 ## agent-swarm-hub
-
-Repository map for human and agent contributors. Start here, then read only the
-next file that matches the task.
-
+Repository map for human and agent contributors. Start here, then read only the next file that matches the task.
 ### Core principle
-
 - Treat this repo as the source of truth for project/session/memory/runtime
   behavior.
+- Treat `ash` as the local runtime above providers, not as a thin shell around
+  one agent.
 - Prefer maps over manuals: this file stays short and points to the deeper
   source of truth.
 - Keep mechanical boundaries stable. If you change cross-module ownership,
   update `docs/ARCHITECTURE.md` and the architecture tests in `tests/`.
 
 ### Where to read first
-
 - Product and usage overview:
   - `README.md`
 - Architectural boundaries and harness model:
   - `docs/ARCHITECTURE.md`
+- Remote tmux + ssh bridge scope:
+  - `docs/remote-tmux-bridge.md`
 - Change history and implementation rationale:
   - `docs/开发日志.md`
-
 ### Main code ownership
-
 - `src/agent_swarm_hub/cli.py`
   - top-level command router and compatibility wrappers only
 - `src/agent_swarm_hub/workspace_ops.py`
@@ -33,11 +30,15 @@ next file that matches the task.
   - native provider launch, resume, env injection, postrun reconciliation
 - `src/agent_swarm_hub/cli_ops.py`
   - operational commands: OpenViking, project-sessions, runtime cleanup
+- `src/agent_swarm_hub/auto_continue.py`
+  - single-step automatic project continuation above runtime health
+- `src/agent_swarm_hub/runtime_monitor.py`
+  - bounded runtime monitor loop for repeated heartbeat, repair, and auto-continue
 - `src/agent_swarm_hub/project_context.py`
   - project memory, shared/global memory, exports, consolidation
-
+- `src/agent_swarm_hub/bridge_policy.py`
+  - thin project bridge policy files and tmux-bridge-mcp env export only
 ### Memory model
-
 - `project_memory`
   - project-local runtime memory
 - `shared:<group>`
@@ -48,14 +49,19 @@ next file that matches the task.
   - `PROJECT_MEMORY.md`
   - `PROJECT_SKILL.md`
   - `SHARED_MEMORY.md`
-
 ### Provider model
-
 - The shared project harness is provider-agnostic.
 - Provider-specific sessions are attached under the shared project layer.
 - Current built-in providers include `claude` and `codex`, but project
   identity, memory, shared scopes, and exported views must not depend on any
   single provider.
+- Terminal, dashboard, and remote chat are entry surfaces into the same local
+  runtime; they should not fork separate project/memory models.
+
+### Runtime health
+- Heartbeat, orphan detection, quarantine, and repair/reset are runtime-layer concerns.
+- If a feature changes provider-process health or recovery behavior, check
+  `native_entry.py`, `cli_ops.py`, and `runtime_health.py`.
 
 ### OpenViking
 

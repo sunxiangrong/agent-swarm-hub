@@ -767,3 +767,7 @@ class SessionStore:
     @staticmethod
     def dumps_json(data: object) -> str:
         return json.dumps(data, ensure_ascii=False)
+
+    @staticmethod
+    def loads_json(data: str) -> object:
+        return json.loads(data or "{}")

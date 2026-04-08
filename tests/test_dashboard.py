@@ -180,6 +180,8 @@ def test_dashboard_html_mentions_openviking_sections() -> None:
     assert "Resource Path:" in html
     assert "Open OV Memory" in html
     assert "brain-map" in html
+    assert "Runtime Health" in html
+    assert "Auto-Continue" in html
 
 
 def test_build_dashboard_snapshot_reads_project_brain(monkeypatch, tmp_path) -> None:
@@ -955,3 +957,93 @@ def test_focus_driver_pane_selects_tmux_pane(monkeypatch, tmp_path) -> None:
         ["tmux", "select-window", "-t", "ash:1"],
         ["tmux", "select-pane", "-t", "%2"],
     ]
+
+
+def test_build_dashboard_snapshot_includes_runtime_health(tmp_path) -> None:
+    project_db = tmp_path / "projects.sqlite3"
+    session_db = tmp_path / "runtime.sqlite3"
+    workspace_path = tmp_path / "agent-browser"
+    workspace_path.mkdir()
+
+    with sqlite3.connect(project_db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path, profile, summary) VALUES (?, ?, ?, '', '')",
+            ("agent-browser", "agent-browser", str(workspace_path)),
+        )
+
+    store = ProjectContextStore(str(project_db))
+    store.record_runtime_health(
+        "agent-browser",
+        "codex",
+        status="healthy",
+        summary="Codex session codex-current is healthy (pid=123 cpu=1.2 cpu_time_s=42).",
+        details={"session_id": "codex-current", "pid": "123", "issue": "healthy"},
+    )
+
+    payload = build_dashboard_snapshot(
+        project_store=store,
+        session_store=SessionStore(session_db),
+    )
+
+    project = payload["projects"][0]
+    assert project["runtime_health_status"] == "healthy"
+    assert "codex-current is healthy" in project["runtime_health_summary"]
+    assert project["runtime_health_details"]["session_id"] == "codex-current"
+
+
+def test_build_dashboard_snapshot_includes_auto_continue_state(tmp_path) -> None:
+    project_db = tmp_path / "projects.sqlite3"
+    session_db = tmp_path / "runtime.sqlite3"
+    workspace_path = tmp_path / "agent-browser"
+    workspace_path.mkdir()
+
+    with sqlite3.connect(project_db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path, profile, summary) VALUES (?, ?, ?, '', '')",
+            ("agent-browser", "agent-browser", str(workspace_path)),
+        )
+
+    store = ProjectContextStore(str(project_db))
+    store.record_auto_continue_state(
+        "agent-browser",
+        "codex",
+        status="planned",
+        summary="Auto-continue plan ready via codex: expose runtime health in dashboard.",
+        details={"next_step": "expose runtime health in dashboard"},
+    )
+
+    payload = build_dashboard_snapshot(
+        project_store=store,
+        session_store=SessionStore(session_db),
+    )
+
+    project = payload["projects"][0]
+    assert project["auto_continue_status"] == "planned"
+    assert "plan ready via codex" in project["auto_continue_summary"]
+    assert project["auto_continue_details"]["next_step"] == "expose runtime health in dashboard"

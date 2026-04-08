@@ -6,6 +6,8 @@ __pycache__/
 *.egg-info/
 .DS_Store
 .env.local
+.agents/
+.ash/
 .agent-swarm-hub.sqlite3
 .ccb/
 pane-logs/

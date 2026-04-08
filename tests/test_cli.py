@@ -4,7 +4,9 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+from agent_swarm_hub import cli_ops
 from agent_swarm_hub.cli import ash_chat_main, ash_swarm_main, main
+from agent_swarm_hub.adapter import CCConnectAdapter
 from agent_swarm_hub.paths import ccb_lib_dir, project_session_db_path, provider_command
 from agent_swarm_hub.session_store import SessionStore
 
@@ -76,6 +78,57 @@ def test_project_session_db_defaults_to_cli_root() -> None:
 def test_ccb_lib_dir_defaults_to_cli_root() -> None:
     expected = Path("/Users/sunxiangrong/dev/cli/Codex/claude_code_bridge/lib")
     assert ccb_lib_dir() == expected
+
+
+def test_shared_projects_as_workspaces_default_to_auto_transport(monkeypatch, tmp_path) -> None:
+    project_db = tmp_path / "project-sessions.sqlite3"
+    workspace = tmp_path / "demo"
+    projects_dir = tmp_path / "projects"
+    workspace.mkdir()
+    projects_dir.mkdir()
+    with sqlite3.connect(project_db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, '', ?)
+            """,
+            ("demo", "Demo", str(workspace), "Project: demo"),
+        )
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(project_db))
+    monkeypatch.setenv("ASH_EXECUTOR", "claude")
+    monkeypatch.setenv("ASH_EXECUTOR_TRANSPORT", "ccb")
+    monkeypatch.setattr("agent_swarm_hub.workspace_ops.projects_root", lambda: projects_dir)
+
+    workspaces = __import__("agent_swarm_hub.workspace_ops", fromlist=["shared_projects_as_workspaces"]).shared_projects_as_workspaces()
+
+    workspace_ids = {workspace.workspace_id for workspace in workspaces}
+
+    assert "demo" in workspace_ids
+    assert "ash-workbench" in workspace_ids
+    demo = next(workspace for workspace in workspaces if workspace.workspace_id == "demo")
+    workbench = next(workspace for workspace in workspaces if workspace.workspace_id == "ash-workbench")
+    assert demo.backend == "claude"
+    assert demo.transport == "ccb"
+    assert workbench.path == str(projects_dir / "ash-workbench")
+    assert (projects_dir / "ash-workbench").is_dir()
+
+
+def test_workspace_record_from_project_defaults_to_auto_transport() -> None:
+    workspace = CCConnectAdapter._workspace_record_from_project("demo")
+    assert workspace.transport == "auto"
 
 
 def test_ash_where_script_reports_project_identity(monkeypatch, tmp_path):
@@ -1554,7 +1607,118 @@ def test_cli_local_native_skips_duplicate_running_codex_resume(monkeypatch, tmp_
 
     assert exit_code == 0
     output = capsys.readouterr().out
-    assert "detected existing codex process; skip duplicate launch (pid=123)" in output
+    assert "heartbeat check: healthy existing codex process; skip duplicate launch" in output
+
+
+def test_cli_local_native_reports_entry_heartbeat_before_resume(monkeypatch, tmp_path, capsys) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "project-alpha"
+    workspace_path.mkdir()
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+
+    from agent_swarm_hub.session_store import SessionStore
+
+    store = SessionStore(db_path)
+    store.upsert_workspace(
+        workspace_id="project-alpha",
+        title="project-alpha",
+        path=str(workspace_path),
+        backend="codex",
+        transport="direct",
+    )
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "project-alpha",
+                "project-alpha",
+                str(workspace_path),
+                "Project alpha profile",
+                "Project: project-alpha\nCurrent focus: Resume with heartbeat",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, notes, source_path, cwd, last_used_at)
+            VALUES (?, ?, ?, 'active', '', '', ?, '2026-03-17T10:00:00+00:00')
+            """,
+            ("codex", "codex-session-123", "project-alpha", str(workspace_path)),
+        )
+        conn.execute(
+            "INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)",
+            ("project-alpha", "codex", "codex-session-123"),
+        )
+
+    _write_codex_session(fake_home, "codex-session-123", str(workspace_path))
+    captured = {}
+
+    def fake_run(argv, env=None, cwd=None, check=False, capture_output=False, text=False):
+        if argv == ["ps", "-ax", "-o", "pid=,command="]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        call = {
+            "command": argv[0],
+            "argv": argv,
+            "env": env or {},
+            "cwd": cwd,
+        }
+        captured.setdefault("calls", []).append(call)
+        if "command" not in captured:
+            captured["command"] = call["command"]
+            captured["argv"] = call["argv"]
+            captured["env"] = call["env"]
+            captured["cwd"] = call["cwd"]
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr("agent_swarm_hub.cli.read_openviking_overview", lambda *args, **kwargs: "OV project overview")
+    monkeypatch.setattr("agent_swarm_hub.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert "resume" in captured["argv"]
+    output = capsys.readouterr().out
+    assert "heartbeat check: no running codex process detected" in output
 
 
 def test_cli_project_summary_prompt_compacts_openviking_overview(monkeypatch, tmp_path) -> None:
@@ -2561,6 +2725,1956 @@ def test_cli_local_native_project_summary_prompt_avoids_repeating_last_hint(monk
     assert "- Current State: chrome会做的更好吗" in captured["argv"][-1]
     assert "- Next Step:" not in captured["argv"][-1]
     assert "- Cache Summary: Compare whether Chrome-native tooling would produce a more reliable browser workflow." in captured["argv"][-1]
+
+
+def test_cli_local_native_quarantines_unhealthy_existing_codex_session(monkeypatch, tmp_path, capsys) -> None:
+    db_path = tmp_path / "sessions.sqlite3"
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "project-alpha"
+    workspace_path.mkdir()
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+
+    from agent_swarm_hub.session_store import SessionStore
+
+    store = SessionStore(db_path)
+    store.upsert_workspace(
+        workspace_id="project-alpha",
+        title="project-alpha",
+        path=str(workspace_path),
+        backend="codex",
+        transport="direct",
+    )
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "project-alpha",
+                "project-alpha",
+                str(workspace_path),
+                "Project alpha profile",
+                "Project: project-alpha\nCurrent focus: Recover from bad codex session",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, notes, source_path, cwd, last_used_at)
+            VALUES (?, ?, ?, 'active', '', '', ?, '2026-03-17T10:00:00+00:00')
+            """,
+            ("codex", "codex-session-123", "project-alpha", str(workspace_path)),
+        )
+        conn.execute(
+            "INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)",
+            ("project-alpha", "codex", "codex-session-123"),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_sessions (project_id, provider, session_id, status, title, summary, cwd, source_path, last_used_at)
+            VALUES (?, ?, ?, 'active', 'Bad session', 'Bad session summary', ?, ?, '2026-03-17T10:00:00+00:00')
+            """,
+            ("project-alpha", "codex", "codex-session-123", str(workspace_path), str(workspace_path)),
+        )
+
+    _write_codex_session(fake_home, "codex-session-123", str(workspace_path))
+    captured = {}
+    kills: list[tuple[int, int]] = []
+
+    def fake_run(argv, env=None, cwd=None, check=False, capture_output=False, text=False):
+        if argv == ["ps", "-ax", "-o", "pid=,command="]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"123 /opt/homebrew/Caskroom/codex/0.116.0/codex-aarch64-apple-darwin --no-alt-screen -C {workspace_path} resume codex-session-123\n",
+                stderr="",
+            )
+        if argv == ["ps", "-p", "123", "-o", "%cpu="]:
+            return SimpleNamespace(returncode=0, stdout="99.9\n", stderr="")
+        if argv == ["ps", "-p", "123", "-o", "time="]:
+            return SimpleNamespace(returncode=0, stdout="28:50\n", stderr="")
+        call = {
+            "command": argv[0],
+            "argv": argv,
+            "env": env or {},
+            "cwd": cwd,
+        }
+        captured.setdefault("calls", []).append(call)
+        if "command" not in captured:
+            captured["command"] = call["command"]
+            captured["argv"] = call["argv"]
+            captured["env"] = call["env"]
+            captured["cwd"] = call["cwd"]
+        _write_codex_session(fake_home, "codex-session-new", str(workspace_path))
+        _write_codex_history(fake_home, "codex-session-new", "继续项目")
+        return SimpleNamespace(returncode=0)
+
+    def fake_kill(pid, sig):
+        kills.append((pid, sig))
+        if sig == 0:
+            raise OSError("process exited")
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(db_path))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr("agent_swarm_hub.cli.read_openviking_overview", lambda *args, **kwargs: "OV project overview")
+    monkeypatch.setattr("agent_swarm_hub.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_swarm_hub.runtime_health.os.kill", fake_kill)
+    monkeypatch.setattr("agent_swarm_hub.runtime_health.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "local-native", "--provider", "codex", "--project", "project-alpha"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert captured["argv"][:4] == [provider_command("codex"), "--no-alt-screen", "-C", str(workspace_path)]
+    assert "resume" not in captured["argv"]
+    output = capsys.readouterr().out
+    assert "heartbeat check: unhealthy existing codex process" in output
+    assert kills and kills[0][0] == 123
+    with sqlite3.connect(shared_db_path) as conn:
+        binding = conn.execute(
+            "SELECT raw_session_id FROM provider_bindings WHERE project_id = ? AND provider = ?",
+            ("project-alpha", "codex"),
+        ).fetchone()
+        session_status = conn.execute(
+            "SELECT status FROM project_sessions WHERE project_id = ? AND provider = ? AND session_id = ?",
+            ("project-alpha", "codex", "codex-session-123"),
+        ).fetchone()[0]
+        provider_status = conn.execute(
+            "SELECT status FROM provider_sessions WHERE project_id = ? AND provider = ? AND raw_session_id = ?",
+            ("project-alpha", "codex", "codex-session-123"),
+        ).fetchone()[0]
+    assert binding == ("codex-session-new",)
+    assert session_status == "quarantined"
+    assert provider_status == "quarantined"
+
+
+def test_latest_provider_session_skips_quarantined_binding(tmp_path) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "project-alpha"
+    workspace_path.mkdir()
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)",
+            ("project-alpha", "project-alpha", str(workspace_path)),
+        )
+        conn.execute(
+            "INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, cwd) VALUES (?, ?, ?, ?, ?)",
+            ("codex", "codex-bad", "project-alpha", "quarantined", str(workspace_path)),
+        )
+        conn.execute(
+            "INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)",
+            ("project-alpha", "codex", "codex-bad"),
+        )
+
+    _write_codex_session(fake_home, "codex-bad", str(workspace_path))
+
+    from agent_swarm_hub.native_entry import latest_provider_session
+    from agent_swarm_hub.project_context import ProjectContextStore
+
+    store = ProjectContextStore(str(shared_db_path))
+    session_id = latest_provider_session(
+        project_id="project-alpha",
+        provider="codex",
+        workspace_path=str(workspace_path),
+        context_store=store,
+    )
+
+    assert session_id is None
+    with sqlite3.connect(shared_db_path) as conn:
+        binding = conn.execute(
+            "SELECT raw_session_id FROM provider_bindings WHERE project_id = ? AND provider = ?",
+            ("project-alpha", "codex"),
+        ).fetchone()
+    assert binding is None
+
+
+def test_cli_project_sessions_heartbeat_apply_quarantines_unhealthy_codex_binding(monkeypatch, tmp_path, capsys) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "project-alpha"
+    workspace_path.mkdir()
+    kills: list[tuple[int, int]] = []
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)",
+            ("project-alpha", "project-alpha", str(workspace_path)),
+        )
+        conn.execute(
+            "INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, cwd) VALUES (?, ?, ?, ?, ?)",
+            ("codex", "codex-bad", "project-alpha", "active", str(workspace_path)),
+        )
+        conn.execute(
+            "INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)",
+            ("project-alpha", "codex", "codex-bad"),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_sessions (project_id, provider, session_id, status, title, summary, cwd, source_path)
+            VALUES (?, ?, ?, 'active', 'Bad session', 'Bad session summary', ?, ?)
+            """,
+            ("project-alpha", "codex", "codex-bad", str(workspace_path), str(workspace_path)),
+        )
+
+    def fake_run(argv, env=None, cwd=None, check=False, capture_output=False, text=False):
+        if argv == ["ps", "-ax", "-o", "pid=,command="]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"123 /opt/homebrew/Caskroom/codex/0.116.0/codex-aarch64-apple-darwin --no-alt-screen -C {workspace_path} resume codex-bad\n",
+                stderr="",
+            )
+        if argv == ["ps", "-p", "123", "-o", "%cpu="]:
+            return SimpleNamespace(returncode=0, stdout="99.9\n", stderr="")
+        if argv == ["ps", "-p", "123", "-o", "time="]:
+            return SimpleNamespace(returncode=0, stdout="28:50\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_kill(pid, sig):
+        kills.append((pid, sig))
+        if sig == 0:
+            raise OSError("process exited")
+
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr("agent_swarm_hub.runtime_health.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_swarm_hub.runtime_health.os.kill", fake_kill)
+    monkeypatch.setattr("agent_swarm_hub.runtime_health.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "heartbeat", "project-alpha", "--apply"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "status=unhealthy" in output
+    assert "actions: 1" in output
+    assert kills and kills[0][0] == 123
+    with sqlite3.connect(shared_db_path) as conn:
+        binding = conn.execute(
+            "SELECT raw_session_id FROM provider_bindings WHERE project_id = ? AND provider = ?",
+            ("project-alpha", "codex"),
+        ).fetchone()
+        session_status = conn.execute(
+            "SELECT status FROM project_sessions WHERE project_id = ? AND provider = ? AND session_id = ?",
+            ("project-alpha", "codex", "codex-bad"),
+        ).fetchone()[0]
+        provider_status = conn.execute(
+            "SELECT status FROM provider_sessions WHERE project_id = ? AND provider = ? AND raw_session_id = ?",
+            ("project-alpha", "codex", "codex-bad"),
+        ).fetchone()[0]
+    assert binding is None
+    assert session_status == "quarantined"
+    assert provider_status == "quarantined"
+
+
+def test_cli_project_sessions_heartbeat_apply_clears_missing_codex_binding(monkeypatch, tmp_path, capsys) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "project-alpha"
+    workspace_path.mkdir()
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)",
+            ("project-alpha", "project-alpha", str(workspace_path)),
+        )
+        conn.execute(
+            "INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, cwd) VALUES (?, ?, ?, ?, ?)",
+            ("codex", "codex-missing", "project-alpha", "active", str(workspace_path)),
+        )
+        conn.execute(
+            "INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)",
+            ("project-alpha", "codex", "codex-missing"),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_sessions (project_id, provider, session_id, status, title, summary, cwd, source_path)
+            VALUES (?, ?, ?, 'active', 'Missing session', 'Missing session summary', ?, ?)
+            """,
+            ("project-alpha", "codex", "codex-missing", str(workspace_path), str(workspace_path)),
+        )
+
+    def fake_run(argv, env=None, cwd=None, check=False, capture_output=False, text=False):
+        if argv == ["ps", "-ax", "-o", "pid=,command="]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr("agent_swarm_hub.runtime_health.subprocess.run", fake_run)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "heartbeat", "project-alpha", "--apply"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "status=missing-binding-process" in output
+    assert "actions: 1" in output
+    with sqlite3.connect(shared_db_path) as conn:
+        binding = conn.execute(
+            "SELECT raw_session_id FROM provider_bindings WHERE project_id = ? AND provider = ?",
+            ("project-alpha", "codex"),
+        ).fetchone()
+        session_status = conn.execute(
+            "SELECT status FROM project_sessions WHERE project_id = ? AND provider = ? AND session_id = ?",
+            ("project-alpha", "codex", "codex-missing"),
+        ).fetchone()[0]
+    assert binding is None
+    assert session_status == "active"
+
+
+def test_cli_project_sessions_heartbeat_labels_known_unbound_sessions_as_detached(monkeypatch, tmp_path, capsys) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_alpha = tmp_path / "project-alpha"
+    workspace_beta = tmp_path / "project-beta"
+    workspace_alpha.mkdir()
+    workspace_beta.mkdir()
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)",
+            ("project-alpha", "project-alpha", str(workspace_alpha)),
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)",
+            ("project-beta", "project-beta", str(workspace_beta)),
+        )
+        conn.execute(
+            "INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, cwd) VALUES (?, ?, ?, ?, ?)",
+            ("codex", "codex-alpha", "project-alpha", "active", str(workspace_alpha)),
+        )
+        conn.execute(
+            "INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, cwd) VALUES (?, ?, ?, ?, ?)",
+            ("codex", "codex-beta", "project-beta", "active", str(workspace_beta)),
+        )
+        conn.execute(
+            "INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)",
+            ("project-alpha", "codex", "codex-alpha"),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_sessions (project_id, provider, session_id, status, title, summary, cwd, source_path)
+            VALUES (?, ?, ?, 'active', 'Alpha session', 'Alpha session summary', ?, ?)
+            """,
+            ("project-alpha", "codex", "codex-alpha", str(workspace_alpha), str(workspace_alpha)),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_sessions (project_id, provider, session_id, status, title, summary, cwd, source_path)
+            VALUES (?, ?, ?, 'active', 'Beta session', 'Beta session summary', ?, ?)
+            """,
+            ("project-beta", "codex", "codex-beta", str(workspace_beta), str(workspace_beta)),
+        )
+
+    def fake_run(argv, env=None, cwd=None, check=False, capture_output=False, text=False):
+        if argv == ["ps", "-ax", "-o", "pid=,command="]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"123 /opt/homebrew/Caskroom/codex/0.116.0/codex-aarch64-apple-darwin --no-alt-screen -C {workspace_alpha} resume codex-alpha\n"
+                    f"456 /opt/homebrew/Caskroom/codex/0.116.0/codex-aarch64-apple-darwin --no-alt-screen -C {workspace_beta} resume codex-beta\n"
+                ),
+                stderr="",
+            )
+        if argv == ["ps", "-p", "123", "-o", "%cpu="]:
+            return SimpleNamespace(returncode=0, stdout="2.1\n", stderr="")
+        if argv == ["ps", "-p", "123", "-o", "time="]:
+            return SimpleNamespace(returncode=0, stdout="00:15\n", stderr="")
+        if argv == ["ps", "-p", "456", "-o", "%cpu="]:
+            return SimpleNamespace(returncode=0, stdout="1.4\n", stderr="")
+        if argv == ["ps", "-p", "456", "-o", "time="]:
+            return SimpleNamespace(returncode=0, stdout="00:20\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr("agent_swarm_hub.runtime_health.subprocess.run", fake_run)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "heartbeat", "project-alpha"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "project=project-beta provider=codex status=detached-running" not in output
+    assert "No provider heartbeat issues detected." in output
+
+
+def test_cli_project_sessions_heartbeat_all_reports_detached_sessions(monkeypatch, tmp_path, capsys) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_alpha = tmp_path / "project-alpha"
+    workspace_beta = tmp_path / "project-beta"
+    workspace_alpha.mkdir()
+    workspace_beta.mkdir()
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)",
+            ("project-alpha", "project-alpha", str(workspace_alpha)),
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)",
+            ("project-beta", "project-beta", str(workspace_beta)),
+        )
+        conn.execute(
+            "INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, cwd) VALUES (?, ?, ?, ?, ?)",
+            ("codex", "codex-alpha", "project-alpha", "active", str(workspace_alpha)),
+        )
+        conn.execute(
+            "INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, cwd) VALUES (?, ?, ?, ?, ?)",
+            ("codex", "codex-beta", "project-beta", "active", str(workspace_beta)),
+        )
+        conn.execute(
+            "INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)",
+            ("project-alpha", "codex", "codex-alpha"),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_sessions (project_id, provider, session_id, status, title, summary, cwd, source_path)
+            VALUES (?, ?, ?, 'active', 'Alpha session', 'Alpha session summary', ?, ?)
+            """,
+            ("project-alpha", "codex", "codex-alpha", str(workspace_alpha), str(workspace_alpha)),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_sessions (project_id, provider, session_id, status, title, summary, cwd, source_path)
+            VALUES (?, ?, ?, 'active', 'Beta session', 'Beta session summary', ?, ?)
+            """,
+            ("project-beta", "codex", "codex-beta", str(workspace_beta), str(workspace_beta)),
+        )
+
+    def fake_run(argv, env=None, cwd=None, check=False, capture_output=False, text=False):
+        if argv == ["ps", "-ax", "-o", "pid=,command="]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"123 /opt/homebrew/Caskroom/codex/0.116.0/codex-aarch64-apple-darwin --no-alt-screen -C {workspace_alpha} resume codex-alpha\n"
+                    f"456 /opt/homebrew/Caskroom/codex/0.116.0/codex-aarch64-apple-darwin --no-alt-screen -C {workspace_beta} resume codex-beta\n"
+                ),
+                stderr="",
+            )
+        if argv == ["ps", "-p", "123", "-o", "%cpu="]:
+            return SimpleNamespace(returncode=0, stdout="2.1\n", stderr="")
+        if argv == ["ps", "-p", "123", "-o", "time="]:
+            return SimpleNamespace(returncode=0, stdout="00:15\n", stderr="")
+        if argv == ["ps", "-p", "456", "-o", "%cpu="]:
+            return SimpleNamespace(returncode=0, stdout="1.4\n", stderr="")
+        if argv == ["ps", "-p", "456", "-o", "time="]:
+            return SimpleNamespace(returncode=0, stdout="00:20\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr("agent_swarm_hub.runtime_health.subprocess.run", fake_run)
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "heartbeat", "--all"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "project=project-beta provider=codex status=detached-running" in output
+    assert "No provider heartbeat issues detected." in output
+
+
+def test_cli_project_sessions_reset_current_clears_binding(monkeypatch, tmp_path, capsys) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "project-alpha"
+    workspace_path.mkdir()
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)",
+            ("project-alpha", "project-alpha", str(workspace_path)),
+        )
+        conn.execute(
+            "INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)",
+            ("project-alpha", "codex", "codex-current"),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_sessions (project_id, provider, session_id, status, title, summary, cwd, source_path)
+            VALUES (?, ?, ?, 'active', 'Current session', 'Current session summary', ?, ?)
+            """,
+            ("project-alpha", "codex", "codex-current", str(workspace_path), str(workspace_path)),
+        )
+
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "reset-current", "project-alpha", "codex"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Cleared current codex binding" in output
+    with sqlite3.connect(shared_db_path) as conn:
+        binding = conn.execute(
+            "SELECT raw_session_id FROM provider_bindings WHERE project_id = ? AND provider = ?",
+            ("project-alpha", "codex"),
+        ).fetchone()
+        session_status = conn.execute(
+            "SELECT status FROM project_sessions WHERE project_id = ? AND provider = ? AND session_id = ?",
+            ("project-alpha", "codex", "codex-current"),
+        ).fetchone()[0]
+    assert binding is None
+    assert session_status == "active"
+
+
+def test_cli_project_sessions_reset_current_quarantines_binding(monkeypatch, tmp_path, capsys) -> None:
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "project-alpha"
+    workspace_path.mkdir()
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE provider_bindings (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_id, provider)
+            );
+            CREATE TABLE provider_sessions (
+                provider TEXT NOT NULL,
+                raw_session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, raw_session_id)
+            );
+            CREATE TABLE project_sessions (
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, session_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO projects (project_id, title, workspace_path) VALUES (?, ?, ?)",
+            ("project-alpha", "project-alpha", str(workspace_path)),
+        )
+        conn.execute(
+            "INSERT INTO provider_bindings (project_id, provider, raw_session_id) VALUES (?, ?, ?)",
+            ("project-alpha", "codex", "codex-current"),
+        )
+        conn.execute(
+            "INSERT INTO provider_sessions (provider, raw_session_id, project_id, status, cwd) VALUES (?, ?, ?, ?, ?)",
+            ("codex", "codex-current", "project-alpha", "active", str(workspace_path)),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_sessions (project_id, provider, session_id, status, title, summary, cwd, source_path)
+            VALUES (?, ?, ?, 'active', 'Current session', 'Current session summary', ?, ?)
+            """,
+            ("project-alpha", "codex", "codex-current", str(workspace_path), str(workspace_path)),
+        )
+
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr("sys.argv", ["agent-swarm-hub", "project-sessions", "reset-current", "project-alpha", "codex", "--quarantine"])
+
+    exit_code = main()
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Quarantined current codex session" in output
+    with sqlite3.connect(shared_db_path) as conn:
+        binding = conn.execute(
+            "SELECT raw_session_id FROM provider_bindings WHERE project_id = ? AND provider = ?",
+            ("project-alpha", "codex"),
+        ).fetchone()
+        session_status = conn.execute(
+            "SELECT status FROM project_sessions WHERE project_id = ? AND provider = ? AND session_id = ?",
+            ("project-alpha", "codex", "codex-current"),
+        ).fetchone()[0]
+        provider_status = conn.execute(
+            "SELECT status FROM provider_sessions WHERE project_id = ? AND provider = ? AND raw_session_id = ?",
+            ("project-alpha", "codex", "codex-current"),
+        ).fetchone()[0]
+    assert binding is None
+    assert session_status == "quarantined"
+    assert provider_status == "quarantined"
+
+
+def test_cli_project_sessions_auto_continue_runs_single_step(monkeypatch, tmp_path, capsys) -> None:
+    session_db = tmp_path / "sessions.sqlite3"
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "project-alpha"
+    workspace_path.mkdir()
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, '', '')
+            """,
+            ("project-alpha", "project-alpha", str(workspace_path)),
+        )
+
+    from agent_swarm_hub.executor import EchoExecutor
+    from agent_swarm_hub.project_context import ProjectContextStore
+    from agent_swarm_hub.session_store import SessionStore
+
+    project_store = ProjectContextStore(str(shared_db_path))
+    project_store.upsert_project_memory(
+        "project-alpha",
+        focus="实现最小自动执行器",
+        recent_context="runtime health phase 1 已完成，需要开始单步自动推进。",
+        memory="Single-step auto-continue should run exactly one meaningful increment and then stop.",
+        recent_hints=["Next: expose single-step auto-continue as a project command"],
+    )
+
+    class FakeMemoryExecutor:
+        def run(self, prompt: str):
+            return SimpleNamespace(
+                output=json.dumps(
+                    {
+                        "focus": "实现最小自动执行器",
+                        "current_state": "已经接入单步 auto-continue 命令并验证项目能自动推进一小步。",
+                        "next_step": "把 auto-continue 的结果投影到 dashboard 和 summary。",
+                        "long_term_memory": "Single-step auto execution is the first rung above runtime health hardening.",
+                        "key_points": ["把 auto-continue 的结果投影到 dashboard 和 summary。"],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(session_db))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr("agent_swarm_hub.auto_continue.build_executor_for_config", lambda **_: EchoExecutor())
+    monkeypatch.setattr("agent_swarm_hub.project_context.build_executor_for_config", lambda **_: FakeMemoryExecutor())
+    monkeypatch.setattr("agent_swarm_hub.cli._sync_openviking_project_artifacts", lambda _project_id: None)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-swarm-hub", "project-sessions", "auto-continue", "project-alpha", "--provider", "codex"],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Auto-continue project: project-alpha" in output
+    assert "Provider: codex" in output
+    assert "Next step: Next: expose single-step auto-continue as a project command" in output
+
+    runtime_store = SessionStore(session_db)
+    workspace_session = runtime_store.get_workspace_session("local:auto-runtime:project-alpha:root", "project-alpha")
+    assert workspace_session is not None
+    assert workspace_session.active_task_id is not None
+    assert workspace_session.phase == "discussion"
+
+
+def test_cli_project_sessions_auto_continue_refuses_blocked_runtime_health(monkeypatch, tmp_path, capsys) -> None:
+    session_db = tmp_path / "sessions.sqlite3"
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "project-alpha"
+    workspace_path.mkdir()
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, '', '')
+            """,
+            ("project-alpha", "project-alpha", str(workspace_path)),
+        )
+
+    from agent_swarm_hub.project_context import ProjectContextStore
+    from agent_swarm_hub.session_store import SessionStore
+
+    project_store = ProjectContextStore(str(shared_db_path))
+    project_store.upsert_project_memory(
+        "project-alpha",
+        focus="实现最小自动执行器",
+        recent_context="runtime health 当前不稳定。",
+        memory="Single-step auto execution should pause when runtime health is blocked.",
+        recent_hints=["Next: expose single-step auto-continue as a project command"],
+    )
+    project_store.record_runtime_health(
+        "project-alpha",
+        "codex",
+        status="quarantined",
+        summary="Bound codex session is quarantined and must not be auto-continued.",
+        details={"session_id": "codex-bad", "issue": "unhealthy"},
+    )
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(session_db))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-swarm-hub", "project-sessions", "auto-continue", "project-alpha", "--provider", "codex"],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert "Auto-continue blocked by runtime health for `project-alpha`: quarantined" in output
+    assert "must not be auto-continued" in output
+
+    runtime_store = SessionStore(session_db)
+    workspace_session = runtime_store.get_workspace_session("local:auto-runtime:project-alpha:root", "project-alpha")
+    assert workspace_session is None
+
+
+def test_cli_project_sessions_auto_continue_explain_only(monkeypatch, tmp_path, capsys) -> None:
+    session_db = tmp_path / "sessions.sqlite3"
+    shared_db_path = tmp_path / "shared-projects.sqlite3"
+    workspace_path = tmp_path / "project-alpha"
+    workspace_path.mkdir()
+
+    with sqlite3.connect(shared_db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE project_memory (
+                project_id TEXT PRIMARY KEY,
+                focus TEXT NOT NULL DEFAULT '',
+                recent_context TEXT NOT NULL DEFAULT '',
+                memory TEXT NOT NULL DEFAULT '',
+                recent_hints_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (project_id, title, workspace_path, profile, summary)
+            VALUES (?, ?, ?, '', '')
+            """,
+            ("project-alpha", "project-alpha", str(workspace_path)),
+        )
+
+    from agent_swarm_hub.project_context import ProjectContextStore
+    from agent_swarm_hub.session_store import SessionStore
+
+    project_store = ProjectContextStore(str(shared_db_path))
+    project_store.upsert_project_memory(
+        "project-alpha",
+        focus="实现 explain-only auto-continue",
+        recent_context="runtime health 已稳定，可以先解释自动推进计划。",
+        memory="Single-step auto execution should support explain-only mode.",
+        recent_hints=["Next: expose auto-continue explain mode"],
+    )
+
+    monkeypatch.setenv("ASH_SESSION_DB", str(session_db))
+    monkeypatch.setenv("ASH_PROJECT_SESSION_DB", str(shared_db_path))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-swarm-hub", "project-sessions", "auto-continue", "project-alpha", "--provider", "codex", "--explain"],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Requested provider: codex" in output
+    assert "Auto-step project: project-alpha" in output
+    assert "Explain only: no execution performed." in output
+    assert "Next step: Next: expose auto-continue explain mode" in output
+
+    runtime_store = SessionStore(session_db)
+    workspace_session = runtime_store.get_workspace_session("local:auto-runtime:project-alpha:root", "project-alpha")
+    assert workspace_session is None
+
+
+def test_cli_project_sessions_monitor_routes_arguments(monkeypatch, capsys) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_monitor(
+        project_id: str | None,
+        *,
+        monitor_all: bool,
+        apply: bool,
+        auto_continue_enabled: bool,
+        until_complete: bool,
+        interval_seconds: float,
+        cycles: int,
+        sync_project_memory_artifacts_cb,
+    ) -> int:
+        captured.update(
+            {
+                "project_id": project_id,
+                "monitor_all": monitor_all,
+                "apply": apply,
+                "auto_continue_enabled": auto_continue_enabled,
+                "until_complete": until_complete,
+                "interval_seconds": interval_seconds,
+                "cycles": cycles,
+                "has_sync_cb": callable(sync_project_memory_artifacts_cb),
+            }
+        )
+        print("monitor-routed")
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli_ops.project_sessions_monitor", fake_monitor)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent-swarm-hub",
+            "project-sessions",
+            "monitor",
+            "project-alpha",
+            "--apply",
+            "--auto-continue",
+            "--interval",
+            "5",
+            "--cycles",
+            "3",
+        ],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert "monitor-routed" in capsys.readouterr().out
+    assert captured == {
+        "project_id": "project-alpha",
+        "monitor_all": False,
+        "apply": True,
+        "auto_continue_enabled": True,
+        "until_complete": False,
+        "interval_seconds": 5.0,
+        "cycles": 3,
+        "has_sync_cb": True,
+    }
+
+
+def test_cli_project_sessions_followup_live_routes_arguments(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_followup(project_id: str, *, provider: str | None, prompt: str) -> int:
+        captured.update(
+            {
+                "project_id": project_id,
+                "provider": provider,
+                "prompt": prompt,
+            }
+        )
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli_ops.project_sessions_followup_live", fake_followup)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent-swarm-hub",
+            "project-sessions",
+            "followup-live",
+            "scpagwas_celltype",
+            "--provider",
+            "codex",
+            "请检查服务器任务是否全部完成",
+            "如果完成就继续下一步",
+        ],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert captured == {
+        "project_id": "scpagwas_celltype",
+        "provider": "codex",
+        "prompt": "请检查服务器任务是否全部完成 如果完成就继续下一步",
+    }
+
+
+def test_cli_project_sessions_bridge_policy_routes_arguments(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_bridge_policy(project_id: str, *, init: bool, force: bool, set_ssh_targets: list[str] | None) -> int:
+        captured.update(
+            {
+                "project_id": project_id,
+                "init": init,
+                "force": force,
+                "set_ssh_targets": set_ssh_targets,
+            }
+        )
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli_ops.project_sessions_bridge_policy", fake_bridge_policy)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent-swarm-hub",
+            "project-sessions",
+            "bridge-policy",
+            "agent-swarm-hub",
+            "--init",
+            "--force",
+        ],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert captured == {
+        "project_id": "agent-swarm-hub",
+        "init": True,
+        "force": True,
+        "set_ssh_targets": None,
+    }
+
+
+def test_cli_project_sessions_bridge_policy_routes_set_ssh_targets(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_bridge_policy(project_id: str, *, init: bool, force: bool, set_ssh_targets: list[str] | None) -> int:
+        captured.update(
+            {
+                "project_id": project_id,
+                "init": init,
+                "force": force,
+                "set_ssh_targets": set_ssh_targets,
+            }
+        )
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli_ops.project_sessions_bridge_policy", fake_bridge_policy)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent-swarm-hub",
+            "project-sessions",
+            "bridge-policy",
+            "agent-swarm-hub",
+            "--set-ssh-target",
+            "xinong",
+            "--set-ssh-target",
+            "gpu",
+        ],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert captured == {
+        "project_id": "agent-swarm-hub",
+        "init": False,
+        "force": False,
+        "set_ssh_targets": ["xinong", "gpu"],
+    }
+
+
+def test_cli_project_sessions_bridge_env_routes_arguments(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_bridge_env(project_id: str, *, init: bool) -> int:
+        captured.update(
+            {
+                "project_id": project_id,
+                "init": init,
+            }
+        )
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli_ops.project_sessions_bridge_env", fake_bridge_env)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent-swarm-hub",
+            "project-sessions",
+            "bridge-env",
+            "agent-swarm-hub",
+            "--init",
+        ],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert captured == {
+        "project_id": "agent-swarm-hub",
+        "init": True,
+    }
+
+
+def test_cli_project_sessions_open_tmux_routes_arguments(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_open_tmux(
+        project_id: str,
+        *,
+        provider: str | None,
+        bridge_layout: bool,
+        ssh_targets: list[str] | None,
+        manual_pane: bool,
+        secondary_agents: list[str] | None,
+    ) -> int:
+        captured.update(
+            {
+                "project_id": project_id,
+                "provider": provider,
+                "bridge_layout": bridge_layout,
+                "ssh_targets": ssh_targets,
+                "manual_pane": manual_pane,
+                "secondary_agents": secondary_agents,
+            }
+        )
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli_ops.project_sessions_open_tmux_terminal", fake_open_tmux)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent-swarm-hub",
+            "project-sessions",
+            "open-tmux",
+            "agent-swarm-hub",
+            "--provider",
+            "codex",
+        ],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert captured == {
+        "project_id": "agent-swarm-hub",
+        "provider": "codex",
+        "bridge_layout": False,
+        "ssh_targets": [],
+        "manual_pane": True,
+        "secondary_agents": [],
+    }
+
+
+def test_cli_project_sessions_open_tmux_with_bridge_layout_routes_arguments(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_open_tmux(
+        project_id: str,
+        *,
+        provider: str | None,
+        bridge_layout: bool,
+        ssh_targets: list[str] | None,
+        manual_pane: bool,
+        secondary_agents: list[str] | None,
+    ) -> int:
+        captured.update(
+            {
+                "project_id": project_id,
+                "provider": provider,
+                "bridge_layout": bridge_layout,
+                "ssh_targets": ssh_targets,
+                "manual_pane": manual_pane,
+                "secondary_agents": secondary_agents,
+            }
+        )
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli_ops.project_sessions_open_tmux_terminal", fake_open_tmux)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent-swarm-hub",
+            "project-sessions",
+            "open-tmux",
+            "agent-swarm-hub",
+            "--provider",
+            "codex",
+            "--bridge-layout",
+            "--ssh-target",
+            "xinong",
+            "--ssh-target",
+            "ias",
+            "--secondary-agent",
+            "claude",
+            "--no-manual",
+        ],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert captured == {
+        "project_id": "agent-swarm-hub",
+        "provider": "codex",
+        "bridge_layout": True,
+        "ssh_targets": ["xinong", "ias"],
+        "manual_pane": False,
+        "secondary_agents": ["claude"],
+    }
+
+
+def test_cli_project_sessions_bridge_status_routes_arguments(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_bridge_status(
+        project_id: str,
+        *,
+        provider: str | None,
+        init: bool,
+        exports: bool,
+    ) -> int:
+        captured.update(
+            {
+                "project_id": project_id,
+                "provider": provider,
+                "init": init,
+                "exports": exports,
+            }
+        )
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli_ops.project_sessions_bridge_status", fake_bridge_status)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent-swarm-hub",
+            "project-sessions",
+            "bridge-status",
+            "agent-swarm-hub",
+            "--provider",
+            "codex",
+            "--init",
+            "--exports",
+        ],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert captured == {
+        "project_id": "agent-swarm-hub",
+        "provider": "codex",
+        "init": True,
+        "exports": True,
+    }
+
+
+def test_cli_project_sessions_bridge_workbench_routes_arguments(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_bridge_workbench(
+        project_id: str,
+        *,
+        provider: str | None,
+        ssh_targets: list[str] | None,
+        manual_pane: bool,
+        secondary_agents: list[str] | None,
+        init: bool,
+        exports: bool,
+    ) -> int:
+        captured.update(
+            {
+                "project_id": project_id,
+                "provider": provider,
+                "ssh_targets": ssh_targets,
+                "manual_pane": manual_pane,
+                "secondary_agents": secondary_agents,
+                "init": init,
+                "exports": exports,
+            }
+        )
+        return 0
+
+    monkeypatch.setattr("agent_swarm_hub.cli_ops.project_sessions_bridge_workbench", fake_bridge_workbench)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent-swarm-hub",
+            "project-sessions",
+            "bridge-workbench",
+            "agent-swarm-hub",
+            "--provider",
+            "codex",
+            "--ssh-target",
+            "xinong",
+            "--ssh-target",
+            "ias",
+            "--secondary-agent",
+            "claude",
+            "--init",
+            "--exports",
+        ],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert captured == {
+        "project_id": "agent-swarm-hub",
+        "provider": "codex",
+        "ssh_targets": ["xinong", "ias"],
+        "manual_pane": True,
+        "secondary_agents": ["claude"],
+        "init": True,
+        "exports": True,
+    }
+
+
+def test_project_sessions_open_tmux_terminal_opens_terminal(monkeypatch, tmp_path, capsys) -> None:
+    workspace = tmp_path / "agent-swarm-hub"
+    workspace.mkdir()
+
+    class FakeStore:
+        def get_project(self, project_id: str):
+            if project_id != "agent-swarm-hub":
+                return None
+            return SimpleNamespace(project_id=project_id, workspace_path=str(workspace))
+
+    launch_calls: list[dict[str, object]] = []
+    run_calls: list[list[str]] = []
+
+    def fake_ensure_orchestrator_pane(*, project_id: str, workspace_path: str, provider: str = "claude", launch_mode: str | None = None):
+        launch_calls.append(
+            {
+                "project_id": project_id,
+                "workspace_path": workspace_path,
+                "provider": provider,
+                "launch_mode": launch_mode,
+            }
+        )
+        return {
+            "status": "launched",
+            "session_name": "ash-codex-agent-swarm-hub",
+            "window_index": "4",
+            "pane_id": "%7",
+        }
+
+    def fake_run(argv, check=False, capture_output=False, text=False):
+        run_calls.append(argv)
+        if argv[:3] == ["tmux", "has-session", "-t"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli_ops, "ProjectContextStore", lambda: FakeStore())
+    monkeypatch.setattr(cli_ops, "ensure_orchestrator_pane", fake_ensure_orchestrator_pane)
+    monkeypatch.setattr(cli_ops.subprocess, "run", fake_run)
+
+    exit_code = cli_ops.project_sessions_open_tmux_terminal(
+        "agent-swarm-hub",
+        provider="codex",
+        bridge_layout=False,
+        ssh_targets=[],
+        manual_pane=True,
+        secondary_agents=[],
+    )
+
+    assert exit_code == 0
+    assert launch_calls == [
+        {
+            "project_id": "agent-swarm-hub",
+            "workspace_path": str(workspace),
+            "provider": "codex",
+            "launch_mode": "focus",
+        }
+    ]
+    assert run_calls
+    assert run_calls[0][:3] == ["tmux", "has-session", "-t"]
+    assert any(call[:4] == ["tmux", "set-environment", "-t", "ash-codex-agent-swarm-hub"] for call in run_calls)
+    osa_calls = [call for call in run_calls if call[0:2] == ["osascript", "-e"]]
+    assert osa_calls
+    assert "tmux attach -t ash-codex-agent-swarm-hub" in osa_calls[0][2]
+    out = capsys.readouterr().out
+    assert "Opened Terminal for `agent-swarm-hub` (codex)" in out
+    assert "Applied bridge env to tmux session `ash-codex-agent-swarm-hub`." in out
+    assert "project-sessions bridge-env agent-swarm-hub" in out
+    assert "project-sessions bridge-status agent-swarm-hub --provider codex" in out
+
+
+def test_project_sessions_open_tmux_terminal_applies_bridge_layout(monkeypatch, tmp_path) -> None:
+    workspace = tmp_path / "agent-swarm-hub"
+    workspace.mkdir()
+
+    class FakeStore:
+        def get_project(self, project_id: str):
+            if project_id != "agent-swarm-hub":
+                return None
+            return SimpleNamespace(project_id=project_id, workspace_path=str(workspace))
+
+    tmux_calls: list[list[str]] = []
+
+    def fake_ensure_orchestrator_pane(*, project_id: str, workspace_path: str, provider: str = "claude", launch_mode: str | None = None):
+        return {
+            "status": "launched",
+            "session_name": "ash-codex-agent-swarm-hub",
+            "window_index": "4",
+            "pane_id": "%7",
+        }
+
+    def fake_run(argv, check=False, capture_output=False, text=False):
+        if argv and argv[0] == "tmux":
+            tmux_calls.append(argv)
+            if argv[1:3] == ["has-session", "-t"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[1:4] == ["list-panes", "-t", "ash-codex-agent-swarm-hub:4"]:
+                return SimpleNamespace(returncode=0, stdout="%7\t\tash-chat | agent-swarm-hub | codex\n", stderr="")
+            if argv[1:2] == ["split-window"]:
+                return SimpleNamespace(returncode=0, stdout="%8\n", stderr="")
+            if argv[1:3] == ["set-option", "-p"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[1:3] == ["set-environment", "-t"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[1:3] == ["select-layout", "-t"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli_ops, "ProjectContextStore", lambda: FakeStore())
+    monkeypatch.setattr(cli_ops, "ensure_orchestrator_pane", fake_ensure_orchestrator_pane)
+    monkeypatch.setattr(cli_ops.subprocess, "run", fake_run)
+
+    exit_code = cli_ops.project_sessions_open_tmux_terminal(
+        "agent-swarm-hub",
+        provider="codex",
+        bridge_layout=True,
+        ssh_targets=["xinong"],
+        manual_pane=True,
+        secondary_agents=["claude"],
+    )
+
+    assert exit_code == 0
+    assert any(call[:4] == ["tmux", "set-option", "-p", "-t"] and call[-1] == "agent:codex" for call in tmux_calls)
+    assert any(call[:5] == ["tmux", "split-window", "-d", "-t", "%7"] for call in tmux_calls)
+    assert any(call[:4] == ["tmux", "set-environment", "-t", "ash-codex-agent-swarm-hub"] for call in tmux_calls)
+    assert any(call[:4] == ["tmux", "set-option", "-p", "-t"] and call[-1] == "manual" for call in tmux_calls)
+    assert any(call[:4] == ["tmux", "set-option", "-p", "-t"] and call[-1] == "ssh:xinong" for call in tmux_calls)
+    assert any(call[:4] == ["tmux", "set-option", "-p", "-t"] and call[-1] == "agent:claude" for call in tmux_calls)
+    assert any(
+        call[:2] == ["tmux", "split-window"] and "env -u LC_ALL -u LC_CTYPE -u LANGUAGE LANG=C LC_ALL=C LC_CTYPE=C ssh xinong" in call[-1]
+        for call in tmux_calls
+    )
+
+
+def test_project_sessions_bridge_status_prints_session_panes_and_policy(monkeypatch, tmp_path, capsys) -> None:
+    workspace = tmp_path / "agent-swarm-hub"
+    workspace.mkdir()
+
+    class FakeStore:
+        def get_project(self, project_id: str):
+            if project_id != "agent-swarm-hub":
+                return None
+            return SimpleNamespace(project_id=project_id, workspace_path=str(workspace))
+
+    def fake_ensure_orchestrator_pane(*, project_id: str, workspace_path: str, provider: str = "claude", launch_mode: str | None = None):
+        return {
+            "status": "existing",
+            "session_name": "ash-codex-agent-swarm-hub",
+            "window_index": "1",
+            "pane_id": "%0",
+        }
+
+    def fake_run(argv, check=False, capture_output=False, text=False):
+        if argv and argv[0] == "tmux":
+            if argv[1:3] == ["has-session", "-t"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[1:4] == ["list-panes", "-t", "ash-codex-agent-swarm-hub:1"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="%0\tagent:codex\tash-chat | agent-swarm-hub | codex\n%1\tmanual\tsunxiangrong.local\n",
+                    stderr="",
+                )
+            if argv[1:3] == ["show-environment", "-t"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "TMUX_BRIDGE_READABLE_TARGETS=manual,agent:codex,agent:claude,ssh:xinong,ssh:ias\n"
+                        "TMUX_BRIDGE_WRITABLE_TARGETS=agent:codex,agent:claude,ssh:xinong,ssh:ias\n"
+                        "TMUX_BRIDGE_READONLY_PATHS=/,/etc,/usr,/var\n"
+                        f"TMUX_BRIDGE_WRITABLE_PATHS={workspace}\n"
+                        "TMUX_BRIDGE_DENY_PREFIXES=rm -rf,sudo,reboot,shutdown\n"
+                    ),
+                    stderr="",
+                )
+            if argv[1:4] == ["capture-pane", "-pt", "%0"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="[agent-swarm-hub] heartbeat check: healthy existing codex process\n(base) sunxiangrong:agent-swarm-hub sunxiangrong$\n",
+                    stderr="",
+                )
+            if argv[1:4] == ["capture-pane", "-pt", "%1"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="manual shell ready\n",
+                    stderr="",
+                )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli_ops, "ProjectContextStore", lambda: FakeStore())
+    monkeypatch.setattr(cli_ops, "ensure_orchestrator_pane", fake_ensure_orchestrator_pane)
+    monkeypatch.setattr(cli_ops.subprocess, "run", fake_run)
+
+    exit_code = cli_ops.project_sessions_bridge_status(
+        "agent-swarm-hub",
+        provider="codex",
+        init=False,
+        exports=True,
+    )
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Project: agent-swarm-hub" in out
+    assert "Session: ash-codex-agent-swarm-hub" in out
+    assert "tmux-bridge env applied: yes" in out
+    assert "- %0 | agent:codex | local-shell | ash-chat | agent-swarm-hub | codex" in out
+    assert "- %1 | manual | manual-readonly | sunxiangrong.local" in out
+    assert "SSH Targets: xinong, ias" in out
+    assert "Bridge Env:" in out
+    assert "TMUX_BRIDGE_WRITABLE_TARGETS=agent:codex,agent:claude,ssh:xinong,ssh:ias" in out
+
+
+def test_project_sessions_bridge_policy_updates_ssh_targets(monkeypatch, tmp_path, capsys) -> None:
+    workspace = tmp_path / "agent-swarm-hub"
+    workspace.mkdir()
+
+    class FakeStore:
+        def get_project(self, project_id: str):
+            if project_id != "agent-swarm-hub":
+                return None
+            return SimpleNamespace(project_id=project_id, workspace_path=str(workspace))
+
+    monkeypatch.setattr(cli_ops, "ProjectContextStore", lambda: FakeStore())
+
+    exit_code = cli_ops.project_sessions_bridge_policy(
+        "agent-swarm-hub",
+        init=True,
+        force=False,
+        set_ssh_targets=["xinong", "gpu"],
+    )
+
+    assert exit_code == 0
+    policy = json.loads((workspace / ".ash" / "bridge-policy.json").read_text(encoding="utf-8"))
+    assert policy["ssh_targets"] == ["xinong", "gpu"]
+    assert policy["readable_targets"] == ["manual", "agent:codex", "agent:claude", "ssh:xinong", "ssh:gpu"]
+    assert policy["writable_targets"] == ["agent:codex", "agent:claude", "ssh:xinong", "ssh:gpu"]
+    out = capsys.readouterr().out
+    assert "SSH Targets: xinong, gpu" in out
+    assert "Updated SSH targets." in out
+
+
+def test_project_sessions_bridge_status_falls_back_to_existing_tmux_session(monkeypatch, tmp_path, capsys) -> None:
+    workspace = tmp_path / "agent-swarm-hub"
+    workspace.mkdir()
+
+    class FakeStore:
+        def get_project(self, project_id: str):
+            if project_id != "agent-swarm-hub":
+                return None
+            return SimpleNamespace(project_id=project_id, workspace_path=str(workspace))
+
+    def fake_ensure_orchestrator_pane(*, project_id: str, workspace_path: str, provider: str = "claude", launch_mode: str | None = None):
+        return {
+            "status": "error",
+            "reason": "duplicate session: ash-codex-agent-swarm-hub",
+            "window_index": "1",
+        }
+
+    def fake_run(argv, check=False, capture_output=False, text=False):
+        if argv and argv[0] == "tmux":
+            if argv[1:3] == ["has-session", "-t"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[1:4] == ["list-panes", "-t", "ash-codex-agent-swarm-hub:1"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="%0\tagent:codex\tash-chat | agent-swarm-hub | codex\n",
+                    stderr="",
+                )
+            if argv[1:3] == ["show-environment", "-t"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "TMUX_BRIDGE_READABLE_TARGETS=manual,agent:codex,agent:claude,ssh:xinong,ssh:ias\n"
+                        "TMUX_BRIDGE_WRITABLE_TARGETS=agent:codex,agent:claude,ssh:xinong,ssh:ias\n"
+                        "TMUX_BRIDGE_READONLY_PATHS=/,/etc,/usr,/var\n"
+                        f"TMUX_BRIDGE_WRITABLE_PATHS={workspace}\n"
+                        "TMUX_BRIDGE_DENY_PREFIXES=rm -rf,sudo,reboot,shutdown\n"
+                    ),
+                    stderr="",
+                )
+            if argv[1:4] == ["capture-pane", "-pt", "%0"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="(base) sunxiangrong:agent-swarm-hub sunxiangrong$\n",
+                    stderr="",
+                )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli_ops, "ProjectContextStore", lambda: FakeStore())
+    monkeypatch.setattr(cli_ops, "ensure_orchestrator_pane", fake_ensure_orchestrator_pane)
+    monkeypatch.setattr(cli_ops.subprocess, "run", fake_run)
+
+    exit_code = cli_ops.project_sessions_bridge_status(
+        "agent-swarm-hub",
+        provider="codex",
+        init=False,
+        exports=False,
+    )
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Session: ash-codex-agent-swarm-hub" in out
+    assert "tmux-bridge env applied: yes" in out
+    assert "- %0 | agent:codex | local-shell | ash-chat | agent-swarm-hub | codex" in out
+
+
+def test_project_sessions_bridge_workbench_opens_tmux_then_prints_status(monkeypatch) -> None:
+    calls: list[tuple[str, object]] = []
+
+    def fake_open_tmux(project_id: str, *, provider: str | None, bridge_layout: bool, ssh_targets: list[str] | None) -> int:
+        raise AssertionError("stale fake signature")
+        return 0
+
+    def fake_open_tmux(
+        project_id: str,
+        *,
+        provider: str | None,
+        bridge_layout: bool,
+        ssh_targets: list[str] | None,
+        manual_pane: bool,
+        secondary_agents: list[str] | None,
+    ) -> int:
+        calls.append(("open", project_id, provider, bridge_layout, list(ssh_targets or []), manual_pane, list(secondary_agents or [])))
+        return 0
+
+    def fake_bridge_status(project_id: str, *, provider: str | None, init: bool, exports: bool) -> int:
+        calls.append(("status", project_id, provider, init, exports))
+        return 0
+
+    monkeypatch.setattr(cli_ops, "project_sessions_open_tmux_terminal", fake_open_tmux)
+    monkeypatch.setattr(cli_ops, "project_sessions_bridge_status", fake_bridge_status)
+
+    exit_code = cli_ops.project_sessions_bridge_workbench(
+        "agent-swarm-hub",
+        provider="codex",
+        ssh_targets=["xinong", "ias"],
+        manual_pane=False,
+        secondary_agents=["claude"],
+        init=True,
+        exports=True,
+    )
+
+    assert exit_code == 0
+    assert calls == [
+        ("open", "agent-swarm-hub", "codex", True, ["xinong", "ias"], False, ["claude"]),
+        ("status", "agent-swarm-hub", "codex", True, True),
+    ]
+
+
+def test_project_sessions_bridge_workbench_uses_policy_default_ssh_targets(monkeypatch, tmp_path) -> None:
+    workspace = tmp_path / "agent-swarm-hub"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / ".ash").mkdir(parents=True, exist_ok=True)
+    (workspace / ".ash" / "bridge-policy.json").write_text(
+        json.dumps(
+            {
+                "project_id": "agent-swarm-hub",
+                "workspace_path": str(workspace),
+                "ssh_targets": ["xinong", "gpu"],
+                "readable_targets": ["manual", "agent:codex", "agent:claude", "ssh:xinong", "ssh:gpu"],
+                "writable_targets": ["agent:codex", "agent:claude", "ssh:xinong", "ssh:gpu"],
+                "readonly_paths": ["/", "/etc", "/usr", "/var"],
+                "writable_paths": [str(workspace)],
+                "deny_prefixes": ["rm -rf", "sudo", "reboot", "shutdown"],
+                "allow_manual_write": False,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeStore:
+        def get_project(self, project_id: str):
+            if project_id != "agent-swarm-hub":
+                return None
+            return SimpleNamespace(project_id=project_id, workspace_path=str(workspace))
+
+    calls: list[tuple[str, object]] = []
+
+    def fake_open_tmux(
+        project_id: str,
+        *,
+        provider: str | None,
+        bridge_layout: bool,
+        ssh_targets: list[str] | None,
+        manual_pane: bool,
+        secondary_agents: list[str] | None,
+    ) -> int:
+        calls.append(("open", project_id, provider, bridge_layout, list(ssh_targets or []), manual_pane, list(secondary_agents or [])))
+        return 0
+
+    def fake_bridge_status(project_id: str, *, provider: str | None, init: bool, exports: bool) -> int:
+        calls.append(("status", project_id, provider, init, exports))
+        return 0
+
+    monkeypatch.setattr(cli_ops, "ProjectContextStore", lambda: FakeStore())
+    monkeypatch.setattr(cli_ops, "project_sessions_open_tmux_terminal", fake_open_tmux)
+    monkeypatch.setattr(cli_ops, "project_sessions_bridge_status", fake_bridge_status)
+
+    exit_code = cli_ops.project_sessions_bridge_workbench(
+        "agent-swarm-hub",
+        provider="codex",
+        ssh_targets=[],
+        manual_pane=True,
+        secondary_agents=[],
+        init=False,
+        exports=False,
+    )
+
+    assert exit_code == 0
+    assert calls == [
+        ("open", "agent-swarm-hub", "codex", True, ["xinong", "gpu"], True, []),
+        ("status", "agent-swarm-hub", "codex", False, False),
+    ]
 
 
 def test_project_context_sync_updates_structured_project_summary(tmp_path) -> None:

@@ -8,6 +8,9 @@ from typing import Any
 
 from .paths import repo_root
 
+_SSH_LOCALE_EXPORTS = "unset LANGUAGE; export LANG=C LC_ALL=C LC_CTYPE=C;"
+_LOGIN_SHELL = os.getenv("SHELL") or "/bin/zsh"
+
 
 def ensure_orchestrator_pane(*, project_id: str, workspace_path: str, provider: str = "claude", launch_mode: str | None = None) -> dict[str, str]:
     workspace = str(workspace_path or "").strip()
@@ -28,14 +31,20 @@ def ensure_orchestrator_pane(*, project_id: str, workspace_path: str, provider: 
             "title": str(existing.get("pane_title") or ""),
         }
 
-    command = f"cd {repo_root()} && ASH_AUTO_ENTER_NATIVE=1 ./scripts/start-chat.sh {provider} {project_id}"
+    command = (
+        f"{_SSH_LOCALE_EXPORTS} "
+        f"cd {repo_root()} && "
+        f"ASH_AUTO_ENTER_NATIVE=1 ./scripts/start-chat.sh {provider} {project_id}; "
+        f"{_SSH_LOCALE_EXPORTS} "
+        f"exec {_LOGIN_SHELL} -l"
+    )
     output_format = "#{session_name}\t#{window_index}\t#{pane_id}"
 
     try:
         if os.getenv("TMUX"):
             window_name = f"ash-{provider}-{_slug(project_id)}"
             result = subprocess.run(
-                ["tmux", "new-window", "-d", "-n", window_name, "-c", workspace, "-P", "-F", output_format, "/bin/bash", "-lc", command],
+                ["tmux", "new-window", "-d", "-n", window_name, "-c", workspace, "-P", "-F", output_format, _LOGIN_SHELL, "-lc", command],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -57,7 +66,7 @@ def ensure_orchestrator_pane(*, project_id: str, workspace_path: str, provider: 
 
         session_name = f"ash-{provider}-{_slug(project_id)}"
         result = subprocess.run(
-            ["tmux", "new-session", "-d", "-s", session_name, "-c", workspace, "-P", "-F", output_format, "/bin/bash", "-lc", command],
+            ["tmux", "new-session", "-d", "-s", session_name, "-c", workspace, "-P", "-F", output_format, _LOGIN_SHELL, "-lc", command],
             check=False,
             capture_output=True,
             text=True,

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
+import re
+from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from hashlib import sha1
@@ -8,10 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from .escalation import EscalationDecision
+from .auto_continue import build_auto_continue_plan, parse_auto_continue_request, render_auto_continue_plan
 from .executor import AuthenticationRequiredError, ConfirmationRequiredError, EchoExecutor, Executor, ExecutorError
 from .models import Event, EventType
 from .project_context import ProjectContextStore
 from .remote import RemoteMessage, parse_remote_command
+from .runtime_monitor import parse_runtime_monitor_request
 from .session_store import SessionStore
 from .swarm import SwarmCoordinator, SwarmState
 from .swarm_launch import cleanup_tmux_launch, ensure_orchestrator_pane
@@ -100,6 +105,9 @@ class CCConnectAdapter:
             self._ensure_workspace(workspace_id)
             self._ensure_executor_session_id(message.session_key, workspace_id)
             self._load_session(message.session_key, workspace_id)
+            natural_automation = self._maybe_handle_natural_automation(message, workspace_id)
+            if natural_automation is not None:
+                return natural_automation
         if self._should_treat_as_ephemeral(message, workspace_id):
             return self._handle_ephemeral(message, workspace_id or EPHEMERAL_WORKSPACE_ID)
         if workspace_id is None and self._is_plain_text(message):
@@ -128,6 +136,8 @@ class CCConnectAdapter:
                     "/project set-backend <backend>  设置项目默认后端\n"
                     "/project set-transport <transport>  设置项目默认传输层\n"
                     "/status  查看当前任务摘要\n"
+                    "/autostep [provider] [--explain]  自动推进当前项目的一小步\n"
+                    "/automonitor [--apply] [--auto-continue] [--until-complete] [--cycles N] [--interval N]  运行当前项目范围的有界监控循环\n"
                     "/worker  查看当前 worker phase、handoff、sub-agent 运行情况\n"
                     "/tasks  查看当前项目最近任务列表\n"
                     "/sessions  查看 Claude/Codex formal 与 ephemeral 消息数量\n"
@@ -157,6 +167,10 @@ class CCConnectAdapter:
             return self._handle_write(message, command.argument)
         if command.name == "execute":
             return self._handle_execute(message, command.argument)
+        if command.name == "autostep":
+            return self._handle_autostep(message, command.argument)
+        if command.name == "automonitor":
+            return self._handle_automonitor(message, command.argument)
         if command.name == "new":
             return self._handle_new(message)
         if command.name == "status":
@@ -747,6 +761,174 @@ class CCConnectAdapter:
             )
             return AdapterResponse(text=text, task_id=task_id)
 
+    def _handle_autostep(self, message: RemoteMessage, argument: str) -> AdapterResponse:
+        workspace_id = self._require_bound_workspace(message)
+        if workspace_id is None:
+            return self._formal_project_required_response()
+        project_id = self._resolve_shared_project_id(workspace_id) or workspace_id
+        request = parse_auto_continue_request(argument)
+        provider = str(request.get("provider") or "")
+        explain = bool(request.get("explain"))
+        plan = build_auto_continue_plan(project_id, context_store=self.project_context_store)
+        if int(plan["code"]) != 0:
+            self.project_context_store.record_auto_continue_state(
+                project_id,
+                provider or "codex",
+                status="blocked",
+                summary=str(plan.get("message") or "Auto-continue is currently blocked."),
+                details={
+                    "mode": "chat-explain" if explain else "chat-execute",
+                    "runtime_status": str(plan.get("runtime_status") or ""),
+                },
+            )
+            return AdapterResponse(text=str(plan.get("message") or ""))
+        if explain:
+            self.project_context_store.record_auto_continue_state(
+                project_id,
+                provider or "codex",
+                status="planned",
+                summary=f"Auto-continue plan ready via {provider or 'codex'}: {str(plan.get('next_step') or '').strip()}",
+                details={
+                    "mode": "chat-explain",
+                    "phase": str(plan.get("current_phase") or ""),
+                    "next_step": str(plan.get("next_step") or ""),
+                },
+            )
+            lines = [
+                "Automation Preview",
+                f"Project: {project_id}",
+            ]
+            if provider:
+                lines.append(f"Provider: {provider}")
+            if str(plan.get("current_phase") or "").strip():
+                lines.append(f"Phase: {plan['current_phase']}")
+            if str(plan.get("runtime_summary") or "").strip():
+                lines.append(f"Runtime health: {plan['runtime_summary']}")
+            if str(plan.get("current_state") or "").strip():
+                lines.append(f"Current state: {plan['current_state']}")
+            if str(plan.get("next_step") or "").strip():
+                lines.append(f"Planned next step: {plan['next_step']}")
+            lines.append("Explain only: no execution performed.")
+            return AdapterResponse(text="\n".join(lines))
+        prompt = str(plan.get("prompt") or "").strip()
+        if not prompt:
+            return AdapterResponse(text=str(plan.get("message") or f"No auto-continue candidate is available for `{project_id}`."))
+        auto_message = RemoteMessage(
+            platform=message.platform,
+            chat_id=message.chat_id,
+            user_id=message.user_id,
+            text=prompt,
+            thread_id=message.thread_id,
+            message_id=message.message_id,
+        )
+        response = self.handle_message(auto_message)
+        self.project_context_store.record_auto_continue_state(
+            project_id,
+            provider or "codex",
+            status="executed",
+            summary=f"Auto-continue executed one step via {provider or 'codex'}: {str(plan.get('next_step') or '').strip()}",
+            details={
+                "mode": "chat-execute",
+                "phase": str(plan.get("current_phase") or ""),
+                "next_step": str(plan.get("next_step") or ""),
+                "task_id": str(response.task_id or ""),
+            },
+        )
+        lines = [
+            "Automation Result",
+            f"Project: {project_id}",
+        ]
+        if provider:
+            lines.append(f"Provider: {provider}")
+        if str(plan.get("current_phase") or "").strip():
+            lines.append(f"Phase: {plan['current_phase']}")
+        lines.append(f"Executed next step: {plan['next_step']}")
+        lines.append("Execution output:")
+        lines.append(response.text)
+        return AdapterResponse(text="\n".join(lines), task_id=response.task_id)
+
+    def _handle_automonitor(self, message: RemoteMessage, argument: str) -> AdapterResponse:
+        workspace_id = self._require_bound_workspace(message)
+        if workspace_id is None:
+            return self._formal_project_required_response()
+        project_id = self._resolve_shared_project_id(workspace_id) or workspace_id
+        options = parse_runtime_monitor_request(argument)
+        from . import cli_ops
+
+        output_buffer = io.StringIO()
+        with redirect_stdout(output_buffer):
+            result = cli_ops.project_sessions_monitor(
+                project_id,
+                monitor_all=False,
+                apply=bool(options["apply"]),
+                auto_continue_enabled=bool(options["auto_continue_enabled"]),
+                until_complete=bool(options["until_complete"]),
+                interval_seconds=float(options["interval_seconds"]),
+                cycles=int(options["cycles"]),
+                sync_project_memory_artifacts_cb=lambda store, pid: cli_ops.sync_project_memory_artifacts(
+                    store,
+                    pid,
+                    sync_openviking_project_artifacts_cb=lambda _project_id: None,
+                ),
+            )
+        monitor_output = [line.strip() for line in output_buffer.getvalue().splitlines() if line.strip()]
+        lines = [
+            "Automation Monitor",
+            f"Project: {project_id}",
+            "Scope: current project only",
+            f"Apply repair: {'yes' if options['apply'] else 'no'}",
+            f"Auto-continue: {'yes' if options['auto_continue_enabled'] else 'no'}",
+            f"Until complete: {'yes' if options['until_complete'] else 'no'}",
+            f"Cycles: {int(options['cycles'])}",
+            f"Interval: {float(options['interval_seconds']):g}s",
+            f"Monitor exit code: {result}",
+        ]
+        if monitor_output:
+            lines.append("Monitor summary:")
+            lines.extend(monitor_output[-4:])
+        return AdapterResponse(text="\n".join(lines))
+
+    def _maybe_handle_natural_automation(self, message: RemoteMessage, workspace_id: str) -> AdapterResponse | None:
+        text = " ".join((message.text or "").split()).strip()
+        if not text or text.startswith("/"):
+            return None
+        lowered = text.casefold()
+        watch_markers = (
+            "看看当前任务情况",
+            "看看任务情况",
+            "看看进度",
+            "查看任务情况",
+            "查看进度",
+            "monitor",
+            "watch",
+        )
+        if not any(marker in lowered for marker in watch_markers):
+            return None
+        interval_seconds = self._extract_monitor_interval_seconds(text)
+        if interval_seconds is None:
+            return AdapterResponse(text="隔多久看一次？")
+        cycles = 6
+        synthetic_argument = f"--cycles {cycles} --interval {interval_seconds:g}"
+        return self._handle_automonitor(message, synthetic_argument)
+
+    def _extract_monitor_interval_seconds(self, text: str) -> float | None:
+        normalized = " ".join((text or "").split()).strip().lower()
+        if not normalized:
+            return None
+        patterns = (
+            (r"每\s*(\d+(?:\.\d+)?)\s*(秒钟|秒|s|sec|secs|second|seconds)", 1.0),
+            (r"每\s*(\d+(?:\.\d+)?)\s*(分钟|分|min|mins|minute|minutes)", 60.0),
+        )
+        for pattern, scale in patterns:
+            match = re.search(pattern, normalized)
+            if not match:
+                continue
+            try:
+                return float(match.group(1)) * scale
+            except ValueError:
+                return None
+        return None
+
     def _handle_new(self, message: RemoteMessage) -> AdapterResponse:
         workspace_id = self._require_bound_workspace(message)
         if workspace_id is None:
@@ -1169,7 +1351,7 @@ class CCConnectAdapter:
             title=project_id,
             path="",
             backend=default_backend,
-            transport="direct",
+            transport="auto",
             created_at="",
             updated_at="",
         )
@@ -1544,9 +1726,11 @@ class CCConnectAdapter:
         )
 
     @staticmethod
-    def _coordination_label(*, complexity: str, subagent_runs: int) -> str:
+    def _coordination_label(*, complexity: str, subagent_runs: int, planned: bool) -> str:
         if subagent_runs > 0:
             return f"swarm collaboration ({subagent_runs} sub-agent runs)"
+        if planned:
+            return "planned execution"
         if complexity == "simple":
             return "single-agent execution"
         if complexity in {"medium", "large"}:
@@ -1590,7 +1774,7 @@ class CCConnectAdapter:
         ]
         planning_lines = [
             "Planning:",
-            f"- Coordination: {self._coordination_label(complexity=complexity, subagent_runs=len(subagent_results))}",
+            f"- Coordination: {self._coordination_label(complexity=complexity, subagent_runs=len(subagent_results), planned=True)}",
             f"- Complexity: {complexity}",
         ]
         if planning_backend:

@@ -16,6 +16,16 @@ from .session_store import SessionStore, WorkspaceRecord
 
 
 ADD_PROJECT_SENTINEL = "__add_project__"
+WORKBENCH_PROJECT_ID = "ash-workbench"
+
+
+def _default_backend() -> str:
+    return (os.getenv("ASH_EXECUTOR") or "claude").strip().lower() or "claude"
+
+
+def _default_transport() -> str:
+    transport = (os.getenv("ASH_PROJECT_DEFAULT_TRANSPORT") or os.getenv("ASH_EXECUTOR_TRANSPORT") or "auto").strip().lower()
+    return transport or "auto"
 
 
 def resolve_workspace_selection(selection: str, workspaces: list[WorkspaceRecord]) -> str | None:
@@ -41,19 +51,34 @@ def resolve_workspace_selection(selection: str, workspaces: list[WorkspaceRecord
 
 
 def shared_projects_as_workspaces() -> list[WorkspaceRecord]:
+    _ensure_builtin_runtime_projects()
     contexts = ProjectContextStore().list_projects()
+    backend = _default_backend()
+    transport = _default_transport()
     return [
         WorkspaceRecord(
             workspace_id=context.project_id,
             title=context.title,
             path=context.workspace_path,
-            backend="claude",
-            transport="direct",
+            backend=backend,
+            transport=transport,
             created_at="",
             updated_at="",
         )
         for context in contexts
     ]
+
+
+def _ensure_builtin_runtime_projects() -> None:
+    store = ProjectContextStore()
+    if store.get_project(WORKBENCH_PROJECT_ID) is not None:
+        return
+    workspace_path = new_project_workspace_path(WORKBENCH_PROJECT_ID)
+    upsert_project_workspace(
+        store=SessionStore(),
+        title=WORKBENCH_PROJECT_ID,
+        workspace_path=workspace_path,
+    )
 
 
 def workspace_path_is_enterable(path: str | None) -> bool:
@@ -85,6 +110,8 @@ def new_project_workspace_path(title: str) -> Path:
 
 def upsert_project_workspace(*, store: SessionStore, title: str, workspace_path: Path) -> WorkspaceRecord:
     project_id = project_slug(title)
+    backend = _default_backend()
+    transport = _default_transport()
     db_path = project_session_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     workspace_path.mkdir(parents=True, exist_ok=True)
@@ -134,8 +161,8 @@ def upsert_project_workspace(*, store: SessionStore, title: str, workspace_path:
         workspace_id=project_id,
         title=title.strip() or project_id,
         path=str(workspace_path),
-        backend="claude",
-        transport="direct",
+        backend=backend,
+        transport=transport,
     )
     context_store = ProjectContextStore(str(db_path))
     context_store.ensure_default_project_memory_scopes(project_id)
@@ -145,8 +172,8 @@ def upsert_project_workspace(*, store: SessionStore, title: str, workspace_path:
         workspace_id=project_id,
         title=title.strip() or project_id,
         path=str(workspace_path),
-        backend="claude",
-        transport="direct",
+        backend=backend,
+        transport=transport,
         created_at="",
         updated_at="",
     )
